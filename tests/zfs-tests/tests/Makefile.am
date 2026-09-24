@@ -2007,6 +2007,8 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/raidz/raidz_expand_007_neg.ksh \
 	functional/raidz/raidz_zinject.ksh \
 	functional/raidz/raidz_parity_epochs_pos.ksh \
+	functional/raidz/reparity_neg.ksh \
+	functional/raidz/reparity_promote_pos.ksh \
 	functional/raidz/setup.ksh \
 	functional/redacted_send/cleanup.ksh \
 	functional/redacted_send/redacted_compressed.ksh \

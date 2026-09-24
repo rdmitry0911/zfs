@@ -93,6 +93,7 @@ dist_man_MANS = \
 	%D%/man8/zpool-reguid.8 \
 	%D%/man8/zpool-remove.8 \
 	%D%/man8/zpool-reopen.8 \
+	%D%/man8/zpool-reparity.8 \
 	%D%/man8/zpool-replace.8 \
 	%D%/man8/zpool-resilver.8 \
 	%D%/man8/zpool-scrub.8 \

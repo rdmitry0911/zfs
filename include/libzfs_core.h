@@ -131,6 +131,7 @@ _LIBZFS_CORE_H int lzc_channel_program_nosync(const char *, const char *,
     uint64_t, uint64_t, nvlist_t *, nvlist_t **);
 
 _LIBZFS_CORE_H int lzc_sync(const char *, nvlist_t *, nvlist_t **);
+_LIBZFS_CORE_H int lzc_pool_reparity(const char *, nvlist_t *, nvlist_t **);
 _LIBZFS_CORE_H int lzc_reopen(const char *, boolean_t);
 
 _LIBZFS_CORE_H int lzc_condense(const char *, const char *, const char *);
