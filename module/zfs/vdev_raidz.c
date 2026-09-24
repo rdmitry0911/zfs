@@ -3770,7 +3770,6 @@ vdev_raidz_combrec(zio_t *zio)
 	vdev_t *vd = zio->io_vd;
 	int nparity = vdev_get_nparity(vd);
 	raidz_map_t *rm = zio->io_vsd;
-	int nparity = rm->rm_row[0]->rr_firstdatacol;
 	int physical_width = zio->io_vd->vdev_children;
 
 	if (vd->vdev_ops == &vdev_draid_ops) {

@@ -68,6 +68,7 @@ dist_man_MANS = \
 	%D%/man8/zfs_ids_to_path.8 \
 	%D%/man8/zgenhostid.8 \
 	%D%/man8/zinject.8 \
+	%D%/man8/zhack.8 \
 	%D%/man8/zpool.8 \
 	%D%/man8/zpool-add.8 \
 	%D%/man8/zpool-attach.8 \
