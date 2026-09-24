@@ -223,6 +223,19 @@
 #include <sys/lua/lua.h>
 #include <sys/lua/lauxlib.h>
 #include <sys/zfs_ioctl_impl.h>
+#include <sys/vdev_raidz.h>
+#include <sys/dmu_traverse.h>
+#include <sys/zil.h>
+#include <sys/vdev_impl.h>
+#include <sys/zfs_vfsops.h>
+#include <sys/dbuf.h>
+#include <sys/ddt.h>
+#include <sys/brt.h>
+#include <sys/dsl_scan.h>
+#include <sys/spa_checkpoint.h>
+#include <sys/dsl_pool.h>
+#include <sys/metaslab.h>
+#include <sys/metaslab_impl.h>
 
 kmutex_t zfsdev_state_lock;
 static zfsdev_state_t zfsdev_state_listhead;
@@ -7277,6 +7290,1113 @@ zfs_ioc_send_space(const char *snapname, nvlist_t *innvl, nvlist_t *outnvl)
  *
  * onvl is unused
  */
+
+/* ================= zpool reparity engine ================= */
+
+/*
+ * Deterministic crash/stop cutpoint hooks (native crash campaign). The harness
+ * arms reparity_stop_phase to a phase id; the engine records the highest phase
+ * reached in reparity_reached_phase (the harness polls it via /sys so a real
+ * hook -- not sleep -- proves the phase was hit), and at the armed phase takes
+ * reparity_stop_mode: 0 = abort the op here (crash-before-next-step), 1 = HANG
+ * so a host watchdog can power-cut (kill_VM) at exactly this phase, 2 = panic
+ * (kernel_panic recovery path). Off (phase 0) is a no-op with zero overhead.
+ */
+int reparity_stop_phase = 0;
+int reparity_stop_mode = 0;
+int reparity_reached_phase = 0;
+/*
+ * P10 rate-limit knobs: bound the per-txg work of the reparity sweep so a large
+ * pool's promotion/demotion/normalization does not monopolize a TXG. These cap
+ * the MOS objects dirtied per sync task and the metaslabs condensed per txg
+ * batch. Tunable at runtime; the defaults match the historical fixed values.
+ */
+/*
+ * P8b: allow reparity to COMMIT on a deduped/cloned pool once its DDT has been
+ * migrated by the dedup-aware BPR (zhack snap_bpr + zhack_bpr_ddt_remap_sync).
+ * The commit only runs the census + marker; the DDT-tripping rewrite was
+ * already done offline. Default 0 = keep the fail-closed guard.
+ */
+int reparity_allow_dedup = 0;
+unsigned long reparity_mos_budget = 256;
+unsigned long reparity_condense_budget = 16;
+#define	RP_EPOCH_PUBLISHED	1
+#define	RP_SWEEP_STARTED	2
+#define	RP_SWEEP_DONE		3
+#define	RP_CENSUS_DONE		4
+#define	RP_PRE_COMMIT		5
+#define	RP_POST_COMMIT		6
+
+static int
+reparity_phase(int ph)
+{
+	reparity_reached_phase = ph;
+	if (reparity_stop_phase != ph)
+		return (0);
+	zfs_dbgmsg("reparity crash-hook: reached armed phase %d mode %d",
+	    ph, reparity_stop_mode);
+	if (reparity_stop_mode == 2) {
+		cmn_err(CE_PANIC, "reparity crash injection at phase %d", ph);
+	} else if (reparity_stop_mode == 1) {
+		/* hang until the host watchdog power-cuts the guest here. */
+		while (reparity_stop_phase == ph)
+			delay(MSEC_TO_TICK(100));
+		return (0);
+	}
+	return (1);	/* mode 0: abort the operation at this cutpoint */
+}
+
+static uint64_t
+spa_reparity_digest(const uint64_t *tbl, uint64_t nent, uint64_t max_parity)
+{
+	uint64_t h = 1469598103934665603ULL;
+	for (uint64_t i = 0; i < nent; i++) {
+		if (tbl[3 * i + 2] > max_parity)
+			continue;
+		for (int k = 0; k < 3; k++) {
+			h ^= tbl[3 * i + k];
+			h *= 1099511628211ULL;
+		}
+	}
+	return (h);
+}
+typedef struct spa_reparity {
+	uint64_t sr_vdev_guid;
+	uint64_t sr_width;
+	uint64_t sr_base;
+	uint64_t sr_target;
+	uint64_t sr_start_txg;
+	vdev_raidz_t *sr_vdrz;
+	uint64_t sr_visited;
+	uint64_t sr_residual;
+	uint64_t sr_busy;
+	boolean_t sr_online;
+	uint64_t sr_mos_cursor;
+	uint64_t sr_mos_budget;
+	boolean_t sr_mos_more;
+	boolean_t sr_multi;	/* pool has >1 top-level raidz vdev */
+	boolean_t sr_demote;	/* P11/D: target < base (parity DEMOTION) */
+	/* R07: gang (or other) blocks we refuse */
+	uint64_t sr_unsupported;
+	/* R06: cancel flag checked inside the sweep */
+	volatile uint32_t *sr_cancelp;
+	/*
+	 * bounded force-condense (audit debt): a persistent (vd,ms) cursor
+	 * over a flat metaslab enumeration, a per-txg batch budget, and a
+	 * SURFACED load error so a metaslab that cannot be loaded fails the
+	 * op instead of being silently left un-condensed.
+	 */
+	/* next flat metaslab index to process */
+	uint64_t sr_condense_flat;
+	uint64_t sr_condense_batch_lo;	/* flat index this batch started at */
+	uint64_t sr_condense_budget;	/* metaslabs loaded/dirtied per txg */
+	/* more metaslabs remain after this batch */
+	boolean_t sr_condense_more;
+	/* first metaslab_load() error (fail-closed) */
+	int sr_condense_err;
+} spa_reparity_t;
+
+static boolean_t reparity_bp_at_target(dmu_buf_t *ddb, uint64_t start_txg);
+
+static uint64_t
+spa_reparity_epoch_parity(vdev_raidz_t *vdrz, uint64_t birth)
+{
+	uint64_t p = vdrz->vd_nparity;
+	for (uint64_t i = 0; i < vdrz->vd_parity_epoch_count; i++) {
+		if (vdrz->vd_parity_epochs[3 * i] > birth)
+			break;
+		p = vdrz->vd_parity_epochs[3 * i + 2];
+	}
+	return (p);
+}
+
+/*
+ * APPEND-ONLY epoch publish (audit R01). The prior implementation wrote exactly
+ * two entries {0:W:base, T:W:target} and freed the old table, so a second
+ * promotion (1->2->3) DROPPED the middle epoch and a block born under it was
+ * re-classified at the base parity -> undecodable/wrong tolerance. This helper
+ * PRESERVES every prior entry and appends {T:W:target}: the epoch prefix is
+ * immutable, so births in each historical range keep their parity across
+ * 1->2->3. It is idempotent -- a promotion whose target is already the last
+ * entry's parity appends nothing (safe crash-resume / repeated operation).
+ *
+ * T is append_txg+1 (the P9 fence): a write racing the publish lands in the
+ * append txg under the OLD table (physical base parity); classifying it at the
+ * old parity (birth < T) keeps the sweep promoting it. Writes from T onward are
+ * allocated under the now-visible epoch, so classification matches physical.
+ */
+static void
+spa_reparity_append_epoch(spa_t *spa, vdev_t *vd, uint64_t W, uint64_t base,
+    uint64_t target, uint64_t T, dmu_tx_t *tx)
+{
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	uint64_t oldn = vdrz->vd_parity_epoch_count;
+	/* idempotent: last epoch already AT target (promote or demote) */
+	if (oldn > 0 && vdrz->vd_parity_epochs[(oldn - 1) * 3 + 2] == target)
+		return;
+	uint64_t newn = (oldn == 0) ? 2 : oldn + 1;
+	uint64_t *nt = kmem_alloc(newn * 3 * sizeof (uint64_t), KM_SLEEP);
+	if (oldn == 0) {
+		nt[0] = 0; nt[1] = W; nt[2] = base;
+		nt[3] = T; nt[4] = W; nt[5] = target;
+	} else {
+		/* immutable prefix */
+		for (uint64_t i = 0; i < oldn * 3; i++)
+			nt[i] = vdrz->vd_parity_epochs[i];
+		nt[oldn * 3 + 0] = T;
+		nt[oldn * 3 + 1] = W;
+		nt[oldn * 3 + 2] = target;
+	}
+	VERIFY0(zap_update(spa->spa_meta_objset, vd->vdev_top_zap,
+	    VDEV_TOP_ZAP_RAIDZ_PARITY_EPOCHS, sizeof (uint64_t), newn * 3, nt,
+	    tx));
+	if (vdrz->vd_parity_epochs != NULL)
+		kmem_free(vdrz->vd_parity_epochs, oldn * 3 * sizeof (uint64_t));
+	vdrz->vd_parity_epochs = nt;
+	vdrz->vd_parity_epoch_count = newn;
+	if (!spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_PARITY_EPOCHS))
+		spa_feature_incr(spa, SPA_FEATURE_RAIDZ_PARITY_EPOCHS, tx);
+	vdev_config_dirty(vd);
+}
+
+static void
+spa_reparity_epochs_sync(void *arg, dmu_tx_t *tx)
+{
+	spa_reparity_t *sr = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	vdev_t *vd = vdev_lookup_by_guid(spa->spa_root_vdev, sr->sr_vdev_guid);
+	sr->sr_start_txg = dmu_tx_get_txg(tx) + 1;
+	spa_reparity_append_epoch(spa, vd, sr->sr_width, sr->sr_base,
+	    sr->sr_target, sr->sr_start_txg, tx);
+	if (sr->sr_demote) {
+		/*
+		 * P11/D: LOWER the advertised tolerance NOW -- in the same txg
+		 * that publishes the demotion epoch, before the sweep can write
+		 * any weaker-parity block. For demotion the safe direction is
+		 * early (understating tolerance is always safe); a crash
+		 * mid-sweep then still imports advertising the target, never
+		 * the old higher guarantee.
+		 */
+		vdev_raidz_t *vdrz = vd->vdev_tsd;
+		vdrz->vd_reparity_parity = sr->sr_target;
+		vdrz->vd_reparity_completion_txg = dmu_tx_get_txg(tx);
+		vdrz->vd_reparity_epoch_digest = spa_reparity_digest(
+		    vdrz->vd_parity_epochs, vdrz->vd_parity_epoch_count,
+		    sr->sr_target);
+		vdev_config_dirty(vd);
+	}
+}
+
+/* Bounded MOS sweep: dirty MOS objects so they re-emit at the new parity. */
+static void
+spa_reparity_mos_sync(void *arg, dmu_tx_t *tx)
+{
+	spa_reparity_t *sr = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	objset_t *mos = spa->spa_meta_objset;
+	uint64_t obj = sr->sr_mos_cursor, n = 0;
+	sr->sr_mos_more = B_FALSE;
+	while (dmu_object_next(mos, &obj, B_FALSE, 0) == 0) {
+		dmu_object_info_t doi;
+		if (dmu_object_info(mos, obj, &doi) != 0)
+			continue;
+		if (doi.doi_type == DMU_OT_SPACE_MAP ||
+		    doi.doi_type == DMU_OT_OBJECT_ARRAY)
+			continue;
+		dmu_buf_t *db;
+		if (dmu_bonus_hold(mos, obj, FTAG, &db) == 0) {
+			dmu_buf_will_dirty(db, tx);
+			dmu_buf_rele(db, FTAG);
+		}
+		uint64_t bs = doi.doi_data_block_size, cap = doi.doi_max_offset;
+		if (cap > (16ULL << 20))
+			cap = (16ULL << 20);
+		if (bs > 0) {
+			for (uint64_t off = 0; off < cap; off += bs) {
+				dmu_buf_t *ddb;
+				if (dmu_buf_hold(mos, obj, off, FTAG, &ddb,
+				    0) == 0) {
+					if (!reparity_bp_at_target(ddb,
+					    sr->sr_start_txg))
+						dmu_buf_will_dirty(ddb, tx);
+					dmu_buf_rele(ddb, FTAG);
+				}
+			}
+		}
+		sr->sr_mos_cursor = obj;
+		if (++n >= sr->sr_mos_budget) {
+			sr->sr_mos_more = B_TRUE;
+			break;
+		}
+	}
+}
+
+/*
+ * Promote per-metaslab SPACEMAPS to the target parity.
+ *
+ * With the log-spacemap feature (on by default) ordinary alloc/free during the
+ * sweep only touch the pool-wide log; a metaslab whose per-metaslab spacemap
+ * block predates the promotion epoch is never rewritten, so the census counts
+ * that block (objset=0, DMU_OT_SPACE_MAP, physical birth < start_txg) as
+ * residual on every pass -> the op fail-closes with EAGAIN (never a false
+ * commit). The MOS sweep deliberately skips DMU_OT_SPACE_MAP because dirtying a
+ * spacemap block by hand races metaslab_sync(). The safe promotion is ZFS's own
+ * force-condense: metaslab_condense() truncates and rewrites the ENTIRE
+ * spacemap (a superset of a flush -- it folds in the unflushed log entries) at
+ * the current (>= start) txg, so every rewritten block lands at the target
+ * parity; once every metaslab is flushed the drained log-spacemap objects are
+ * freed too.
+ *
+ * Split in two so spacemap-load I/O never runs on the sync thread, and BOUNDED
+ * (audit debt): each pass handles at most sr_condense_budget metaslabs from a
+ * persistent flat (vd,ms) cursor, and a metaslab_load() failure is surfaced in
+ * sr_condense_err (never swallowed) so the op fail-closes rather than leave a
+ * spacemap un-condensed:
+ *   (1) spa_reparity_condense_load  -- OPEN context: load one batch, advance
+ *       the cursor, record any load error, set sr_condense_more if work
+ *       remains.
+ *   (2) spa_reparity_condense_sync  -- SYNC task: for the SAME batch (the flat
+ *       range [sr_condense_batch_lo, sr_condense_flat)), under ms_lock set
+ *       ms_condense_wanted and dirty the metaslab for the syncing txg; that
+ *       txg's vdev_sync -> metaslab_sync (sync pass 1) then condenses it.
+ */
+static void
+spa_reparity_condense_load(spa_t *spa, spa_reparity_t *sr)
+{
+	vdev_t *rvd = spa->spa_root_vdev;
+	uint64_t flat = 0, done = 0;
+	sr->sr_condense_more = B_FALSE;
+	sr->sr_condense_batch_lo = sr->sr_condense_flat;
+	for (int c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *vd = rvd->vdev_child[c];
+		if (vd->vdev_ops != &vdev_raidz_ops || vd->vdev_top_zap == 0)
+			continue;
+		for (uint64_t m = 0; m < vd->vdev_ms_count; m++, flat++) {
+			/* processed in a prior batch */
+			if (flat < sr->sr_condense_flat)
+				continue;
+			if (done >= sr->sr_condense_budget) {
+				sr->sr_condense_more = B_TRUE;
+				return;
+			}
+			metaslab_t *msp = vd->vdev_ms[m];
+			if (msp != NULL) {
+				mutex_enter(&msp->ms_lock);
+				if (msp->ms_sm != NULL && !msp->ms_loaded) {
+					int e = metaslab_load(msp);
+					/* surfaced */
+					if (e != 0 && sr->sr_condense_err == 0)
+						sr->sr_condense_err = e;
+				}
+				mutex_exit(&msp->ms_lock);
+			}
+			sr->sr_condense_flat = flat + 1;
+			done++;
+		}
+	}
+}
+
+static void
+spa_reparity_condense_sync(void *arg, dmu_tx_t *tx)
+{
+	spa_reparity_t *sr = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	uint64_t txg = dmu_tx_get_txg(tx);
+	vdev_t *rvd = spa->spa_root_vdev;
+	uint64_t flat = 0;
+	for (int c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *vd = rvd->vdev_child[c];
+		if (vd->vdev_ops != &vdev_raidz_ops || vd->vdev_top_zap == 0)
+			continue;
+		for (uint64_t m = 0; m < vd->vdev_ms_count; m++, flat++) {
+			if (flat < sr->sr_condense_batch_lo ||
+			    flat >= sr->sr_condense_flat)
+				continue;		/* only THIS batch */
+			metaslab_t *msp = vd->vdev_ms[m];
+			if (msp == NULL)
+				continue;
+			mutex_enter(&msp->ms_lock);
+			if (msp->ms_loaded && msp->ms_sm != NULL) {
+				msp->ms_condense_wanted = B_TRUE;
+				vdev_dirty(vd, VDD_METASLAB, msp, txg);
+			}
+			mutex_exit(&msp->ms_lock);
+		}
+	}
+}
+
+/* Dirty every block of every object in one dataset (held, not owned). */
+static int
+spa_reparity_collect_cb(const char *dsname, void *arg)
+{
+	fnvlist_add_boolean((nvlist_t *)arg, dsname);
+	return (0);
+}
+
+/*
+ * Re-emit every L0 block of one object at the new parity via
+ * dmu_buf_will_rewrite (physical rewrite): the rewritten block keeps its
+ * ORIGINAL logical birth but gets a new PHYSICAL birth = tx_txg. Parity-epoch
+ * selection keys on physical birth (>= T -> new parity), while DSL accounting
+ * (deadlist/written/block-claim) keys on logical birth -> the promotion is
+ * ACCOUNTING-TRANSPARENT. This is the enabler for snapshot-preserving promotion
+ * (a re-encoded block a snapshot references keeps a logical birth <= the
+ * snapshot's creation txg, so no block-claim/birth-txg violation).
+ */
+/*
+ * IDEMPOTENCY: a block is already at the target parity iff its PHYSICAL birth
+ * is at or after the promotion epoch's start txg. Skipping such blocks makes
+ * the multi-pass sweep (up to 8 passes) idempotent -- pass 0 promotes the
+ * parity-1 blocks, and every later pass skips them instead of re-rewriting
+ * (which would pile generations of old blocks into the deadlist ->
+ * head-deadlist bloat -> dsl_dataset_recalc_head_uniq panic on a later snapshot
+ * destroy).
+ */
+static boolean_t
+reparity_bp_at_target(dmu_buf_t *ddb, uint64_t start_txg)
+{
+	if (start_txg == 0)
+		return (B_FALSE);
+	dmu_buf_impl_t *dbi = (dmu_buf_impl_t *)ddb;
+	blkptr_t *bp = dbi->db_blkptr;
+	if (bp == NULL || BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp))
+		return (B_FALSE);
+	return (BP_GET_PHYSICAL_BIRTH(bp) >= start_txg);
+}
+
+static void
+reparity_sweep_object(objset_t *os, uint64_t obj, uint64_t start_txg,
+    volatile uint32_t *cancelp)
+{
+	dmu_object_info_t doi;
+	if (dmu_object_info(os, obj, &doi) != 0)
+		return;
+	uint64_t bs = doi.doi_data_block_size, cap = doi.doi_max_offset;
+	if (bs == 0 || cap == 0)
+		return;
+	uint64_t chunk = 4ULL << 20;
+	for (uint64_t base = 0; base < cap; base += chunk) {
+		/*
+		 * R06: honour cancellation between chunk transactions so a huge
+		 * or sparse object cannot hold the (online) suspend window open
+		 * until the whole object is swept. The per-chunk 4 MiB tx
+		 * already bounds each transaction; this bounds the loop.
+		 */
+		if (cancelp != NULL && *cancelp)
+			break;
+		uint64_t end = base + chunk;
+		if (end > cap)
+			end = cap;
+		dmu_tx_t *tx = dmu_tx_create(os);
+		dmu_tx_hold_write(tx, obj, base, (int)(end - base));
+		if (dmu_tx_assign(tx, DMU_TX_WAIT) != 0) {
+			dmu_tx_abort(tx);
+			break;
+		}
+		for (uint64_t off = base; off < end; off += bs) {
+			dmu_buf_t *ddb;
+			if (dmu_buf_hold(os, obj, off, FTAG, &ddb, 0) == 0) {
+				if (!reparity_bp_at_target(ddb, start_txg))
+					dmu_buf_will_rewrite(ddb, tx);
+				dmu_buf_rele(ddb, FTAG);
+			}
+		}
+		dmu_tx_commit(tx);
+	}
+}
+
+/* Objects swept per suspend window in online mode (keeps each pause brief). */
+#define	REPARITY_ONLINE_CHUNK	8
+
+static int
+spa_reparity_ds_cb(const char *dsname, void *arg)
+{
+	spa_reparity_t *sr = arg;
+	boolean_t online = (sr != NULL && sr->sr_online);
+	zfsvfs_t *zfsvfs = NULL;
+	if (online && getzfsvfs(dsname, &zfsvfs) == 0) {
+		/*
+		 * Online, INCREMENTAL: suspend the mounted fs, sweep only a
+		 * small batch of objects, resume -- repeat until done. Apps see
+		 * brief pauses (one batch each) instead of a single long
+		 * suspend. The object cursor persists across cycles (object ids
+		 * are stable); concurrent writes between cycles land at the new
+		 * parity anyway.
+		 */
+		zfs_vfs_rele(zfsvfs);
+		uint64_t cursor = 0;
+		for (;;) {
+			if (getzfsvfs(dsname, &zfsvfs) != 0)
+				break;
+			dsl_dataset_t *ds = dmu_objset_ds(zfsvfs->z_os);
+			if (zfs_suspend_fs(zfsvfs) != 0) {
+				zfs_vfs_rele(zfsvfs);
+				break;
+			}
+			objset_t *os = zfsvfs->z_os;
+			uint64_t obj = cursor, n = 0;
+			boolean_t more = B_FALSE;
+			while (dmu_object_next(os, &obj, B_FALSE, 0) == 0) {
+				reparity_sweep_object(os, obj,
+				    sr != NULL ? sr->sr_start_txg : 0,
+				    sr != NULL ? sr->sr_cancelp : NULL);
+				cursor = obj;
+				if (++n >= REPARITY_ONLINE_CHUNK) {
+					more = B_TRUE;
+					break;
+				}
+			}
+			(void) zfs_resume_fs(zfsvfs, ds);
+			zfs_vfs_rele(zfsvfs);
+			if (!more)
+				break;
+		}
+		return (0);
+	}
+	/*
+	 * Offline (or online + not mounted): exclusive own, sweep all,
+	 * disown.
+	 */
+	objset_t *os;
+	if (dmu_objset_own(dsname, DMU_OST_ZFS, B_FALSE, B_FALSE, FTAG,
+	    &os) != 0) {
+		if (sr != NULL)
+			sr->sr_busy++;
+		return (0);
+	}
+	uint64_t obj = 0;
+	while (dmu_object_next(os, &obj, B_FALSE, 0) == 0)
+		reparity_sweep_object(os, obj,
+		    sr != NULL ? sr->sr_start_txg : 0,
+		    sr != NULL ? sr->sr_cancelp : NULL);
+	zil_destroy(dmu_objset_zil(os), B_FALSE);
+	dmu_objset_disown(os, B_FALSE, FTAG);
+	return (0);
+}
+
+/*
+ * Multi-vdev residual test: a block needs promotion if ANY of its DVA copies
+ * lives on a top-level raidz vdev being reparitied and that vdev's epoch table
+ * classifies the block (by physical birth) below the target parity. Checking
+ * every DVA (not just the first) covers ditto copies split across vdevs and
+ * mixed raidz + special/log pools, where the first DVA may be on a non-raidz
+ * vdev. All reparitied vdevs share one epoch boundary, so a block below target
+ * on one raidz vdev is below target on every raidz copy.
+ */
+static boolean_t
+spa_reparity_bp_needs_promo(spa_t *spa, const blkptr_t *bp, uint64_t target)
+{
+	uint64_t birth = BP_GET_PHYSICAL_BIRTH(bp);
+	vdev_t *rvd = spa->spa_root_vdev;
+	for (int d = 0; d < SPA_DVAS_PER_BP; d++) {
+		const dva_t *dva = &bp->blk_dva[d];
+		if (DVA_GET_ASIZE(dva) == 0)
+			continue;
+		/*
+		 * Index the top-level vdev array directly rather than calling
+		 * vdev_lookup_top(), which ASSERTs the SCL config lock is held
+		 * -- the traverse census callback does not hold it. The vdev
+		 * tree is stable during reparity (no add/remove), so the DVA's
+		 * vdev id is a valid index into rvd->vdev_child[].
+		 */
+		uint64_t vdid = DVA_GET_VDEV(dva);
+		if (vdid >= rvd->vdev_children)
+			continue;
+		vdev_t *vd = rvd->vdev_child[vdid];
+		if (vd == NULL || vd->vdev_ops != &vdev_raidz_ops ||
+		    vd->vdev_top_zap == 0)
+			continue;
+		if (spa_reparity_epoch_parity(vd->vdev_tsd, birth) < target)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+static int
+spa_reparity_census_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, const dnode_phys_t *dnp, void *arg)
+{
+	(void) zilog; (void) zb; (void) dnp;
+	spa_reparity_t *sr = arg;
+	if (bp == NULL || BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp))
+		return (0);
+	sr->sr_visited++;
+	if (BP_IS_GANG(bp)) {
+		/* R07: gang blocks need gang-tree-aware reshape; refuse. */
+		sr->sr_unsupported++;
+		return (0);
+	}
+	if (sr->sr_multi) {
+		if (spa_reparity_bp_needs_promo(spa, bp, sr->sr_target))
+			sr->sr_residual++;
+	} else {
+		uint64_t ep = spa_reparity_epoch_parity(sr->sr_vdrz,
+		    BP_GET_PHYSICAL_BIRTH(bp));
+		/*
+		 * Direction-aware completion census (P11/D). Promotion is done
+		 * when no block is BELOW target; demotion is done when no block
+		 * is ABOVE target (every over-parity block re-encoded down so
+		 * its extra column space is reclaimable). "parity < target"
+		 * alone is trivially satisfied for a demotion (old P3 already
+		 * satisfies P2) and would falsely certify.
+		 */
+		if (sr->sr_demote ? (ep > sr->sr_target) : (ep < sr->sr_target))
+			sr->sr_residual++;
+	}
+	return (0);
+}
+
+/* Set the per-vdev commit marker (tolerance + completion txg + digest). */
+static void
+spa_reparity_commit_sync(void *arg, dmu_tx_t *tx)
+{
+	spa_reparity_t *sr = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	vdev_t *vd = vdev_lookup_by_guid(spa->spa_root_vdev, sr->sr_vdev_guid);
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	vdrz->vd_reparity_parity = sr->sr_target;
+	/*
+	 * P11/D: for DEMOTION the marker + completion_txg were set early (at
+	 * epoch publish, when tolerance dropped). Do NOT advance completion_txg
+	 * to the commit txg -- a rewind to mid-sweep must still see the marker
+	 * as covered (comp <= ub) and advertise the LOWER tolerance, since
+	 * weaker blocks may already exist. Only a promotion advances completion
+	 * to the commit txg (tolerance rises only once every block reached the
+	 * higher parity).
+	 */
+	if (!sr->sr_demote)
+		vdrz->vd_reparity_completion_txg = dmu_tx_get_txg(tx);
+	vdrz->vd_reparity_epoch_digest = spa_reparity_digest(
+	    vdrz->vd_parity_epochs, vdrz->vd_parity_epoch_count, sr->sr_target);
+	vdev_config_dirty(vd);
+}
+
+/*
+ * Multi-vdev epoch establishment: append {0:W:base, T+1:W:target} to EVERY
+ * top-level raidz vdev that does not already carry a target epoch (idempotent
+ * for crash-resume). All vdevs share one boundary txg T+1 (the P9 fence: a
+ * write racing the flip is classified old-parity and swept). Each vdev keeps
+ * its own width W and base parity.
+ */
+static void
+spa_reparity_epochs_multi_sync(void *arg, dmu_tx_t *tx)
+{
+	spa_reparity_t *sr = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	vdev_t *rvd = spa->spa_root_vdev;
+	sr->sr_start_txg = dmu_tx_get_txg(tx) + 1;
+	for (int c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *vd = rvd->vdev_child[c];
+		if (vd->vdev_ops != &vdev_raidz_ops || vd->vdev_top_zap == 0)
+			continue;
+		vdev_raidz_t *vdrz = vd->vdev_tsd;
+		/* append-only per vdev (R01); idempotent for resume. */
+		spa_reparity_append_epoch(spa, vd, vd->vdev_children,
+		    vdrz->vd_nparity, sr->sr_target, sr->sr_start_txg, tx);
+	}
+}
+
+/* Multi-vdev commit: set the per-vdev marker on every reparitied raidz vdev. */
+static void
+spa_reparity_commit_multi_sync(void *arg, dmu_tx_t *tx)
+{
+	spa_reparity_t *sr = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	vdev_t *rvd = spa->spa_root_vdev;
+	for (int c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *vd = rvd->vdev_child[c];
+		if (vd->vdev_ops != &vdev_raidz_ops || vd->vdev_top_zap == 0)
+			continue;
+		vdev_raidz_t *vdrz = vd->vdev_tsd;
+		vdrz->vd_reparity_parity = sr->sr_target;
+		vdrz->vd_reparity_completion_txg = dmu_tx_get_txg(tx);
+		vdrz->vd_reparity_epoch_digest = spa_reparity_digest(
+		    vdrz->vd_parity_epochs, vdrz->vd_parity_epoch_count,
+		    sr->sr_target);
+		vdev_config_dirty(vd);
+	}
+}
+
+static int
+spa_reparity_count_snap_cb(const char *dsname, void *arg)
+{
+	if (strchr(dsname, '@') != NULL)
+		(*(uint64_t *)arg)++;
+	return (0);
+}
+
+/*
+ * Async background reparity: a single pool-wide op at a time. Lock-free -- the
+ * active flag is CAS-guarded; progress/flags are word-atomic on 64-bit. The
+ * ioctl "start" spawns reparity_worker() and returns immediately; "status"
+ * reports progress; "cancel" sets ra_cancel (checked between sweep passes).
+ */
+typedef struct reparity_async {
+	volatile uint32_t ra_active;	/* 0/1, atomic_cas guarded */
+	volatile uint32_t ra_cancel;
+	volatile uint32_t ra_done;
+	volatile uint32_t ra_committed;
+	volatile int ra_error;
+	volatile uint64_t ra_visited;
+	volatile uint64_t ra_residual;
+	uint64_t ra_target_req;
+	boolean_t ra_online;
+	char ra_pool[ZFS_MAX_DATASET_NAME_LEN];
+} reparity_async_t;
+static reparity_async_t reparity_async;
+
+static int reparity_do(const char *pool, uint64_t target_req, boolean_t online,
+    reparity_async_t *ra, nvlist_t *onvl);
+
+static void
+reparity_worker(void *arg)
+{
+	reparity_async_t *ra = arg;
+	nvlist_t *scratch = fnvlist_alloc();
+	int err = reparity_do(ra->ra_pool, ra->ra_target_req, ra->ra_online,
+	    ra, scratch);
+	fnvlist_free(scratch);
+	ra->ra_error = err;
+	ra->ra_done = 1;
+	membar_producer();
+	ra->ra_active = 0;
+	thread_exit();
+}
+
+static int
+reparity_do(const char *pool, uint64_t target_req, boolean_t online,
+    reparity_async_t *ra, nvlist_t *onvl)
+{
+	spa_t *spa;
+	int err;
+	if ((err = spa_open(pool, &spa, FTAG)) != 0)
+		return (err);
+
+	/*
+	 * Fail-closed on features whose shared/refcounted blocks the reparity
+	 * CoW rewrite cannot safely re-emit yet: dedup (DDT) and block cloning
+	 * (BRT). Rewriting a deduped or cloned block through the normal write
+	 * path trips the DDT/BRT accounting (an spl_panic in the zio write
+	 * pipeline was observed), so refuse up front rather than wedge or
+	 * corrupt. The feature-aware rewrite each needs is specified in
+	 * rrmvp/feature_reshape.py (Priority 8b) and is not yet implemented
+	 * in-kernel.
+	 */
+	if (!reparity_allow_dedup && ddt_get_dedup_dspace(spa) != 0) {
+		spa_close(spa, FTAG);
+		return (SET_ERROR(ENOTSUP));
+	}
+	if (!reparity_allow_dedup &&
+	    spa_feature_is_active(spa, SPA_FEATURE_BLOCK_CLONING) &&
+	    brt_get_used(spa) != 0) {
+		spa_close(spa, FTAG);
+		return (SET_ERROR(ENOTSUP));
+	}
+	/*
+	 * R07: refuse states the sweep cannot reason about. A pool checkpoint
+	 * pins an older on-disk state that the re-encode would diverge from
+	 * (ENOTSUP); a running scrub/resilver is a competing exclusive scan
+	 * (EBUSY). Both are checked BEFORE any epoch is published, so a refusal
+	 * writes nothing. (Gang blocks are refused in the census below, since
+	 * they are only discoverable per-block during traversal.)
+	 */
+	if (spa_has_checkpoint(spa)) {
+		spa_close(spa, FTAG);
+		return (SET_ERROR(ENOTSUP));
+	}
+	if (spa->spa_dsl_pool != NULL &&
+	    (dsl_scan_scrubbing(spa->spa_dsl_pool) ||
+	    dsl_scan_resilvering(spa->spa_dsl_pool))) {
+		spa_close(spa, FTAG);
+		return (SET_ERROR(EBUSY));
+	}
+
+	/*
+	 * Collect the top-level raidz vdevs. One is the common case
+	 * (single-vdev path, unchanged); several are promoted together
+	 * (multi-vdev, Priority 8b) provided they share a base parity so a
+	 * single target applies. Every raidz vdev must carry its per-vdev top
+	 * ZAP (for the epoch table).
+	 */
+	vdev_t *rvd = spa->spa_root_vdev, *tvd = NULL;
+	int nraidz = 0;
+	for (int c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *cvd = rvd->vdev_child[c];
+		if (cvd->vdev_ops != &vdev_raidz_ops)
+			continue;
+		if (cvd->vdev_top_zap == 0) {
+			spa_close(spa, FTAG);
+			return (SET_ERROR(ENOTSUP));
+		}
+		if (tvd == NULL)
+			tvd = cvd;
+		else if (((vdev_raidz_t *)cvd->vdev_tsd)->vd_nparity !=
+		    ((vdev_raidz_t *)tvd->vdev_tsd)->vd_nparity) {
+			/*
+			 * mixed base parity across vdevs: one target cannot
+			 * apply.
+			 */
+			spa_close(spa, FTAG);
+			return (SET_ERROR(ENOTSUP));
+		}
+		nraidz++;
+	}
+	if (tvd == NULL) {
+		spa_close(spa, FTAG);
+		return (SET_ERROR(ENOTSUP));
+	}
+	vdev_raidz_t *vdrz = tvd->vdev_tsd;
+	boolean_t multi = (nraidz > 1);
+
+	spa_reparity_t sr;
+	memset(&sr, 0, sizeof (sr));
+	sr.sr_cancelp = (ra != NULL) ? &ra->ra_cancel : NULL;	/* R06 */
+	sr.sr_vdev_guid = tvd->vdev_guid;
+	sr.sr_width = tvd->vdev_children;
+	/*
+	 * Base = the last COMMITTED effective parity (the vd_reparity_parity
+	 * marker), not the structural vd_nparity and NOT the last appended
+	 * epoch. After a committed demotion to 1 the marker is 1, so a
+	 * re-promotion to 2 is a real op (target>base). Using the last epoch
+	 * would be wrong: a REFUSED/incomplete promotion already appended its
+	 * {T:target} epoch without committing, so re-running would see
+	 * base==target and reject a legitimate resume. With no marker yet
+	 * (marker==0) the base is the structural vd_nparity.
+	 */
+	sr.sr_base = (vdrz->vd_reparity_parity != 0) ?
+	    vdrz->vd_reparity_parity : vdrz->vd_nparity;
+	sr.sr_target = sr.sr_base + 1;
+	sr.sr_vdrz = vdrz;
+	sr.sr_mos_budget = reparity_mos_budget;
+	if (target_req != 0)
+		sr.sr_target = target_req;
+	sr.sr_online = online;
+	sr.sr_multi = multi;
+	/*
+	 * P11/D: target < base is a DEMOTION; target > base a promotion; target
+	 * == base is a no-op and rejected. Both directions need target in
+	 * [1,MAXPARITY] and width > target (a raidz vdev needs > parity data
+	 * columns).
+	 */
+	sr.sr_demote = (sr.sr_target < sr.sr_base);
+	if (sr.sr_target == sr.sr_base || sr.sr_target < 1 ||
+	    sr.sr_target > VDEV_RAIDZ_MAXPARITY ||
+	    sr.sr_width <= sr.sr_target) {
+		spa_close(spa, FTAG);
+		return (SET_ERROR(EINVAL));
+	}
+	if (sr.sr_demote && multi) {
+		/* demotion across multiple raidz vdevs not yet supported. */
+		spa_close(spa, FTAG);
+		return (SET_ERROR(ENOTSUP));
+	}
+	if (multi) {
+		/*
+		 * every raidz vdev must be wide enough for the target
+		 * parity.
+		 */
+		for (int c = 0; c < rvd->vdev_children; c++) {
+			vdev_t *cvd = rvd->vdev_child[c];
+			if (cvd->vdev_ops == &vdev_raidz_ops &&
+			    cvd->vdev_children <= sr.sr_target) {
+				spa_close(spa, FTAG);
+				return (SET_ERROR(EINVAL));
+			}
+		}
+	}
+	if (ra != NULL) ra->ra_target_req = sr.sr_target;
+
+	zfs_dbgmsg("REPARITY: start target=%llu width=%llu",
+	    (u_longlong_t)sr.sr_target, (u_longlong_t)sr.sr_width);
+	/*
+	 * 1. Append the epoch table (promotion at the current txg) -- UNLESS a
+	 * promotion to this target is already in progress. On resume we must
+	 * REUSE the existing table (same start-txg) so blocks a prior attempt
+	 * already swept (born at the old start-txg) stay at the target parity;
+	 * re-appending with a newer start-txg would re-classify them as
+	 * residual and the census could never converge (F5 crash-resume
+	 * correctness).
+	 */
+	if (multi) {
+		/*
+		 * Multi-vdev: establish (or reuse, per-vdev) an epoch
+		 * on every top-level raidz vdev in one sync task.
+		 * Idempotent, so crash-resume re-runs harmlessly.
+		 */
+		err = dsl_sync_task(spa_name(spa), NULL,
+		    spa_reparity_epochs_multi_sync, &sr, 3,
+		    ZFS_SPACE_CHECK_NORMAL);
+		if (err != 0) {
+			spa_close(spa, FTAG); return (err);
+		}
+	} else {
+	boolean_t have_epoch = (vdrz->vd_parity_epoch_count > 0 &&
+	    vdrz->vd_parity_epochs[(vdrz->vd_parity_epoch_count - 1) * 3 + 2] >=
+	    sr.sr_target);
+	if (!have_epoch) {
+		err = dsl_sync_task(spa_name(spa), NULL,
+		    spa_reparity_epochs_sync,
+		    &sr, 3, ZFS_SPACE_CHECK_NORMAL);
+		if (err != 0) {
+			spa_close(spa, FTAG); return (err);
+		}
+	} else {
+		/*
+		 * Reuse the existing promotion epoch (e.g. established
+		 * by `zhack raidz_epochs` before an offline snap_bpr,
+		 * or by a prior reparity pass). Set sr_start_txg to its
+		 * start txg so the idempotent sweep skips blocks
+		 * already promoted (physical birth >= start), instead
+		 * of re-rewriting them across the 8 passes.
+		 */
+		for (uint64_t i = 0; i < vdrz->vd_parity_epoch_count; i++) {
+			if (vdrz->vd_parity_epochs[i * 3 + 2] >= sr.sr_target) {
+				sr.sr_start_txg = vdrz->vd_parity_epochs[i * 3];
+				break;
+			}
+		}
+	}
+	}
+	if (reparity_phase(RP_EPOCH_PUBLISHED)) {
+		spa_close(spa, FTAG); return (SET_ERROR(EINTR));
+	}
+
+	/*
+	 * 1b. Promote metaslab spacemaps: force-condense every metaslab so its
+	 * per-metaslab spacemap (which ordinary log-spacemap alloc/free never
+	 * rewrites) is rebuilt at the target parity, and the drained
+	 * log-spacemap objects are freed. Without this an untouched metaslab's
+	 * pre-epoch spacemap block is residual on every census pass -> EAGAIN.
+	 * BOUNDED: each iteration loads+dirties at most sr_condense_budget
+	 * metaslabs from a persistent cursor; a metaslab_load() failure is
+	 * surfaced and fail-closes the op; a second wait per batch lets the
+	 * freed log spacemaps be reclaimed.
+	 */
+	sr.sr_condense_flat = 0; sr.sr_condense_err = 0;
+	/* P10: tunable */
+	sr.sr_condense_budget = reparity_condense_budget;
+	do {
+		spa_reparity_condense_load(spa, &sr);
+		if (sr.sr_condense_err != 0) {
+			spa_close(spa, FTAG);
+			return (SET_ERROR(sr.sr_condense_err));
+		}
+		err = dsl_sync_task(spa_name(spa), NULL,
+		    spa_reparity_condense_sync, &sr, 3, ZFS_SPACE_CHECK_NORMAL);
+		if (err != 0) {
+			spa_close(spa, FTAG); return (err);
+		}
+		txg_wait_synced(spa_get_dsl(spa), 0);
+	} while (sr.sr_condense_more);
+	txg_wait_synced(spa_get_dsl(spa), 0);	/* drain freed log spacemaps */
+
+	/*
+	 * 2-3. sweep (MOS + datasets) + census, repeated a few passes so
+	 * metadata churned by earlier passes (e.g. spacemaps) also reaches the
+	 * target parity; stop as soon as the census is clean.
+	 */
+	for (int pass = 0; pass < 8; pass++) {
+	if (ra != NULL && ra->ra_cancel) { err = SET_ERROR(ECANCELED); break; }
+	if (reparity_phase(RP_SWEEP_STARTED)) {
+		spa_close(spa, FTAG); return (SET_ERROR(EINTR));
+	}
+	sr.sr_busy = 0;
+	/* 2. sweep MOS (bounded) then every dataset. */
+	sr.sr_mos_cursor = 0;
+	do {
+		err = dsl_sync_task(spa_name(spa), NULL, spa_reparity_mos_sync,
+		    &sr, 128, ZFS_SPACE_CHECK_NORMAL);
+		if (err != 0) {
+			spa_close(spa, FTAG); return (err);
+		}
+	} while (sr.sr_mos_more);
+	{
+		/*
+		 * Sweep every dataset. Offline: exclusive dmu_objset_own.
+		 * Online: the cb suspends each mounted fs (zfs_suspend_fs),
+		 * sweeps it, then resumes -- the mount persists (no unmount).
+		 */
+		nvlist_t *dslist = fnvlist_alloc();
+		(void) dmu_objset_find(spa_name(spa), spa_reparity_collect_cb,
+		    dslist, DS_FIND_CHILDREN);
+		for (nvpair_t *pair = nvlist_next_nvpair(dslist, NULL);
+		    pair != NULL; pair = nvlist_next_nvpair(dslist, pair)) {
+			if (ra != NULL && ra->ra_cancel)
+				break;
+			(void) spa_reparity_ds_cb(nvpair_name(pair), &sr);
+		}
+		fnvlist_free(dslist);
+	}
+	txg_wait_synced(spa_get_dsl(spa), 0);
+	if (reparity_phase(RP_SWEEP_DONE)) {
+		spa_close(spa, FTAG); return (SET_ERROR(EINTR));
+	}
+
+	/* 3. self-verifying census. */
+	sr.sr_visited = 0; sr.sr_residual = 0; sr.sr_unsupported = 0;
+	err = traverse_pool(spa, 0, TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
+	    spa_reparity_census_cb, &sr);
+	zfs_dbgmsg("REPARITY: pass %d residual=%llu visited=%llu", pass,
+	    (u_longlong_t)sr.sr_residual, (u_longlong_t)sr.sr_visited);
+	if (ra != NULL) {
+		ra->ra_visited = sr.sr_visited;
+		ra->ra_residual = sr.sr_residual;
+	}
+	if (err != 0 || sr.sr_residual == 0) {
+		if (reparity_phase(RP_CENSUS_DONE)) {
+			spa_close(spa, FTAG); return (SET_ERROR(EINTR));
+		}
+		break;
+	}
+	}
+	uint64_t nsnaps = 0;
+	(void) dmu_objset_find(spa_name(spa), spa_reparity_count_snap_cb,
+	    &nsnaps, DS_FIND_SNAPSHOTS | DS_FIND_CHILDREN);
+	fnvlist_add_uint64(onvl, "snapshots", nsnaps);
+	fnvlist_add_uint64(onvl, "visited", sr.sr_visited);
+	fnvlist_add_uint64(onvl, "residual", sr.sr_residual);
+	fnvlist_add_uint64(onvl, "target_parity", sr.sr_target);
+	fnvlist_add_uint64(onvl, "busy_datasets", sr.sr_busy);
+	fnvlist_add_uint64(onvl, "unsupported", sr.sr_unsupported);
+	if (err != 0 || sr.sr_residual != 0 || sr.sr_visited == 0 ||
+	    sr.sr_unsupported != 0) {
+		/*
+		 * R07: gang (or other unsupported) blocks -> refuse, no
+		 * commit.
+		 */
+		fnvlist_add_boolean_value(onvl, "committed", B_FALSE);
+		spa_close(spa, FTAG);
+		return (err != 0 ? err :
+		    (sr.sr_unsupported != 0 ? SET_ERROR(ENOTSUP) :
+		    SET_ERROR(EAGAIN)));
+	}
+
+	if (reparity_phase(RP_PRE_COMMIT)) {
+		fnvlist_add_boolean_value(onvl, "committed", B_FALSE);
+		spa_close(spa, FTAG); return (SET_ERROR(EINTR));
+	}
+	/* 4. commit the marker(s) (raises device-state tolerance). */
+	err = dsl_sync_task(spa_name(spa), NULL,
+	    multi ? spa_reparity_commit_multi_sync : spa_reparity_commit_sync,
+	    &sr, 5, ZFS_SPACE_CHECK_NORMAL);
+	fnvlist_add_boolean_value(onvl, "committed", (err == 0));
+	if (ra != NULL && err == 0) ra->ra_committed = 1;
+	(void) reparity_phase(RP_POST_COMMIT);
+	spa_close(spa, FTAG);
+	return (err);
+}
+static int
+zfs_ioc_pool_reparity(const char *pool, nvlist_t *innvl, nvlist_t *onvl)
+{
+	boolean_t async = B_FALSE, status = B_FALSE, cancel = B_FALSE;
+	boolean_t online = B_FALSE;
+	uint64_t target = 0;
+	(void) nvlist_lookup_boolean_value(innvl, "async", &async);
+	(void) nvlist_lookup_boolean_value(innvl, "status", &status);
+	(void) nvlist_lookup_boolean_value(innvl, "cancel", &cancel);
+	(void) nvlist_lookup_boolean_value(innvl, "online", &online);
+	(void) nvlist_lookup_uint64(innvl, "target_parity", &target);
+
+	reparity_async_t *ra = &reparity_async;
+
+	/*
+	 * R03: cancel/status are scoped to the requesting pool. The single
+	 * global slot records ra_pool; a request for a DIFFERENT pool must
+	 * never observe or cancel another pool's operation.
+	 */
+	if (status) {
+		boolean_t mine = (ra->ra_pool[0] != '\0' &&
+		    strcmp(ra->ra_pool, pool) == 0);
+		if (!mine) {
+			/*
+			 * No operation for THIS pool -- do not leak
+			 * another pool's state (and leave "pool" unset
+			 * so the CLI reports "no reparity operation on
+			 * record").
+			 */
+			fnvlist_add_boolean_value(onvl, "active", B_FALSE);
+			fnvlist_add_boolean_value(onvl, "done", B_FALSE);
+			return (0);
+		}
+		fnvlist_add_boolean_value(onvl, "active", ra->ra_active != 0);
+		fnvlist_add_boolean_value(onvl, "done", ra->ra_done != 0);
+		fnvlist_add_boolean_value(onvl, "committed",
+		    ra->ra_committed != 0);
+		fnvlist_add_boolean_value(onvl, "canceling",
+		    ra->ra_cancel != 0);
+		fnvlist_add_uint64(onvl, "visited", ra->ra_visited);
+		fnvlist_add_uint64(onvl, "residual", ra->ra_residual);
+		fnvlist_add_int32(onvl, "error", ra->ra_error);
+		fnvlist_add_uint64(onvl, "target_parity", ra->ra_target_req);
+		fnvlist_add_string(onvl, "pool", ra->ra_pool);
+		return (0);
+	}
+	if (cancel) {
+		boolean_t mine = (ra->ra_active != 0 &&
+		    strcmp(ra->ra_pool, pool) == 0);
+		if (mine)
+			ra->ra_cancel = 1;
+		fnvlist_add_boolean_value(onvl, "canceling", mine);
+		/* ENOENT when there is no active operation for THIS pool. */
+		return (mine ? 0 : SET_ERROR(ENOENT));
+	}
+	/*
+	 * R04: sync and async share ONE gate. Both claim ra_active via CAS, so
+	 * a sync call cannot start a second engine while any reparity is
+	 * active, and ra_pool identifies the owner for status/cancel.
+	 */
+	if (atomic_cas_32(&ra->ra_active, 0, 1) != 0)
+		return (SET_ERROR(EBUSY));
+	ra->ra_cancel = 0;
+	ra->ra_done = 0;
+	ra->ra_committed = 0;
+	ra->ra_error = 0;
+	ra->ra_visited = 0;
+	ra->ra_residual = 0;
+	ra->ra_target_req = target;
+	ra->ra_online = online;
+	(void) strlcpy(ra->ra_pool, pool, sizeof (ra->ra_pool));
+	membar_producer();
+	if (async) {
+		(void) thread_create(NULL, 0, reparity_worker, ra, 0, &p0,
+		    TS_RUN, defclsyspri);
+		fnvlist_add_boolean_value(onvl, "started", B_TRUE);
+		fnvlist_add_string(onvl, "pool", pool);
+		return (0);
+	}
+	/* synchronous (default): run under the same gate, release on return. */
+	int rc = reparity_do(pool, target, online, ra, onvl);
+	ra->ra_error = rc;
+	ra->ra_done = 1;
+	membar_producer();
+	ra->ra_active = 0;
+	return (rc);
+}
+
+ZFS_MODULE_PARAM(zfs, reparity_, stop_phase, INT, ZMOD_RW,
+	"native crash campaign: phase id to stop at (0=off)");
+ZFS_MODULE_PARAM(zfs, reparity_, stop_mode, INT, ZMOD_RW,
+	"native crash campaign: 0=abort 1=hang-for-watchdog 2=panic");
+ZFS_MODULE_PARAM(zfs, reparity_, reached_phase, INT, ZMOD_RW,
+	"native crash campaign: highest reparity phase reached "
+	"(harness polls)");
+
+ZFS_MODULE_PARAM(zfs, reparity_, mos_budget, ULONG, ZMOD_RW,
+	"P10: MOS objects dirtied per reparity sync task (per-txg bound)");
+ZFS_MODULE_PARAM(zfs, reparity_, condense_budget, ULONG, ZMOD_RW,
+	"P10: metaslabs condensed per reparity txg batch (per-txg bound)");
+ZFS_MODULE_PARAM(zfs, reparity_, allow_dedup, INT, ZMOD_RW,
+	"P8b: permit reparity COMMIT on a dedup/BRT pool whose DDT was "
+	"migrated by the dedup-aware BPR (default 0 = fail-closed)");
+
+static const zfs_ioc_key_t zfs_keys_pool_reparity[] = {
+	{"target_parity",	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{"online",	DATA_TYPE_BOOLEAN_VALUE,	ZK_OPTIONAL},
+	{"async",	DATA_TYPE_BOOLEAN_VALUE,	ZK_OPTIONAL},
+	{"status",	DATA_TYPE_BOOLEAN_VALUE,	ZK_OPTIONAL},
+	{"cancel",	DATA_TYPE_BOOLEAN_VALUE,	ZK_OPTIONAL},
+};
+
 static const zfs_ioc_key_t zfs_keys_pool_sync[] = {
 	{"force",	DATA_TYPE_BOOLEAN_VALUE,	0},
 };
@@ -7653,6 +8773,10 @@ zfs_ioctl_init(void)
 	    B_TRUE, B_TRUE, zfs_keys_change_key,
 	    ARRAY_SIZE(zfs_keys_change_key));
 
+	zfs_ioctl_register("reparity", ZFS_IOC_POOL_REPARITY,
+	    zfs_ioc_pool_reparity, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_FALSE,
+	    zfs_keys_pool_reparity, ARRAY_SIZE(zfs_keys_pool_reparity));
 	zfs_ioctl_register("sync", ZFS_IOC_POOL_SYNC,
 	    zfs_ioc_pool_sync, zfs_secpolicy_none, POOL_NAME,
 	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_FALSE,

@@ -1,0 +1,129 @@
+.\" SPDX-License-Identifier: CDDL-1.0
+.\"
+.\" CDDL HEADER START
+.\"
+.\" The contents of this file are subject to the terms of the
+.\" Common Development and Distribution License (the "License").
+.\" You may not use this file except in compliance with the License.
+.\"
+.\" You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
+.\" or https://opensource.org/licenses/CDDL-1.0.
+.\" See the License for the specific language governing permissions
+.\" and limitations under the License.
+.\"
+.\" When distributing Covered Code, include this CDDL HEADER in each
+.\" file and include the License file at usr/src/OPENSOLARIS.LICENSE.
+.\" If applicable, add the following below this CDDL HEADER, with the
+.\" fields enclosed by brackets "[]" replaced with your own identifying
+.\" information: Portions Copyright [yyyy] [name of copyright owner]
+.\"
+.\" CDDL HEADER END
+.\"
+.\" Copyright (c) 2026 Dmitry R.
+.\"
+.Dd September 25, 2026
+.Dt ZPOOL-REPARITY 8
+.Os
+.
+.Sh NAME
+.Nm zpool-reparity
+.Nd reshape the RAIDZ parity level of a ZFS storage pool in place
+.Sh SYNOPSIS
+.Nm zpool
+.Cm reparity
+.Op Fl -online | Fl -async | Fl -status | Fl -cancel
+.Op Fl -target Ar N
+.Ar pool
+.
+.Sh DESCRIPTION
+Increases (promotes) the parity level of the RAIDZ top-level virtual devices of
+.Ar pool
+in place \(em
+.Sy raidz1 Ns \(->\| Ns Sy raidz2
+or
+.Sy raidz2 Ns \(->\| Ns Sy raidz3 Ns
+\(em without adding devices, without send/receive, and without taking the pool
+offline.
+Every allocated block is read, re-encoded at the new parity level, and rewritten;
+the extra parity column is stored in space that already exists in the RAIDZ stripe.
+.Pp
+Because pre-existing blocks and newly written blocks may briefly coexist at
+different parity levels, the operation records a per-vdev
+.Em parity-epoch table
+\(em a list of
+.Sy start_txg : Ns Sy width : Ns Sy parity
+tuples \(em in the top-level vdev ZAP, and activates the
+.Sy raidz_parity_epochs
+pool feature.
+The RAIDZ reconstruction path selects the layout for each block from its birth
+transaction group, so the pool remains importable and fully redundant at every
+step, including after a crash mid-operation.
+The reshape is transactional: it either
+.Sy COMMITTED Ns
+s at the new parity level or leaves the pool unchanged
+.Pq fail-closed .
+.Pp
+The operation is refused
+.Pq leaving all data intact
+if any block cannot be safely re-encoded at the target parity, and it will not
+commit while blocks pinned at the old parity remain reachable
+.Pq see Sx NOTES .
+.
+.Sh OPTIONS
+.Bl -tag -width "--status"
+.It Fl -online
+Perform the reshape synchronously while keeping all datasets mounted, using
+chunked suspend/resume.
+Without this option the default synchronous mode briefly unmounts and remounts
+the pool's datasets
+.Pq auto-quiesce
+for the duration of the operation.
+.It Fl -async
+Start an online reshape in a background kernel thread and return immediately.
+Progress is reported with
+.Fl -status
+and the operation may be stopped with
+.Fl -cancel .
+.It Fl -status
+Report the progress of a background reshape: whether an operation is active or
+committed, the target parity, the number of blocks visited, and the residual
+count of blocks not yet re-encoded.
+.It Fl -cancel
+Request cancellation of a background reshape.
+.It Fl -target Ar N
+Reshape toward parity level
+.Ar N
+.Pq 2 No or Sy 3
+rather than the next level up.
+When omitted, the parity is promoted by one level.
+.El
+.
+.Sh NOTES
+.Bl -bullet
+.It
+The pool must contain only RAIDZ top-level vdevs of the source parity level.
+The
+.Sy raidz_parity_epochs
+feature is activated automatically on first use and is required to import the
+pool afterward.
+.It
+Datasets that are busy
+.Pq cannot be quiesced
+block the default and
+.Fl -online
+modes; unmount them first with
+.Nm zfs Cm unmount Fl a .
+.It
+Snapshots that pin blocks at the old parity level prevent the operation from
+committing.
+.Nm zpool Cm reparity Fl -status
+reports the residual block count and the number of pinning snapshots; destroy
+them and re-run to complete the reshape.
+.El
+.
+.Sh SEE ALSO
+.Xr zpoolconcepts 7 ,
+.Xr zpool-attach 8 ,
+.Xr zpool-features 7 ,
+.Xr zpool-scrub 8 ,
+.Xr zpool-status 8

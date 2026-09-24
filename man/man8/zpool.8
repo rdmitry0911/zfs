@@ -178,6 +178,9 @@ specified.
 Prefetches specific types of pool data.
 .It Xr zpool-scrub 8
 Begins a scrub or resumes a paused scrub.
+.It Xr zpool-reparity 8
+Reshapes the RAIDZ parity level of a pool in place, promoting raidz1 to
+raidz2 or raidz2 to raidz3 without adding devices.
 .It Xr zpool-checkpoint 8
 Checkpoints the current state of
 .Ar pool ,
@@ -645,6 +648,7 @@ don't wait.
 .Xr zpool-reguid 8 ,
 .Xr zpool-remove 8 ,
 .Xr zpool-reopen 8 ,
+.Xr zpool-reparity 8 ,
 .Xr zpool-replace 8 ,
 .Xr zpool-resilver 8 ,
 .Xr zpool-scrub 8 ,
