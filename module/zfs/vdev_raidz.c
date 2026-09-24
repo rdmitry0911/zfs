@@ -2232,32 +2232,57 @@ vdev_raidz_close(vdev_t *vd)
 	}
 }
 
+typedef struct vdev_raidz_layout {
+	uint64_t vrl_width;
+	uint64_t vrl_nparity;
+} vdev_raidz_layout_t;
+
 /*
- * Return the logical width to use, given the txg in which the allocation
- * happened.
+ * Return the complete RAIDZ layout for the txg in which an allocation
+ * happened.  Width and parity must travel together so callers do not
+ * accidentally combine values selected from different layout epochs.
  */
-static uint64_t
-vdev_raidz_get_logical_width(vdev_raidz_t *vdrz, uint64_t txg)
+static vdev_raidz_layout_t
+vdev_raidz_layout_for_alloc(vdev_raidz_t *vdrz, uint64_t txg)
 {
 	reflow_node_t lookup = {
 		.re_txg = txg,
 	};
 	avl_index_t where;
 
-	uint64_t width;
+	vdev_raidz_layout_t layout = {
+		.vrl_nparity = vdrz->vd_nparity,
+	};
 	mutex_enter(&vdrz->vd_expand_lock);
 	reflow_node_t *re = avl_find(&vdrz->vd_expand_txgs, &lookup, &where);
 	if (re != NULL) {
-		width = re->re_logical_width;
+		layout.vrl_width = re->re_logical_width;
 	} else {
 		re = avl_nearest(&vdrz->vd_expand_txgs, where, AVL_BEFORE);
 		if (re != NULL)
-			width = re->re_logical_width;
+			layout.vrl_width = re->re_logical_width;
 		else
-			width = vdrz->vd_original_width;
+			layout.vrl_width = vdrz->vd_original_width;
 	}
 	mutex_exit(&vdrz->vd_expand_lock);
-	return (width);
+
+	if (zfs_flags & ZFS_DEBUG_RAIDZ_RECONSTRUCT) {
+		zfs_dbgmsg("layout_for_alloc(txg=%llu width=%llu parity=%llu)",
+		    (u_longlong_t)txg, (u_longlong_t)layout.vrl_width,
+		    (u_longlong_t)layout.vrl_nparity);
+	}
+	return (layout);
+}
+
+/*
+ * Keep BP layout selection distinct from new-allocation selection even though
+ * both paths intentionally have identical behavior before mixed-parity epochs.
+ */
+static vdev_raidz_layout_t
+vdev_raidz_layout_for_bp(vdev_raidz_t *vdrz, const blkptr_t *bp)
+{
+	return (vdev_raidz_layout_for_alloc(vdrz,
+	    BP_GET_PHYSICAL_BIRTH(bp)));
 }
 /*
  * This code converts an asize into the largest psize that can safely be written
@@ -2273,9 +2298,9 @@ vdev_raidz_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t txg)
 	vdev_raidz_t *vdrz = vd->vdev_tsd;
 	uint64_t psize;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	uint64_t nparity = vdrz->vd_nparity;
-
-	uint64_t cols = vdev_raidz_get_logical_width(vdrz, txg);
+	vdev_raidz_layout_t layout = vdev_raidz_layout_for_alloc(vdrz, txg);
+	uint64_t nparity = layout.vrl_nparity;
+	uint64_t cols = layout.vrl_width;
 
 	ASSERT0(asize % (1 << ashift));
 
@@ -2308,9 +2333,9 @@ vdev_raidz_psize_to_asize(vdev_t *vd, uint64_t psize, uint64_t txg)
 	vdev_raidz_t *vdrz = vd->vdev_tsd;
 	uint64_t asize;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	uint64_t nparity = vdrz->vd_nparity;
-
-	uint64_t cols = vdev_raidz_get_logical_width(vdrz, txg);
+	vdev_raidz_layout_t layout = vdev_raidz_layout_for_alloc(vdrz, txg);
+	uint64_t nparity = layout.vrl_nparity;
+	uint64_t cols = layout.vrl_width;
 
 	asize = ((psize - 1) >> ashift) + 1;
 	asize += nparity * ((asize + cols - nparity - 1) / (cols - nparity));
@@ -2664,9 +2689,8 @@ vdev_raidz_io_start(zio_t *zio)
 	vdev_raidz_t *vdrz = vd->vdev_tsd;
 	raidz_map_t *rm;
 
-	uint64_t logical_width = vdev_raidz_get_logical_width(vdrz,
-	    BP_GET_PHYSICAL_BIRTH(zio->io_bp));
-	if (logical_width != vdrz->vd_physical_width) {
+	vdev_raidz_layout_t layout = vdev_raidz_layout_for_bp(vdrz, zio->io_bp);
+	if (layout.vrl_width != vdrz->vd_physical_width) {
 		zfs_locked_range_t *lr = NULL;
 		uint64_t synced_offset = UINT64_MAX;
 		uint64_t next_offset = UINT64_MAX;
@@ -2707,12 +2731,13 @@ vdev_raidz_io_start(zio_t *zio)
 
 		rm = vdev_raidz_map_alloc_expanded(zio,
 		    tvd->vdev_ashift, vdrz->vd_physical_width,
-		    logical_width, vdrz->vd_nparity,
+		    layout.vrl_width, layout.vrl_nparity,
 		    synced_offset, next_offset, use_scratch);
 		rm->rm_lr = lr;
 	} else {
 		rm = vdev_raidz_map_alloc(zio,
-		    tvd->vdev_ashift, logical_width, vdrz->vd_nparity);
+		    tvd->vdev_ashift, layout.vrl_width,
+		    layout.vrl_nparity);
 	}
 	rm->rm_original_width = vdrz->vd_original_width;
 
@@ -2723,7 +2748,7 @@ vdev_raidz_io_start(zio_t *zio)
 			vdev_raidz_io_start_write(zio, rm->rm_row[i]);
 		}
 
-		if (logical_width == vdrz->vd_physical_width) {
+		if (layout.vrl_width == vdrz->vd_physical_width) {
 			raidz_start_skip_writes(zio);
 		}
 	} else {
