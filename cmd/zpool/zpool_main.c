@@ -129,6 +129,7 @@ static int zpool_do_get(int, char **);
 static int zpool_do_set(int, char **);
 
 static int zpool_do_sync(int, char **);
+static int zpool_do_reparity(int, char **);
 
 static int zpool_do_version(int, char **);
 
@@ -201,6 +202,7 @@ typedef enum {
 	HELP_SET,
 	HELP_SPLIT,
 	HELP_SYNC,
+	HELP_REPARITY,
 	HELP_REGUID,
 	HELP_REOPEN,
 	HELP_VERSION,
@@ -431,6 +433,7 @@ static zpool_command_t command_table[] = {
 	{ "get",	zpool_do_get,		HELP_GET		},
 	{ "set",	zpool_do_set,		HELP_SET		},
 	{ "sync",	zpool_do_sync,		HELP_SYNC		},
+	{ "reparity",	zpool_do_reparity,	HELP_REPARITY		},
 	{ NULL },
 	{ "wait",	zpool_do_wait,		HELP_WAIT		},
 	{ NULL },
@@ -549,6 +552,8 @@ get_usage(zpool_help_t idx)
 		return (gettext("\treguid [-g guid] <pool>\n"));
 	case HELP_SYNC:
 		return (gettext("\tsync [pool] ...\n"));
+	case HELP_REPARITY:
+		return (gettext("\treparity [--online | --async | --status | --cancel] <pool>\n"));
 	case HELP_VERSION:
 		return (gettext("\tversion [-j]\n"));
 	case HELP_WAIT:
@@ -4676,6 +4681,165 @@ error:
  * This command initiates TXG sync(s) and will return after the TXG(s) commit.
  *
  */
+/*
+ * zpool reparity [--online | --async | --status | --cancel] <pool>
+ *
+ * Promote a raidz pool's parity in place (raidz1->2 / raidz2->3). Modes:
+ *   (default)  synchronous, auto-quiesce (briefly unmount + remount datasets)
+ *   --online   synchronous, datasets stay mounted (chunked suspend/resume)
+ *   --async    non-blocking: start an online reparity in a background kernel
+ *              thread and return immediately
+ *   --status   report progress of the background op
+ *   --cancel   request cancellation of the background op
+ */
+static int
+zpool_do_reparity(int argc, char **argv)
+{
+    boolean_t online = B_FALSE, async = B_FALSE;
+    boolean_t status = B_FALSE, cancel = B_FALSE;
+    uint64_t req_target = 0;
+    int ai = 1;
+    while (ai < argc && argv[ai][0] == '-' && argv[ai][1] == '-') {
+        if (strcmp(argv[ai], "--online") == 0)
+            online = B_TRUE;
+        else if (strcmp(argv[ai], "--async") == 0)
+            async = B_TRUE;
+        else if (strcmp(argv[ai], "--status") == 0)
+            status = B_TRUE;
+        else if (strcmp(argv[ai], "--cancel") == 0)
+            cancel = B_TRUE;
+        else if (strcmp(argv[ai], "--target") == 0 && ai + 1 < argc)
+            req_target = strtoull(argv[++ai], NULL, 10);
+        else
+            break;
+        ai++;
+    }
+    if (argc - ai != 1) {
+        (void) fprintf(stderr, gettext("usage: zpool reparity "
+            "[--online | --async | --status | --cancel] [--target N] <pool>\n"));
+        return (2);
+    }
+    const char *pool = argv[ai];
+    nvlist_t *out = NULL, *in = fnvlist_alloc();
+
+    if (status) {
+        fnvlist_add_boolean_value(in, "status", B_TRUE);
+        int e = lzc_pool_reparity(pool, in, &out);
+        boolean_t act = B_FALSE, comm = B_FALSE, cing = B_FALSE;
+        uint64_t vis = 0, res = 0, tgt = 0;
+        int32_t oe = 0;
+        const char *op = NULL;
+        if (out != NULL) {
+            (void) nvlist_lookup_boolean_value(out, "active", &act);
+            (void) nvlist_lookup_boolean_value(out, "committed", &comm);
+            (void) nvlist_lookup_boolean_value(out, "canceling", &cing);
+            (void) nvlist_lookup_uint64(out, "visited", &vis);
+            (void) nvlist_lookup_uint64(out, "residual", &res);
+            (void) nvlist_lookup_uint64(out, "target_parity", &tgt);
+            (void) nvlist_lookup_int32(out, "error", &oe);
+            (void) nvlist_lookup_string(out, "pool", &op);
+        }
+        if (op == NULL || op[0] == '\0')
+            (void) printf(gettext("no reparity operation on record\n"));
+        else if (act)
+            (void) printf(gettext("reparity of '%s' RUNNING%s: target "
+                "parity %llu, visited %llu blocks, residual %llu\n"),
+                op, cing ? " (canceling)" : "", (u_longlong_t)tgt,
+                (u_longlong_t)vis, (u_longlong_t)res);
+        else
+            (void) printf(gettext("reparity of '%s' %s: target parity "
+                "%llu, visited %llu blocks, residual %llu (err %d)\n"),
+                op, comm ? "COMMITTED" : "ended", (u_longlong_t)tgt,
+                (u_longlong_t)vis, (u_longlong_t)res, oe);
+        nvlist_free(in);
+        nvlist_free(out);
+        return (e);
+    }
+    if (cancel) {
+        fnvlist_add_boolean_value(in, "cancel", B_TRUE);
+        int e = lzc_pool_reparity(pool, in, &out);
+        if (e == 0)
+            (void) printf(gettext("reparity of '%s': cancellation "
+                "requested\n"), pool);
+        else
+            (void) fprintf(stderr, gettext("reparity of '%s': no "
+                "operation in progress\n"), pool);
+        nvlist_free(in);
+        nvlist_free(out);
+        return (e == 0 ? 0 : 1);
+    }
+    if (async) {
+        fnvlist_add_boolean_value(in, "async", B_TRUE);
+        fnvlist_add_boolean_value(in, "online", B_TRUE);
+        if (req_target != 0)
+            fnvlist_add_uint64(in, "target_parity", req_target);
+        int e = lzc_pool_reparity(pool, in, &out);
+        if (e == 0)
+            (void) printf(gettext("reparity of '%s' started in the "
+                "background (online).\n  progress: zpool reparity "
+                "--status %s\n  cancel:   zpool reparity --cancel %s\n"),
+                pool, pool, pool);
+        else if (e == EBUSY)
+            (void) fprintf(stderr, gettext("reparity of '%s': an "
+                "operation is already in progress\n"), pool);
+        else
+            (void) fprintf(stderr, gettext("reparity of '%s' failed to "
+                "start (err %d)\n"), pool, e);
+        nvlist_free(in);
+        nvlist_free(out);
+        return (e == 0 ? 0 : 1);
+    }
+
+    /* synchronous (default / --online) */
+    if (online)
+        fnvlist_add_boolean_value(in, "online", B_TRUE);
+    if (req_target != 0)
+        fnvlist_add_uint64(in, "target_parity", req_target);
+    zpool_handle_t *zhp = online ? NULL : zpool_open(g_zfs, pool);
+    if (zhp != NULL)
+        (void) zpool_disable_datasets(zhp, B_FALSE);
+    int err = lzc_pool_reparity(pool, in, &out);
+    uint64_t visited = 0, residual = 0, target = 0, busy = 0, snaps = 0;
+    boolean_t committed = B_FALSE;
+    if (out != NULL) {
+        (void) nvlist_lookup_uint64(out, "visited", &visited);
+        (void) nvlist_lookup_uint64(out, "residual", &residual);
+        (void) nvlist_lookup_uint64(out, "target_parity", &target);
+        (void) nvlist_lookup_boolean_value(out, "committed", &committed);
+        (void) nvlist_lookup_uint64(out, "busy_datasets", &busy);
+        (void) nvlist_lookup_uint64(out, "snapshots", &snaps);
+    }
+    if (err == 0 && committed) {
+        (void) printf(gettext("reparity of '%s' COMMITTED at parity %llu "
+            "(visited %llu blocks)\n"), pool, (u_longlong_t)target,
+            (u_longlong_t)visited);
+    } else if (err == EBUSY) {
+        (void) fprintf(stderr, gettext("reparity of '%s': an operation is "
+            "already in progress\n"), pool);
+    } else {
+        if (busy > 0)
+            (void) fprintf(stderr, gettext("reparity of '%s': %llu "
+                "dataset(s) busy; unmount them first (zfs unmount -a)\n"),
+                pool, (u_longlong_t)busy);
+        else if (snaps > 0 && residual > 0)
+            (void) fprintf(stderr, gettext("reparity of '%s' blocked by "
+                "%llu snapshot(s) pinning %llu blocks at the old parity; "
+                "destroy them and re-run\n"), pool, (u_longlong_t)snaps,
+                (u_longlong_t)residual);
+        else
+            (void) fprintf(stderr, gettext("reparity of '%s' did not "
+                "complete: residual=%llu visited=%llu (err %d)\n"), pool,
+                (u_longlong_t)residual, (u_longlong_t)visited, err);
+    }
+    if (zhp != NULL) {
+        (void) zpool_enable_datasets(zhp, NULL, 0, 1);
+        zpool_close(zhp);
+    }
+    nvlist_free(in);
+    nvlist_free(out);
+    return (err == 0 && committed ? 0 : 1);
+}
+
 static int
 zpool_do_sync(int argc, char **argv)
 {
