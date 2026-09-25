@@ -2858,6 +2858,21 @@ zhack_snap_bpr_sync(void *arg, dmu_tx_t *tx)
 		if (grow != 0)
 			dsl_dir_diduse_space(snap->ds_dir, DD_USED_HEAD,
 			    grow, 0, 0, tx);
+		/*
+		 * The BPR grew dd_used without going through block_born/
+		 * block_kill, so a head's ds_unique_bytes is now stale relative
+		 * to dd_used. The exact unique value depends on shared/clone
+		 * blocks and cannot be reconstructed by a simple delta, so mark
+		 * it inaccurate: ZFS recomputes it on demand
+		 * (dsl_dataset_recalc_head_uniq). dsl_destroy asserts
+		 * ds_unique==dd_used only under DS_UNIQUE_IS_ACCURATE, and the
+		 * destroy uses dd_used_bytes (corrected above), not ds_unique.
+		 */
+		if (grow != 0 && DS_UNIQUE_IS_ACCURATE(snap)) {
+			dmu_buf_will_dirty(snap->ds_dbuf, tx);
+			dsl_dataset_phys(snap)->ds_flags &=
+			    ~DS_FLAG_UNIQUE_ACCURATE;
+		}
 	}
 	zhack_bpr_ds = NULL;
 	dsl_dataset_rele(snap, FTAG);
