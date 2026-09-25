@@ -266,7 +266,7 @@ static struct zstd_pool *zstd_mempool_dctx;
 #endif
 
 /* Kernel space. */
-#if defined(_KERNEL) && defined(ADDRESS_SANITIZER)
+#if defined(_KERNEL) && (defined(ADDRESS_SANITIZER) || defined(__SANITIZE_ADDRESS__))
 void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
 void __asan_poison_memory_region(void const volatile *addr, size_t size);
 void __asan_unpoison_memory_region(void const volatile *addr, size_t size) {};
