@@ -63,6 +63,7 @@
 #include <sys/backtrace.h>
 #include <sys/dsl_dir.h>
 #include <sys/space_map.h>
+#include <sys/brt.h>
 #include <zfeature_common.h>
 #include <libzutil.h>
 #include <sys/metaslab_impl.h>
@@ -3075,7 +3076,7 @@ zhack_snap_dlremap_sync(void *arg, dmu_tx_t *tx)
 static void
 zhack_bpr_ddt_remap_sync(void *arg, dmu_tx_t *tx)
 {
-	(void) tx;
+	(void) arg;
 	dsl_pool_t *dp = dmu_tx_pool(tx);
 	spa_t *spa = dp->dp_spa;
 	for (zhack_bpr_memo_t *m = avl_first(&zhack_bpr_memo); m != NULL;
