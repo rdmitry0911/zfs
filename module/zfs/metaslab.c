@@ -156,6 +156,59 @@ static uint_t zfs_metaslab_fragmentation_threshold = 77;
 int metaslab_debug_load = B_FALSE;
 
 /*
+ * P7 width contraction: minimum (vdev-absolute) allocation offset.
+ * While non-zero the first-fit block picker refuses offsets below it, so
+ * re-encoded narrow raidz blocks land physically above the old-width
+ * high-water and cannot collide with unswept wide blocks. 0 = off.
+ */
+uint64_t raidz_contract_floor = 0;
+/*
+ * P7 width contraction: max (exclusive, vdev-absolute) allocation offset
+ * = W * child_asize, so width-W re-encoded blocks never map off the child
+ * device during the still-N-wide transition. 0 = off.
+ */
+uint64_t raidz_contract_ceiling = 0;
+/*
+ * P7 width contraction PHYSICAL-GAP allocator. occmap is a per-child
+ * (child, depth) occupancy bitmap of EVERY original N-wide block's physical
+ * cells (built by a pre-pass). A re-encoded width-W block may only be placed
+ * where NONE of its width-W physical cells hit occmap -- i.e. in the physical
+ * gaps between the scattered old blocks -- so it can never collide with any
+ * old (swept or unswept) block. This is what a global offset floor cannot do
+ * (ZFS spreads metadata across the whole vdev). nsectors = child_asize sectors
+ * (occmap stride, also the on-device depth bound). 0/NULL = off.
+ */
+uint8_t *raidz_contract_occmap = NULL;
+uint64_t raidz_contract_occ_nsectors = 0;
+uint64_t raidz_contract_occ_nwidth = 0;
+uint64_t raidz_contract_occ_ashift = 0;
+
+/*
+ * B_TRUE iff a width-W block at [offset,offset+size) hits only free,
+ * on-device physical cells (no original N-wide block).
+ */
+static boolean_t
+raidz_contract_gap_ok(uint64_t offset, uint64_t size)
+{
+	uint64_t W = raidz_contract_occ_nwidth;
+	uint64_t b = offset >> raidz_contract_occ_ashift;
+	uint64_t s = size >> raidz_contract_occ_ashift;
+	uint64_t f = b % W;
+	uint64_t base_depth = b / W;
+	for (uint64_t c = 0; c < s; c++) {
+		uint64_t col = f + c;
+		uint64_t child = col % W;
+		uint64_t depth = base_depth + col / W;
+		if (depth >= raidz_contract_occ_nsectors)
+			return (B_FALSE);
+		uint64_t bit = child * raidz_contract_occ_nsectors + depth;
+		if (raidz_contract_occmap[bit >> 3] & (1 << (bit & 7)))
+			return (B_FALSE);
+	}
+	return (B_TRUE);
+}
+
+/*
  * When set will prevent metaslabs from being unloaded.
  */
 static int metaslab_debug_unload = B_FALSE;
@@ -1773,6 +1826,8 @@ metaslab_block_picker(zfs_range_tree_t *rt, uint64_t *cursor, uint64_t size,
 {
 	if (*cursor == 0)
 		*cursor = rt->rt_start;
+	if (raidz_contract_floor != 0 && *cursor < raidz_contract_floor)
+		*cursor = raidz_contract_floor;
 	zfs_btree_t *bt = &rt->rt_root;
 	zfs_btree_index_t where;
 	zfs_range_seg_t *rs = metaslab_block_find(bt, rt, *cursor, size,
@@ -1786,11 +1841,35 @@ metaslab_block_picker(zfs_range_tree_t *rt, uint64_t *cursor, uint64_t size,
 	while (rs != NULL && (zfs_rs_get_start(rs, rt) - first_found <=
 	    max_search || count_searched < metaslab_min_search_count)) {
 		uint64_t offset = zfs_rs_get_start(rs, rt);
+		if (raidz_contract_ceiling != 0 &&
+		    offset + size > raidz_contract_ceiling)
+			break;
 		if (offset + size <= zfs_rs_get_end(rs, rt)) {
-			*found_size = MIN(zfs_rs_get_end(rs, rt) - offset,
-			    max_size);
-			*cursor = offset + *found_size;
-			return (offset);
+			if (raidz_contract_occmap != NULL) {
+				uint64_t end = zfs_rs_get_end(rs, rt);
+				uint64_t o = offset;
+				uint64_t sec = 1ULL <<
+				    raidz_contract_occ_ashift;
+				int scan = 0;
+				while (o + size <= end &&
+				    !raidz_contract_gap_ok(o, size) &&
+				    scan < 200000) {
+					o += sec;
+					scan++;
+				}
+				if (o + size <= end &&
+				    raidz_contract_gap_ok(o, size)) {
+					*found_size = size;
+					*cursor = o + size;
+					return (o);
+				}
+			} else {
+				*found_size =
+				    MIN(zfs_rs_get_end(rs, rt) - offset,
+				    max_size);
+				*cursor = offset + *found_size;
+				return (offset);
+			}
 		}
 		rs = zfs_btree_next(bt, &where, &where);
 		count_searched++;
@@ -3461,6 +3540,9 @@ metaslab_should_allocate(metaslab_t *msp, uint64_t asize, boolean_t try_hard)
 	 */
 	if (unlikely(msp->ms_new))
 		return (B_FALSE);
+	if (raidz_contract_ceiling != 0 &&
+	    msp->ms_start >= raidz_contract_ceiling)
+		return (B_FALSE);
 
 	/*
 	 * If the metaslab is loaded, ms_max_size is definitive and we can use
@@ -4866,6 +4948,18 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t max_size,
 	VERIFY0(msp->ms_new);
 
 	start = mc->mc_ops->msop_alloc(msp, size, max_size, actual_size);
+	/*
+	 * ceiling: enforced even without the occmap (e.g. on the kernel after
+	 * contraction, where all blocks are width-W and only on-device matters)
+	 * so df_alloc's size-based fallback cannot place a width-W block past
+	 * W*child_asize and run off the child device.
+	 */
+	if (start != -1ULL && raidz_contract_ceiling != 0 &&
+	    start + *actual_size > raidz_contract_ceiling)
+		start = -1ULL;
+	if (start != -1ULL && raidz_contract_occmap != NULL &&
+	    !raidz_contract_gap_ok(start, *actual_size))
+		start = -1ULL;
 	if (start != -1ULL) {
 		size = *actual_size;
 		metaslab_group_t *mg = msp->ms_group;
@@ -5287,7 +5381,9 @@ next:
 		 * we may end up in an infinite loop retrying the same
 		 * metaslab.
 		 */
-		ASSERT(!metaslab_should_allocate(msp, asize, try_hard));
+		ASSERT(raidz_contract_occmap != NULL ||
+		    raidz_contract_ceiling != 0 ||
+		    !metaslab_should_allocate(msp, asize, try_hard));
 
 		mutex_exit(&msp->ms_lock);
 	}
@@ -6378,6 +6474,10 @@ ZFS_MODULE_PARAM(zfs_metaslab, metaslab_, aliquot, U64, ZMOD_RW,
 ZFS_MODULE_PARAM(zfs_metaslab, metaslab_, debug_load, INT, ZMOD_RW,
 	"Load all metaslabs when pool is first opened");
 
+ZFS_MODULE_PARAM(zfs, raidz_, contract_floor, U64, ZMOD_RW,
+	"P7: min vdev-absolute alloc offset during width contraction (0=off)");
+ZFS_MODULE_PARAM(zfs, raidz_, contract_ceiling, U64, ZMOD_RW,
+	"P7: max vdev-absolute alloc offset during width contraction (0=off)");
 ZFS_MODULE_PARAM(zfs_metaslab, metaslab_, debug_unload, INT, ZMOD_RW,
 	"Prevent metaslabs from being unloaded");
 
