@@ -7707,6 +7707,18 @@ int reparity_reached_phase = 0;
 int reparity_allow_dedup = 0;
 unsigned long reparity_mos_budget = 256;
 unsigned long reparity_condense_budget = 16;
+/*
+ * P10 foreground-load feedback: the static budgets above bound per-txg WORK,
+ * but a fully idle-vs-busy pool wants different pacing. When reparity_load_ms
+ * > 0 the background sweep, between bounded sync tasks, checks the pool's
+ * in-flight dirty data: if it is already above reparity_load_pct% of
+ * zfs_dirty_data_max -- i.e. foreground writers are loading the TXG engine --
+ * the sweep sleeps reparity_load_ms so it yields TXG bandwidth to them, and
+ * runs at full speed when the pool is idle. Default 0 = off (behavior
+ * unchanged); it never affects correctness, only sweep pacing.
+ */
+unsigned long reparity_load_ms = 0;
+unsigned long reparity_load_pct = 60;
 #define	RP_EPOCH_PUBLISHED	1
 #define	RP_SWEEP_STARTED	2
 #define	RP_SWEEP_DONE		3
@@ -8556,6 +8568,29 @@ reparity_reaccount(const char *pool)
 		kmem_free(rrn.rrn_names, rrn.rrn_cap * sizeof (char *));
 }
 
+/*
+ * P10 foreground-load feedback (see reparity_load_ms). Called between bounded
+ * sweep sync tasks: if opted in and the pool's in-flight dirty data is above
+ * reparity_load_pct% of zfs_dirty_data_max, sleep reparity_load_ms so the
+ * background sweep yields TXG bandwidth to foreground writers. No-op by default
+ * and never affects correctness -- only pacing.
+ */
+static void
+reparity_load_backoff(spa_t *spa)
+{
+	dsl_pool_t *dp;
+	uint64_t thresh;
+
+	if (reparity_load_ms == 0)
+		return;
+	dp = spa_get_dsl(spa);
+	if (dp == NULL)
+		return;
+	thresh = zfs_dirty_data_max / 100 * reparity_load_pct;
+	if (dp->dp_dirty_total > thresh)
+		delay(MSEC_TO_TICK(reparity_load_ms));
+}
+
 static int
 reparity_do(const char *pool, uint64_t target_req, boolean_t online,
     reparity_async_t *ra, nvlist_t *onvl)
@@ -8802,6 +8837,7 @@ reparity_do(const char *pool, uint64_t target_req, boolean_t online,
 		if (err != 0) {
 			spa_close(spa, FTAG); return (err);
 		}
+		reparity_load_backoff(spa);	/* P10 */
 	} while (sr.sr_mos_more);
 	{
 		/*
@@ -8980,6 +9016,12 @@ ZFS_MODULE_PARAM(zfs, reparity_, mos_budget, ULONG, ZMOD_RW,
 	"P10: MOS objects dirtied per reparity sync task (per-txg bound)");
 ZFS_MODULE_PARAM(zfs, reparity_, condense_budget, ULONG, ZMOD_RW,
 	"P10: metaslabs condensed per reparity txg batch (per-txg bound)");
+ZFS_MODULE_PARAM(zfs, reparity_, load_ms, ULONG, ZMOD_RW,
+	"P10: ms the background sweep backs off when foreground dirty-data "
+	"load is high (0 = off, behavior unchanged)");
+ZFS_MODULE_PARAM(zfs, reparity_, load_pct, ULONG, ZMOD_RW,
+	"P10: dirty-data percent of zfs_dirty_data_max above which the "
+	"reparity sweep backs off to yield to foreground writers");
 ZFS_MODULE_PARAM(zfs, reparity_, allow_dedup, INT, ZMOD_RW,
 	"P8b: permit reparity COMMIT on a dedup/BRT pool whose DDT was "
 	"migrated by the dedup-aware BPR (default 0 = fail-closed)");
