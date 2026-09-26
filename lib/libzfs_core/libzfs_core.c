@@ -532,6 +532,12 @@ lzc_exists(const char *dataset)
  * needed in the future.
  */
 int
+lzc_pool_reparity(const char *pool, nvlist_t *innvl, nvlist_t **outnvl)
+{
+	return (lzc_ioctl(ZFS_IOC_POOL_REPARITY, pool, innvl, outnvl));
+}
+
+int
 lzc_sync(const char *pool_name, nvlist_t *innvl, nvlist_t **outnvl)
 {
 	(void) outnvl;
