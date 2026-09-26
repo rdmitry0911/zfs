@@ -2024,6 +2024,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/raidz/raidz_parity_epochs_pos.ksh \
 	functional/raidz/raidz_recon_pos.ksh \
 	functional/raidz/reparity_neg.ksh \
+	functional/raidz/reparity_online_pos.ksh \
 	functional/raidz/reparity_promote_pos.ksh \
 	functional/raidz/setup.ksh \
 	functional/redacted_send/cleanup.ksh \
