@@ -2482,6 +2482,15 @@ static uint64_t zhack_bpr_rewritten;
 static uint64_t zhack_bpr_errors;
 static uint64_t zhack_bpr_alloc_bytes;
 static uint64_t zhack_bpr_free_bytes;
+/*
+ * P20/RC codec normalization: when set, the per-block rewrite re-encodes
+ * level-0 plain file-DATA blocks with zhack_norm_target_{checksum,compress}
+ * (recompress + rechecksum, logical content byte-identical) instead of
+ * preserving the old codec -- so snapshot/clone-pinned old-codec blocks reach
+ * the target codec via the same shared-block BPR relocation used for parity.
+ * No parity epoch is established (parity is unchanged; only the codec is).
+ */
+static int zhack_bpr_normalize;
 static uint64_t zhack_bpr_dlremapped;
 static uint64_t zhack_bpr_freed;
 /*
@@ -2698,8 +2707,22 @@ zhack_bpr_bp(spa_t *spa, dmu_tx_t *tx, blkptr_t *bp, const zbookmark_phys_t *zb)
 
 	zio_prop_t zp;
 	memset(&zp, 0, sizeof (zp));
-	zp.zp_checksum = BP_GET_CHECKSUM(&old);
-	zp.zp_compress = BP_GET_COMPRESS(&old);
+	if (zhack_bpr_normalize && level == 0 &&
+	    type == DMU_OT_PLAIN_FILE_CONTENTS) {
+		/*
+		 * P20/RC: re-encode the corpus block at the target codec. Same
+		 * logical content (priv/lsize), new checksum + compressor; the
+		 * write path re-compresses and re-checksums, and ZFS's raw
+		 * fallback stores an incompressible block OFF (which the RC1
+		 * verifier accepts). Metadata (level>0 / non-file) keeps its
+		 * own codec.
+		 */
+		zp.zp_checksum = zhack_norm_target_checksum;
+		zp.zp_compress = zhack_norm_target_compress;
+	} else {
+		zp.zp_checksum = BP_GET_CHECKSUM(&old);
+		zp.zp_compress = BP_GET_COMPRESS(&old);
+	}
 	zp.zp_complevel = ZIO_COMPLEVEL_DEFAULT;
 	zp.zp_type = type;
 	zp.zp_level = level;
@@ -3367,6 +3390,51 @@ zhack_do_snap_bpr(int argc, char **argv)
 	    (u_longlong_t)(zhack_bpr_free_bytes>>10));
 	spa_close(spa, FTAG);
 	return (0);
+}
+
+/*
+ * usage: zhack normalize_bpr <pool> <checksum-name> <compress-name> [snap]
+ * P20/RC shared-block RELOCATION: normalize the CODEC (checksum+compressor) of
+ * snapshot/clone-pinned level-0 file-DATA blocks that `zfs rewrite -r` cannot
+ * touch (they are immutable in the snapshot). This is the snap_bpr shared-block
+ * block-pointer-rewrite driver run in codec-normalize mode (no parity epoch is
+ * established -- parity is unchanged), so after `zfs rewrite -r <ds>` on the
+ * head + this on its snapshots, `zhack normalize_verify` conforms everywhere.
+ * A re-encoded block gets a new checksum/psize/DVA; the rewrite-once memo +
+ * deadlist/DDT/BRT remap + free-once passes are reused verbatim from snap_bpr.
+ */
+static int
+zhack_do_normalize_bpr(int argc, char **argv)
+{
+	argc--; argv++;
+	if (argc < 3)
+		usage();
+	if (!zhack_checksum_by_name(argv[1], &zhack_norm_target_checksum))
+		fatal(NULL, FTAG, "unsupported checksum name: %s", argv[1]);
+	if (!zhack_compress_by_name(argv[2], &zhack_norm_target_compress))
+		fatal(NULL, FTAG, "unsupported compress name: %s", argv[2]);
+	/*
+	 * Delegate to the hardened snap_bpr driver with normalize mode armed.
+	 * Rebuild its argv: [subcmd(skipped), pool[, snap]].
+	 */
+	char *sub[3];
+	int subc;
+	sub[0] = (char *)"normalize_bpr";	/* skipped by the delegate */
+	sub[1] = argv[0];
+	if (argc >= 4) {
+		sub[2] = argv[3];
+		subc = 3;
+	} else {
+		subc = 2;
+	}
+	zhack_bpr_normalize = 1;
+	int rv = zhack_do_snap_bpr(subc, sub);
+	zhack_bpr_normalize = 0;
+	(void) fprintf(stderr, "normalize_bpr: target_checksum=%llu "
+	    "target_compress=%llu (see snap_bpr line for rewrite counts)\n",
+	    (u_longlong_t)zhack_norm_target_checksum,
+	    (u_longlong_t)zhack_norm_target_compress);
+	return (rv);
 }
 
 /*
@@ -4227,6 +4295,8 @@ main(int argc, char **argv)
 		rv = zhack_do_raidz_contract(argc, argv);
 	} else if (strcmp(subcommand, "normalize_verify") == 0) {
 		rv = zhack_do_normalize_verify(argc, argv);
+	} else if (strcmp(subcommand, "normalize_bpr") == 0) {
+		rv = zhack_do_normalize_bpr(argc, argv);
 	} else if (strcmp(subcommand, "placement_verify") == 0) {
 		rv = zhack_do_placement_verify(argc, argv);
 	} else if (strcmp(subcommand, "raidz_epochs") == 0) {
