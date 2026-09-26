@@ -8387,6 +8387,67 @@ reparity_reaccount_check(void *arg, dmu_tx_t *tx)
 	return (0);
 }
 
+/*
+ * Adjust DD_USED_SNAP by `delta` and propagate the change up the dsl_dir tree,
+ * matching dsl_dir_diduse_space() + dsl_dir_diduse_transfer_space_impl()
+ * bit-for-bit -- EXCEPT that every ancestor's dd_lock is taken under a
+ * MUTEX_HELD guard.
+ *
+ * Why this exists: the stock transfer path (dsl_dir_diduse_transfer_space_impl)
+ * takes each ancestor's dd_lock UNCONDITIONALLY (unlike the leaf, which guards
+ * with !MUTEX_HELD). When this reaccounting sync task runs, the txg_sync thread
+ * already owns the pool root dir's dd_lock, so the stock unconditional
+ * re-acquire self-deadlocks (confirmed via sysrq-t: txg_sync blocked on its own
+ * dd_lock in dsl_dir_diduse_space_impl, no other lock holder). Guarding every
+ * level with MUTEX_HELD lets us update the accounting safely whether or not we
+ * already own that level's lock. parent_delta() is replicated inline (it is
+ * static in dsl_dir.c); it returns the raw delta whenever dd_reserved == 0,
+ * which is the reparity case.
+ */
+static void
+reparity_diduse_snap(dsl_dir_t *dd, int64_t delta, dmu_tx_t *tx)
+{
+	int64_t used = delta;
+	int64_t tonew = delta;
+	boolean_t leaf = B_TRUE;
+
+	while (dd != NULL) {
+		boolean_t needlock = !MUTEX_HELD(&dd->dd_lock);
+		dsl_dir_phys_t *ddp;
+		uint64_t old_used, reserved;
+		int64_t accounted;
+
+		if (needlock) {
+			mutex_enter(&dd->dd_lock);
+		}
+		dmu_buf_will_dirty(dd->dd_dbuf, tx);
+		ddp = dsl_dir_phys(dd);
+		old_used = ddp->dd_used_bytes;
+		reserved = ddp->dd_reserved;
+		accounted = (reserved == 0) ? used :
+		    (int64_t)(MAX(old_used + used, reserved) -
+		    MAX(old_used, reserved));
+		ddp->dd_used_bytes += used;
+		if (ddp->dd_flags & DD_FLAG_USED_BREAKDOWN) {
+			if (leaf) {
+				ddp->dd_used_breakdown[DD_USED_SNAP] += tonew;
+			} else {
+				ddp->dd_used_breakdown[DD_USED_CHILD] += tonew;
+				ddp->dd_used_breakdown[DD_USED_CHILD_RSRV] -=
+				    (tonew - used);
+			}
+		}
+		if (needlock) {
+			mutex_exit(&dd->dd_lock);
+		}
+
+		tonew = used;
+		used = accounted;
+		leaf = B_FALSE;
+		dd = dd->dd_parent;
+	}
+}
+
 static void
 reparity_reaccount_sync(void *arg, dmu_tx_t *tx)
 {
@@ -8433,8 +8494,7 @@ reparity_reaccount_sync(void *arg, dmu_tx_t *tx)
 		dsl_dataset_rele(next, FTAG);
 
 	if (snap_new != snap_old) {
-		dsl_dir_diduse_space(head->ds_dir, DD_USED_SNAP,
-		    snap_new - snap_old, 0, 0, tx);
+		reparity_diduse_snap(head->ds_dir, snap_new - snap_old, tx);
 	}
 	dmu_buf_will_dirty(head->ds_dbuf, tx);
 	dsl_dataset_phys(head)->ds_flags &= ~DS_FLAG_UNIQUE_ACCURATE;
