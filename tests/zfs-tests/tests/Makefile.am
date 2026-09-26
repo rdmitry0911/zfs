@@ -1885,6 +1885,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/raidz/reparity_neg.ksh \
 	functional/raidz/reparity_online_pos.ksh \
 	functional/raidz/reparity_promote_pos.ksh \
+	functional/raidz/reparity_snap_bpr_pos.ksh \
 	functional/raidz/setup.ksh \
 	functional/redacted_send/cleanup.ksh \
 	functional/redacted_send/redacted_compressed.ksh \
