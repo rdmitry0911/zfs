@@ -7718,6 +7718,11 @@ int reparity_reached_phase = 0;
  * already done offline. Default 0 = keep the fail-closed guard.
  */
 int reparity_allow_dedup = 0;
+/*
+ * P9: online sweep with ZERO I/O pause -- never suspend/resume the mounted fs
+ * (default 0 = keep the brief per-batch suspends). See spa_reparity_ds_cb.
+ */
+int reparity_online_nosuspend = 0;
 unsigned long reparity_mos_budget = 256;
 unsigned long reparity_condense_budget = 16;
 /*
@@ -8127,6 +8132,31 @@ spa_reparity_ds_cb(const char *dsname, void *arg)
 	boolean_t online = (sr != NULL && sr->sr_online);
 	zfsvfs_t *zfsvfs = NULL;
 	if (online && getzfsvfs(dsname, &zfsvfs) == 0) {
+		/*
+		 * P9 literal zero-I/O-pause: sweep with the fs FULLY LIVE (no
+		 * suspend/resume at all). Safe because the rewrite is a normal
+		 * DMU write tx -- reparity_sweep_object's dmu_tx + will_rewrite
+		 * serialize against concurrent ZPL writes on the same dbuf via
+		 * the DMU (db_mtx/txg), and either writer leaves the block at
+		 * the target parity; object create/free races only shift a
+		 * block to a later pass, which the multi-pass sweep + census
+		 * catch. Opt-in (default keeps the brief-suspend batches below)
+		 * because it must be proven under concurrent write load.
+		 */
+		if (reparity_online_nosuspend) {
+			objset_t *os = zfsvfs->z_os;
+			uint64_t obj = 0;
+			while (dmu_object_next(os, &obj, B_FALSE, 0) == 0) {
+				if (sr != NULL && sr->sr_cancelp != NULL &&
+				    *sr->sr_cancelp)
+					break;
+				reparity_sweep_object(os, obj,
+				    sr != NULL ? sr->sr_start_txg : 0,
+				    sr != NULL ? sr->sr_cancelp : NULL);
+			}
+			zfs_vfs_rele(zfsvfs);
+			return (0);
+		}
 		/*
 		 * Online, INCREMENTAL: suspend the mounted fs, sweep only a
 		 * small batch of objects, resume -- repeat until done. Apps see
@@ -9038,6 +9068,9 @@ ZFS_MODULE_PARAM(zfs, reparity_, load_pct, ULONG, ZMOD_RW,
 ZFS_MODULE_PARAM(zfs, reparity_, allow_dedup, INT, ZMOD_RW,
 	"P8b: permit reparity COMMIT on a dedup/BRT pool whose DDT was "
 	"migrated by the dedup-aware BPR (default 0 = fail-closed)");
+ZFS_MODULE_PARAM(zfs, reparity_, online_nosuspend, INT, ZMOD_RW,
+	"P9: online sweep with zero I/O pause -- never suspend the mounted fs "
+	"(default 0 = brief per-batch suspends); rewrite is DMU-serialized");
 
 static const zfs_ioc_key_t zfs_keys_pool_reparity[] = {
 	{"target_parity",	DATA_TYPE_UINT64,	ZK_OPTIONAL},
