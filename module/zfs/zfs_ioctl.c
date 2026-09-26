@@ -8350,6 +8350,152 @@ reparity_worker(void *arg)
 	thread_exit();
 }
 
+/*
+ * Post-reparity reaccounting. The parity BPR changes block asizes without
+ * going through dsl_dataset_block_born()/_kill(), so per-dataset derived
+ * accounting (ds_unique_bytes, the dir's DD_USED_SNAP breakdown) is left stale
+ * relative to the correctly-remapped deadlists (snap_bpr updates dl_used). On a
+ * debug build that trips destroy-time asserts (ds_unique==dd_used at
+ * dsl_destroy.c, process_old_cb poa.used==ds_unique, and the breakdown
+ * underflow in dsl_dir_diduse_space). Deadlists carry the new sizes, so we
+ * reconcile each dataset:
+ *   - a snapshot's ds_unique = the space in its successor's deadlist above its
+ *     prev_snap_txg (identical to what dsl_destroy's process_old_cb sums);
+ *   - the dir's DD_USED_SNAP breakdown by the net snapshot-unique delta;
+ *   - the head is marked !UNIQUE_ACCURATE so ZFS recomputes it on demand via
+ *     dsl_dataset_recalc_head_uniq() from ds_referenced + the head deadlist.
+ * The chain walk stops at the dir boundary so a clone's origin snapshot is
+ * reaccounted through its own head, not twice.
+ */
+typedef struct reparity_reaccount_arg {
+	const char	*rra_name;
+	uint64_t	rra_obj;
+} reparity_reaccount_arg_t;
+
+static int
+reparity_reaccount_check(void *arg, dmu_tx_t *tx)
+{
+	reparity_reaccount_arg_t *rra = arg;
+	dsl_pool_t *dp = dmu_tx_pool(tx);
+	dsl_dataset_t *ds;
+	int err = dsl_dataset_hold(dp, rra->rra_name, FTAG, &ds);
+
+	if (err != 0)
+		return (err);
+	rra->rra_obj = ds->ds_object;
+	dsl_dataset_rele(ds, FTAG);
+	return (0);
+}
+
+static void
+reparity_reaccount_sync(void *arg, dmu_tx_t *tx)
+{
+	reparity_reaccount_arg_t *rra = arg;
+	dsl_pool_t *dp = dmu_tx_pool(tx);
+	dsl_dataset_t *head, *next, *snap;
+	int64_t snap_old = 0, snap_new = 0;
+	uint64_t snapobj;
+
+	if (rra->rra_obj == 0 ||
+	    dsl_dataset_hold_obj(dp, rra->rra_obj, FTAG, &head) != 0)
+		return;
+	if (head->ds_is_snapshot) {
+		dsl_dataset_rele(head, FTAG);
+		return;
+	}
+
+	next = head;
+	snapobj = dsl_dataset_phys(head)->ds_prev_snap_obj;
+	while (snapobj != 0) {
+		uint64_t u = 0, c = 0, uc = 0;
+
+		if (dsl_dataset_hold_obj(dp, snapobj, FTAG, &snap) != 0)
+			break;
+		/* a clone origin lives in another dir -- reaccount it there */
+		if (snap->ds_dir->dd_object != head->ds_dir->dd_object) {
+			dsl_dataset_rele(snap, FTAG);
+			break;
+		}
+		dsl_deadlist_space_range(&next->ds_deadlist,
+		    dsl_dataset_phys(snap)->ds_prev_snap_txg, UINT64_MAX,
+		    &u, &c, &uc);
+		snap_old += (int64_t)dsl_dataset_phys(snap)->ds_unique_bytes;
+		snap_new += (int64_t)u;
+		dmu_buf_will_dirty(snap->ds_dbuf, tx);
+		dsl_dataset_phys(snap)->ds_unique_bytes = u;
+		dsl_dataset_phys(snap)->ds_flags |= DS_FLAG_UNIQUE_ACCURATE;
+		if (next != head)
+			dsl_dataset_rele(next, FTAG);
+		next = snap;
+		snapobj = dsl_dataset_phys(snap)->ds_prev_snap_obj;
+	}
+	if (next != head)
+		dsl_dataset_rele(next, FTAG);
+
+	if (snap_new != snap_old) {
+		dsl_dir_diduse_space(head->ds_dir, DD_USED_SNAP,
+		    snap_new - snap_old, 0, 0, tx);
+	}
+	dmu_buf_will_dirty(head->ds_dbuf, tx);
+	dsl_dataset_phys(head)->ds_flags &= ~DS_FLAG_UNIQUE_ACCURATE;
+	dsl_dataset_rele(head, FTAG);
+}
+
+typedef struct reparity_reaccount_names {
+	char	**rrn_names;
+	int	rrn_count;
+	int	rrn_cap;
+} reparity_reaccount_names_t;
+
+static int
+reparity_reaccount_collect(const char *name, void *arg)
+{
+	reparity_reaccount_names_t *rrn = arg;
+
+	if (strchr(name, '@') != NULL)
+		return (0);
+	if (rrn->rrn_count == rrn->rrn_cap) {
+		int nc = (rrn->rrn_cap != 0) ? rrn->rrn_cap * 2 : 16;
+		char **nn = kmem_alloc(nc * sizeof (char *), KM_SLEEP);
+
+		if (rrn->rrn_names != NULL) {
+			memcpy(nn, rrn->rrn_names,
+			    rrn->rrn_count * sizeof (char *));
+			kmem_free(rrn->rrn_names,
+			    rrn->rrn_cap * sizeof (char *));
+		}
+		rrn->rrn_names = nn;
+		rrn->rrn_cap = nc;
+	}
+	rrn->rrn_names[rrn->rrn_count++] = spa_strdup(name);
+	return (0);
+}
+
+/*
+ * Collect head dataset names first (read-only), THEN run the per-dataset sync
+ * tasks. Calling dsl_sync_task() from inside the dmu_objset_find() callback
+ * would wait for a txg sync while holding dp_config_rwlock as a reader (the
+ * sync needs the writer) and deadlock.
+ */
+static void
+reparity_reaccount(const char *pool)
+{
+	reparity_reaccount_names_t rrn = { 0 };
+	int i;
+
+	(void) dmu_objset_find((char *)(uintptr_t)pool,
+	    reparity_reaccount_collect, &rrn, DS_FIND_CHILDREN);
+	for (i = 0; i < rrn.rrn_count; i++) {
+		reparity_reaccount_arg_t rra = { rrn.rrn_names[i], 0 };
+
+		(void) dsl_sync_task(rrn.rrn_names[i], reparity_reaccount_check,
+		    reparity_reaccount_sync, &rra, 3, ZFS_SPACE_CHECK_NONE);
+		spa_strfree(rrn.rrn_names[i]);
+	}
+	if (rrn.rrn_names != NULL)
+		kmem_free(rrn.rrn_names, rrn.rrn_cap * sizeof (char *));
+}
+
 static int
 reparity_do(const char *pool, uint64_t target_req, boolean_t online,
     reparity_async_t *ra, nvlist_t *onvl)
@@ -8668,6 +8814,8 @@ reparity_do(const char *pool, uint64_t target_req, boolean_t online,
 	    &sr, 5, ZFS_SPACE_CHECK_NORMAL);
 	fnvlist_add_boolean_value(onvl, "committed", (err == 0));
 	if (ra != NULL && err == 0) ra->ra_committed = 1;
+	if (err == 0)
+		reparity_reaccount(spa_name(spa));
 	(void) reparity_phase(RP_POST_COMMIT);
 	spa_close(spa, FTAG);
 	return (err);
