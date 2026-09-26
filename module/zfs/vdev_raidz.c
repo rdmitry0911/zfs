@@ -3712,6 +3712,23 @@ vdev_raidz_combrec(zio_t *zio)
 	raidz_map_t *rm = zio->io_vsd;
 	int nparity = rm->rm_row[0]->rr_firstdatacol;
 	int physical_width = zio->io_vd->vdev_children;
+	/*
+	 * For a raidz vdev promoted in place (reparity), search up to the
+	 * marker-honored parity, not the per-block map parity. An online
+	 * promote run concurrently with SYNC writes can leave the ZIL header
+	 * pointing at either a born>=epoch (target-parity) log block or a
+	 * stale born<epoch (base-parity) one; spa_check_logs reads both during
+	 * a degraded import. Using rr_firstdatacol, a target-parity block that
+	 * has lost `target` children is wrongly declared unrecoverable (ENXIO)
+	 * and a stale base-parity block trips the per-row gate (ENXIO) instead
+	 * of exhausting to a benign end-of-log (ECKSUM) -- either way the
+	 * import fails though the committed data is intact. The honored parity
+	 * (a) lets the target-parity block reconstruct and (b) keeps the stale
+	 * block from tripping the gate so it becomes a benign ECKSUM. draid and
+	 * non-reparitied raidz are unaffected (honored == base there).
+	 */
+	if (zio->io_vd->vdev_ops == &vdev_raidz_ops)
+		nparity = vdev_raidz_honored_parity(zio->io_vd);
 	int original_width = (rm->rm_original_width != 0) ?
 	    rm->rm_original_width : physical_width;
 
