@@ -3256,6 +3256,31 @@ zhack_do_snap_bpr(int argc, char **argv)
 	if (argc < 1)
 		usage();
 	zhack_spa_open(argv[0], B_FALSE, FTAG, &spa);
+	/*
+	 * P20/RC fail-closed guard: codec normalization changes a block's
+	 * checksum, hence its DDT/BRT key, so the Pass-2.5/2.6 dedup/clone
+	 * remaps (which repoint by the OLD key) would corrupt a deduped/
+	 * block-cloned pool; and re-encoding under encryption is not yet
+	 * key-oblivious. Refuse rather than corrupt. (Parity promotion --
+	 * zhack_bpr_normalize==0 -- keeps the checksum, so its DDT/BRT remaps
+	 * stay valid; unaffected.)
+	 */
+	if (zhack_bpr_normalize) {
+		if (ddt_get_dedup_dspace(spa) != 0 || brt_get_used(spa) != 0) {
+			(void) fprintf(stderr, "normalize_bpr: REFUSED -- "
+			    "dedup/BRT active; a re-encoded block's new "
+			    "checksum changes its DDT/BRT key (unhandled)\n");
+			spa_close(spa, FTAG);
+			return (1);
+		}
+		if (spa_feature_is_active(spa, SPA_FEATURE_ENCRYPTION)) {
+			(void) fprintf(stderr, "normalize_bpr: REFUSED -- "
+			    "encryption active; codec re-encode is not yet "
+			    "key-oblivious\n");
+			spa_close(spa, FTAG);
+			return (1);
+		}
+	}
 	avl_create(&zhack_bpr_memo, zhack_bpr_memo_cmp,
 	    sizeof (zhack_bpr_memo_t), offsetof(zhack_bpr_memo_t, bm_link));
 	zhack_bpr_rewritten = 0;
