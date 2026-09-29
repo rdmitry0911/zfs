@@ -1797,6 +1797,15 @@ static uint64_t zhack_bpr_rewritten;
 static uint64_t zhack_bpr_errors;
 static uint64_t zhack_bpr_alloc_bytes;
 static uint64_t zhack_bpr_free_bytes;
+/*
+ * P20/RC codec normalization: when set, the per-block rewrite re-encodes
+ * level-0 plain file-DATA blocks with zhack_norm_target_{checksum,compress}
+ * (recompress + rechecksum, logical content byte-identical) instead of
+ * preserving the old codec, so snapshot/clone-pinned old-codec blocks reach
+ * the target codec via the same shared-block BPR relocation used for parity.
+ * No parity epoch is established (parity unchanged; only the codec is).
+ */
+static int zhack_bpr_normalize;
 static uint64_t zhack_bpr_dlremapped;
 static uint64_t zhack_bpr_freed;
 /* per-snapshot growth in physical (asize) space, applied to ds_referenced_bytes */
@@ -1998,8 +2007,20 @@ zhack_bpr_bp(spa_t *spa, dmu_tx_t *tx, blkptr_t *bp, const zbookmark_phys_t *zb)
 
 	zio_prop_t zp;
 	memset(&zp, 0, sizeof (zp));
-	zp.zp_checksum = BP_GET_CHECKSUM(&old);
-	zp.zp_compress = BP_GET_COMPRESS(&old);
+	if (zhack_bpr_normalize && level == 0 &&
+	    type == DMU_OT_PLAIN_FILE_CONTENTS) {
+		/*
+		 * P20/RC: re-encode the corpus block at the target codec (same
+		 * logical content; the write path recompresses + rechecksums,
+		 * with raw fallback for incompressible blocks). Metadata keeps
+		 * its own codec.
+		 */
+		zp.zp_checksum = zhack_norm_target_checksum;
+		zp.zp_compress = zhack_norm_target_compress;
+	} else {
+		zp.zp_checksum = BP_GET_CHECKSUM(&old);
+		zp.zp_compress = BP_GET_COMPRESS(&old);
+	}
 	zp.zp_complevel = ZIO_COMPLEVEL_DEFAULT;
 	zp.zp_type = type;
 	zp.zp_level = level;
@@ -2490,6 +2511,30 @@ zhack_do_snap_bpr(int argc, char **argv)
 	if (argc < 1)
 		usage();
 	zhack_spa_open(argv[0], B_FALSE, FTAG, &spa);
+	/*
+	 * P20/RC fail-closed guard: codec normalization changes a block's
+	 * checksum, hence its DDT/BRT key, so the Pass-2.5/2.6 dedup/clone
+	 * remaps (which repoint by the OLD key) would corrupt a deduped/
+	 * block-cloned pool; and re-encoding under encryption is not yet
+	 * key-oblivious. Refuse rather than corrupt. Parity promotion
+	 * (zhack_bpr_normalize==0, checksum preserved) is unaffected.
+	 */
+	if (zhack_bpr_normalize) {
+		if (ddt_get_dedup_dspace(spa) != 0 || brt_get_used(spa) != 0) {
+			(void) fprintf(stderr, "normalize_bpr: REFUSED -- "
+			    "dedup/BRT active; a re-encoded block's new "
+			    "checksum changes its DDT/BRT key (unhandled)\n");
+			spa_close(spa, FTAG);
+			return (1);
+		}
+		if (spa_feature_is_active(spa, SPA_FEATURE_ENCRYPTION)) {
+			(void) fprintf(stderr, "normalize_bpr: REFUSED -- "
+			    "encryption active; codec re-encode is not yet "
+			    "key-oblivious\n");
+			spa_close(spa, FTAG);
+			return (1);
+		}
+	}
 	avl_create(&zhack_bpr_memo, zhack_bpr_memo_cmp,
 	    sizeof (zhack_bpr_memo_t), offsetof(zhack_bpr_memo_t, bm_link));
 	zhack_bpr_rewritten = 0;
@@ -2616,6 +2661,45 @@ zhack_do_snap_bpr(int argc, char **argv)
 	    (u_longlong_t)(zhack_bpr_free_bytes>>10));
 	spa_close(spa, FTAG);
 	return (0);
+}
+
+/*
+ * usage: zhack normalize_bpr <pool> <checksum-name> <compress-name> [snap]
+ * P20/RC shared-block RELOCATION: normalize the CODEC of snapshot/clone-pinned
+ * level-0 file-DATA blocks that `zfs rewrite -r` cannot touch. The snap_bpr
+ * shared-block BPR driver run in codec-normalize mode (no parity epoch), so
+ * after `zfs rewrite -r <ds>` on the head + this on its snapshots, `zhack
+ * normalize_verify` conforms everywhere. Reuses the rewrite-once memo +
+ * deadlist/DDT/BRT remap + free-once passes; refuses dedup/BRT/encryption.
+ */
+static int
+zhack_do_normalize_bpr(int argc, char **argv)
+{
+	argc--; argv++;
+	if (argc < 3)
+		usage();
+	if (!zhack_checksum_by_name(argv[1], &zhack_norm_target_checksum))
+		fatal(NULL, FTAG, "unsupported checksum name: %s", argv[1]);
+	if (!zhack_compress_by_name(argv[2], &zhack_norm_target_compress))
+		fatal(NULL, FTAG, "unsupported compress name: %s", argv[2]);
+	char *sub[3];
+	int subc;
+	sub[0] = (char *)"normalize_bpr";	/* skipped by the delegate */
+	sub[1] = argv[0];
+	if (argc >= 4) {
+		sub[2] = argv[3];
+		subc = 3;
+	} else {
+		subc = 2;
+	}
+	zhack_bpr_normalize = 1;
+	int rv = zhack_do_snap_bpr(subc, sub);
+	zhack_bpr_normalize = 0;
+	(void) fprintf(stderr, "normalize_bpr: target_checksum=%llu "
+	    "target_compress=%llu (see snap_bpr line for rewrite counts)\n",
+	    (u_longlong_t)zhack_norm_target_checksum,
+	    (u_longlong_t)zhack_norm_target_compress);
+	return (rv);
 }
 
 /* ======== P7 part C: atomic in-libzpool raidz width contraction sweep ======== */
@@ -3465,6 +3549,8 @@ main(int argc, char **argv)
 		rv = zhack_do_raidz_contract(argc, argv);
 	} else if (strcmp(subcommand, "normalize_verify") == 0) {
 		rv = zhack_do_normalize_verify(argc, argv);
+	} else if (strcmp(subcommand, "normalize_bpr") == 0) {
+		rv = zhack_do_normalize_bpr(argc, argv);
 	} else if (strcmp(subcommand, "placement_verify") == 0) {
 		rv = zhack_do_placement_verify(argc, argv);
 	} else if (strcmp(subcommand, "raidz_epochs") == 0) {
