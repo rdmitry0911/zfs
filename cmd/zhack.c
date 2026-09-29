@@ -2381,9 +2381,26 @@ zhack_snap_dlremap_sync(void *arg, dmu_tx_t *tx)
 		}
 	}
 	int64_t uniq = (int64_t)dsref - (int64_t)prevref + (int64_t)dlused;
+	if (uniq < 0)
+		uniq = 0;
 	dmu_buf_will_dirty(snap->ds_dbuf, tx);
-	dsl_dataset_phys(snap)->ds_unique_bytes = (uniq < 0) ? 0 : (uint64_t)uniq;
+	int64_t snap_used_delta =
+	    uniq - (int64_t)dsl_dataset_phys(snap)->ds_unique_bytes;
+	dsl_dataset_phys(snap)->ds_unique_bytes = (uint64_t)uniq;
 	dsl_dataset_phys(snap)->ds_flags |= DS_FLAG_UNIQUE_ACCURATE;
+	/*
+	 * DD_USED_SNAP is the sum of every snapshot's unique bytes. The BPR
+	 * grew this snapshot's unique (re-derived above) but left DD_USED_SNAP
+	 * stale, so `zfs destroy <snap>` -- which decrements DD_USED_SNAP by
+	 * the (grown) deadlist-derived unique -- underflows dd_used_bytes and
+	 * PANICs (VERIFY at dsl_dir_diduse_space_impl) once the head no longer
+	 * shares those blocks (no slack). Reconcile the dir by the same delta.
+	 * Snapshots ONLY: a head/clone charges growth to DD_USED_HEAD in the
+	 * tree pass, and clone-origins returned early above (unique preserved).
+	 */
+	if (snap->ds_is_snapshot && snap_used_delta != 0)
+		dsl_dir_diduse_space(snap->ds_dir, DD_USED_SNAP,
+		    snap_used_delta, 0, 0, tx);
 	dsl_dataset_rele(snap, FTAG);
 }
 
