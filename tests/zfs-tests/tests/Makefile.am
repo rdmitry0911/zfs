@@ -2007,6 +2007,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/quota/quota_007_pos.ksh \
 	functional/quota/setup.ksh \
 	functional/raidz/cleanup.ksh \
+	functional/raidz/normalize_bpr_pos.ksh \
 	functional/raidz/raidz_001_neg.ksh \
 	functional/raidz/raidz_002_pos.ksh \
 	functional/raidz/raidz_dedup_overrun.ksh \
