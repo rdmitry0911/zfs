@@ -1870,6 +1870,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/quota/quota_006_neg.ksh \
 	functional/quota/setup.ksh \
 	functional/raidz/cleanup.ksh \
+	functional/raidz/normalize_bpr_pos.ksh \
 	functional/raidz/raidz_001_neg.ksh \
 	functional/raidz/raidz_002_pos.ksh \
 	functional/raidz/raidz_expand_001_pos.ksh \
