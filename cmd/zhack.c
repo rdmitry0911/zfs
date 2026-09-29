@@ -2370,7 +2370,24 @@ zhack_snap_dlremap_sync(void *arg, dmu_tx_t *tx)
  * persists the change. After this the DDT references the new blocks; the old
  * blocks are then freed as PLAIN (dedup bit cleared, Pass 3) so the drain does
  * NOT decref the (now-migrated) entry.
+ *
+ * P20/RC codec RE-KEY (zhack_bpr_normalize): a re-encoded block has a NEW
+ * checksum, so its DDT key changes -- a re-point (same key) would leave the
+ * entry keyed on the stale checksum. Instead move the entry: capture the old
+ * refcount N, clear the old-checksum phys (entry GC'd on sync; the old DVA is
+ * still freed PLAIN by Pass 3), then create/extend the new-checksum entry with
+ * the new DVAs and set its refcount to N. Same-content blocks map to the same
+ * new checksum, so dedup is preserved. Guarded up front so the target checksum
+ * is always dedup-capable (ddt_select asserts on a non-dedup checksum).
  */
+static boolean_t
+zhack_ddt_checksum_valid(uint64_t c)
+{
+	return (c == ZIO_CHECKSUM_SHA256 || c == ZIO_CHECKSUM_SHA512 ||
+	    c == ZIO_CHECKSUM_SKEIN || c == ZIO_CHECKSUM_EDONR ||
+	    c == ZIO_CHECKSUM_BLAKE3);
+}
+
 static void
 zhack_bpr_ddt_remap_sync(void *arg, dmu_tx_t *tx)
 {
@@ -2383,6 +2400,60 @@ zhack_bpr_ddt_remap_sync(void *arg, dmu_tx_t *tx)
 			continue;
 		if (BP_IS_HOLE(&m->bm_oldbp) || BP_IS_EMBEDDED(&m->bm_oldbp))
 			continue;
+		if (zhack_bpr_normalize) {
+			/*
+			 * Codec re-key: the new block has a new checksum, so
+			 * move the entry to its new key. Capture the old
+			 * refcount N and clear the old-checksum phys (the old
+			 * DVA is still freed PLAIN by Pass 3); then create the
+			 * new-checksum entry, fill its DVAs, and add N to its
+			 * refcount. (Guard guarantees the target checksum is
+			 * dedup-capable, so ddt_select won't assert.)
+			 */
+			uint64_t refn = 0;
+			ddt_t *oddt = ddt_select(spa, &m->bm_oldbp);
+			if (oddt == NULL)
+				continue;
+			ddt_enter(oddt);
+			ddt_entry_t *odde =
+			    ddt_lookup(oddt, &m->bm_oldbp, B_FALSE);
+			if (odde != NULL &&
+			    (odde->dde_flags & DDE_FLAG_LOADED)) {
+				ddt_phys_variant_t ov =
+				    ddt_phys_select(oddt, odde, &m->bm_oldbp);
+				if (ov != DDT_PHYS_NONE) {
+					refn = ddt_phys_refcnt(
+					    odde->dde_phys, ov);
+					ddt_phys_clear(odde->dde_phys, ov);
+				}
+			}
+			ddt_exit(oddt);
+			if (refn == 0)
+				continue;
+			ddt_t *nddt = ddt_select(spa, &m->bm_newbp);
+			if (nddt == NULL)
+				continue;
+			ddt_enter(nddt);
+			ddt_entry_t *ndde =
+			    ddt_lookup(nddt, &m->bm_newbp, B_TRUE);
+			if (ndde != NULL) {
+				int np = DDT_PHYS_FOR_COPIES(nddt,
+				    BP_GET_NDVAS(&m->bm_newbp));
+				ddt_phys_variant_t nv =
+				    DDT_PHYS_VARIANT(nddt, np);
+				ddt_phys_extend(ndde->dde_phys, nv,
+				    &m->bm_newbp);
+				if (nddt->ddt_flags & DDT_FLAG_FLAT)
+					ndde->dde_phys->ddp_flat.ddp_refcnt
+					    += refn;
+				else
+					ndde->dde_phys->ddp_trad[nv].ddp_refcnt
+					    += refn;
+				zhack_bpr_ddt_remapped++;
+			}
+			ddt_exit(nddt);
+			continue;
+		}
 		ddt_t *ddt = ddt_select(spa, &m->bm_oldbp);
 		if (ddt == NULL)
 			continue;
@@ -2512,25 +2583,31 @@ zhack_do_snap_bpr(int argc, char **argv)
 		usage();
 	zhack_spa_open(argv[0], B_FALSE, FTAG, &spa);
 	/*
-	 * P20/RC fail-closed guard: codec normalization changes a block's
-	 * checksum, hence its DDT/BRT key, so the Pass-2.5/2.6 dedup/clone
-	 * remaps (which repoint by the OLD key) would corrupt a deduped/
-	 * block-cloned pool; and re-encoding under encryption is not yet
-	 * key-oblivious. Refuse rather than corrupt. Parity promotion
-	 * (zhack_bpr_normalize==0, checksum preserved) is unaffected.
+	 * P20/RC fail-closed guard for ENCRYPTION: an encrypted block's on-disk
+	 * checksum IS its authentication MAC (computed with the key over the
+	 * compressed-then-encrypted data), and offline zhack has no key loaded,
+	 * so it cannot decrypt->recompress->re-MAC. Codec normalization of
+	 * encrypted blocks is therefore impossible offline (live blocks are
+	 * handled online by `zfs rewrite`; snapshot-pinned encrypted blocks
+	 * are unreachable). Refuse. Dedup IS handled: the codec re-key moves
+	 * each DDT entry to its new-checksum key with the refcount preserved;
+	 * BRT is DVA-keyed (checksum-agnostic) so its existing remap applies.
 	 */
 	if (zhack_bpr_normalize) {
-		if (ddt_get_dedup_dspace(spa) != 0 || brt_get_used(spa) != 0) {
+		if (spa_feature_is_active(spa, SPA_FEATURE_ENCRYPTION)) {
 			(void) fprintf(stderr, "normalize_bpr: REFUSED -- "
-			    "dedup/BRT active; a re-encoded block's new "
-			    "checksum changes its DDT/BRT key (unhandled)\n");
+			    "encryption active; an encrypted block's checksum "
+			    "is its key-derived MAC and offline zhack has no "
+			    "key (use `zfs rewrite` online for live blocks)\n");
 			spa_close(spa, FTAG);
 			return (1);
 		}
-		if (spa_feature_is_active(spa, SPA_FEATURE_ENCRYPTION)) {
-			(void) fprintf(stderr, "normalize_bpr: REFUSED -- "
-			    "encryption active; codec re-encode is not yet "
-			    "key-oblivious\n");
+		if (ddt_get_dedup_dspace(spa) != 0 &&
+		    !zhack_ddt_checksum_valid(zhack_norm_target_checksum)) {
+			(void) fprintf(stderr, "normalize_bpr: REFUSED -- a "
+			    "deduped pool needs a dedup-capable checksum "
+			    "(sha256/sha512/skein) to re-key the DDT; a "
+			    "non-dedup checksum would un-dedup unsafely\n");
 			spa_close(spa, FTAG);
 			return (1);
 		}
