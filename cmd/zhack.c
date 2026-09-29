@@ -2177,6 +2177,8 @@ zhack_checksum_by_name(const char *s, uint64_t *out)
 	else if (strcmp(s, "sha256") == 0) *out = ZIO_CHECKSUM_SHA256;
 	else if (strcmp(s, "sha512") == 0) *out = ZIO_CHECKSUM_SHA512;
 	else if (strcmp(s, "skein") == 0) *out = ZIO_CHECKSUM_SKEIN;
+	else if (strcmp(s, "edonr") == 0) *out = ZIO_CHECKSUM_EDONR;
+	else if (strcmp(s, "blake3") == 0) *out = ZIO_CHECKSUM_BLAKE3;
 	else return (B_FALSE);
 	return (B_TRUE);
 }
@@ -2482,6 +2484,8 @@ static uint64_t zhack_bpr_rewritten;
 static uint64_t zhack_bpr_errors;
 static uint64_t zhack_bpr_alloc_bytes;
 static uint64_t zhack_bpr_free_bytes;
+/* P20/RC: blocks left un-relocated because the target codec would GROW them */
+static uint64_t zhack_bpr_grown_skipped;
 /*
  * P20/RC codec normalization: when set, the per-block rewrite re-encodes
  * level-0 plain file-DATA blocks with zhack_norm_target_{checksum,compress}
@@ -2780,6 +2784,30 @@ zhack_bpr_bp(spa_t *spa, dmu_tx_t *tx, blkptr_t *bp, const zbookmark_phys_t *zb)
 	{
 		int64_t _pd = (int64_t)bp_get_dsize_sync(spa, &newbp)
 		    - (int64_t)bp_get_dsize_sync(spa, &old);
+		if (zhack_bpr_normalize && _pd > 0) {
+			/*
+			 * P20/RC growth guard: a re-encode to a codec that
+			 * compresses WORSE than the source (canonically -> off)
+			 * yields a LARGER block. zhack_snap_bpr_sync skips the
+			 * dd_used_bytes grow for snapshots, so relocating a
+			 * growing block pinned ONLY by a snapshot (head freed
+			 * its copy) enlarges the on-disk alloc with no dd_used
+			 * credit -- and `zfs destroy <snap>` then underflows
+			 * dd_used and PANICs (VERIFY in
+			 * dsl_dir_diduse_space_impl). A grown snapshot block is
+			 * ambiguous (dedup wants N-per-ref ref_delta, CoW
+			 * sharing wants per-block private_delta -- they
+			 * conflict), so rather than mis-account we do NOT
+			 * relocate it: free the fresh copy, keep the old BP,
+			 * count it. normalize_verify then honestly reports it
+			 * non-conforming (RC2 owner honesty). Shrink/same
+			 * re-encodes (normal direction) and parity promotion
+			 * (never normalize) are unaffected.
+			 */
+			zio_free(spa, txg, &newbp);
+			zhack_bpr_grown_skipped++;
+			return;
+		}
 		zhack_bpr_ref_delta += _pd;
 		/* memo MISS: this dataset's own block */
 		zhack_bpr_private_delta += _pd;
@@ -3363,6 +3391,7 @@ zhack_do_snap_bpr(int argc, char **argv)
 	zhack_bpr_errors = 0;
 	zhack_bpr_alloc_bytes = 0;
 	zhack_bpr_free_bytes = 0;
+	zhack_bpr_grown_skipped = 0;
 	nvlist_t *snaps = fnvlist_alloc();
 	if (argc >= 2) {
 		fnvlist_add_boolean(snaps, argv[1]);
@@ -3482,13 +3511,14 @@ zhack_do_snap_bpr(int argc, char **argv)
 	avl_destroy(&zhack_bpr_memo);
 	(void) fprintf(stderr,
 	    "snap_bpr: rewritten=%llu dlremapped=%llu freed=%llu "
-	    "errors=%llu alloc=%lluK free=%lluK\n",
+	    "errors=%llu alloc=%lluK free=%lluK grown_skipped=%llu\n",
 	    (u_longlong_t)zhack_bpr_rewritten,
 	    (u_longlong_t)zhack_bpr_dlremapped,
 	    (u_longlong_t)zhack_bpr_freed,
 	    (u_longlong_t)zhack_bpr_errors,
 	    (u_longlong_t)(zhack_bpr_alloc_bytes>>10),
-	    (u_longlong_t)(zhack_bpr_free_bytes>>10));
+	    (u_longlong_t)(zhack_bpr_free_bytes>>10),
+	    (u_longlong_t)zhack_bpr_grown_skipped);
 	spa_close(spa, FTAG);
 	return (0);
 }
