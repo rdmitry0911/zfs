@@ -1,20 +1,25 @@
 # Discussion / RFC: In-place reshape for RAIDZ and dataset geometry — the full package
 
-> **TL;DR** — Change RAIDZ parity (raidz1 ↔ raidz2 ↔ raidz3, both directions)
-> and remove a disk from a raidz (N → N-1) **in place**, using only the pool's
-> own free space, while the pool stays imported and mounted, with snapshots and
-> clones preserved. One new incompatible feature flag underlies it: a per-vdev
-> **layout-epoch table** (`{start_txg, width, parity}`, the same shape as
-> RAIDZ-expansion's `ZPOOL_CONFIG_RAIDZ_EXPAND_TXGS`). Each block is
-> reconstructed at the geometry it was written with, and a **bounded,
-> fail-closed, crash-resumable CoW sweep** re-encodes the existing corpus,
-> raising effective redundancy only after a census proves zero residual. No
-> change to the RAIDZ row encoding, BP format, ASIZE, ashift, or vdev type.
-> This is a **validated prototype** (device-loss matrices, crash cutpoints,
-> KASAN, soak, online, snapshots/clones/encryption/multi-vdev) — **not** a
-> finished feature; we're seeking design review of the on-disk format and the
-> in-kernel-vs-offline-tooling boundary **before anything is locked**.
-> Full picture and honest per-feature status below.
+> **TL;DR** — The north star is **reconfiguring the storage of a live
+> virtualization host (Proxmox, etc.) without taking it down** — no pool export,
+> no host reboot, so the guests (VMs/containers on zvols and datasets) keep
+> running. Concretely: change RAIDZ parity (raidz1 ↔ raidz2 ↔ raidz3, both
+> directions), grow capacity, and remove a disk (N → N-1) **in place, online**,
+> using only the pool's own free space, with snapshots and clones preserved. One
+> new incompatible feature flag underlies it: a per-vdev **layout-epoch table**
+> (`{start_txg, width, parity}`, the same shape as RAIDZ-expansion's
+> `ZPOOL_CONFIG_RAIDZ_EXPAND_TXGS`); each block is reconstructed at the geometry
+> it was written with, and a **bounded, fail-closed, crash-resumable CoW sweep**
+> re-encodes the corpus, raising effective redundancy only after a census proves
+> zero residual. No change to the RAIDZ row encoding, BP format, ASIZE, ashift,
+> or vdev type. **Validated prototype** (device-loss matrices, crash cutpoints,
+> KASAN, soak, online, snapshots/clones/encryption/multi-vdev) — not a finished
+> feature. **Honest gap up front:** the plain parity-reshape and capacity-grow
+> paths are already fully online (guests stay live); the shared-graph
+> (snapshot/clone), codec, and contraction paths are currently **offline
+> (require `zpool export`, which stops guests)** — closing that gap (in-kernel
+> online for those paths) is the main remaining work and a key question for
+> maintainers. See §1.1 and the per-feature "Live?" column.
 
 ## 0. How to read this
 
@@ -41,23 +46,35 @@ This is a validated prototype seeking design review before anything is locked.
 
 ## 1. Bird's-eye view
 
-Today RAIDZ geometry is fixed at creation. RAIDZ *expansion* (2.3) added width
-growth but not parity change, disk removal, or in-place geometry changes. The
-recurring user need is: **"reshape the pool I already have, in place, using its
-own free space — don't make me build a second pool and `send | recv`."**
+**The motivating use case is the live virtualization host.** On a Proxmox/ESXi-
+style box, the pool backs running VMs and containers (zvols + datasets). Today,
+changing RAIDZ redundancy or removing a disk means evacuating/migrating the
+guests, exporting the pool or rebooting the host, reshaping, and bringing
+everything back — a maintenance window with downtime. RAIDZ *expansion* (2.3)
+added online width growth but nothing else; parity change, disk removal, and
+in-place geometry changes still require that window. The goal here is to do
+those **on the live host with the pool imported and the guests still running** —
+using only the pool's own free space, no second pool and no `send | recv`.
 
 This package delivers that across three genuinely-new capabilities plus a family
-of supporting/adjacent ones:
+of supporting/adjacent ones. The **"Live?"** column is the operational bar that
+matters for the host use case — can it run without exporting the pool (i.e.
+without stopping guests):
 
-| Capability | What it does | Label |
-|---|---|---|
-| **A. Parity reshape** | raidz1 ↔ raidz2 ↔ raidz3 (promote for redundancy, demote to reclaim a column) | CORE/NEW, NATIVE |
-| **B. Width contraction** | remove a disk from a raidz in place (N → N-1) | CORE/NEW, NATIVE |
-| **C. Online operation** | do A/B while imported and mounted | NATIVE |
-| **D. Shared-graph reshape** | preserve snapshots/clones across A/B | EXPERIMENTAL |
-| **E. Feature coverage** | enc / multi-vdev / gang / DDT / BRT under A/B | NATIVE (dedup opt-in) |
-| **F. Perf & observability** | background sweep, throttle, status, cancel | NATIVE |
-| **G. Codec normalization** | re-checksum / re-compress the existing corpus | EXPERIMENTAL |
+| Capability | What it does | Label | Live? (no export) |
+|---|---|---|---|
+| **A. Parity reshape** | raidz1 ↔ raidz2 ↔ raidz3 (promote / demote) | CORE/NEW, NATIVE | ✅ plain pool (`--online`) |
+| **B. Width contraction** | remove a disk from a raidz in place (N → N-1) | CORE/NEW, NATIVE | ❌ needs export today |
+| **C. Online operation** | do A while imported and mounted | NATIVE | ✅ (brief per-dataset suspend) |
+| **D. Shared-graph reshape** | preserve snapshots/clones across A/B | EXPERIMENTAL | ❌ offline tool (export) |
+| **E. Feature coverage** | enc / multi-vdev / gang / DDT / BRT under A/B | NATIVE (dedup opt-in) | ⚠️ enc/multi-vdev live; dedup/BRT offline |
+| **F. Perf & observability** | background sweep, throttle, status, cancel | NATIVE | ✅ |
+| **G. Codec normalization** | re-checksum / re-compress the existing corpus | EXPERIMENTAL | ⚠️ unshared live (`zfs rewrite`); shared offline |
+| **Capacity grow** | replace disks with larger / grow leaves | EXISTING-PRIMITIVES | ✅ `zpool replace` + autoexpand (stock) |
+
+Closing the ❌/⚠️ rows to ✅ — making the shared-graph, contraction, and codec
+paths run **in-kernel online** rather than via an offline exported-pool tool — is
+the main remaining work; see §1.1.
 
 **One shared foundation underlies A, B, C, D.** A small on-disk *layout-epoch
 table* per top-level RAIDZ vdev records `{start_txg, logical_width, parity}`,
@@ -73,6 +90,41 @@ zero residual.
 The design deliberately does **not** touch the RAIDZ row encoding, P/Q/R bytes,
 ASIZE math, BP format, ashift, recordsize, or vdev type. Only *which* geometry a
 block uses changes, and only via a normal CoW rewrite of that block.
+
+### 1.1 Guest liveness — the operational bar (and the honest gap)
+
+For the live-host use case, "in place" is necessary but not sufficient: the
+operation must not **export the pool**, because export unmounts everything and
+stops the guests. By that bar the package splits cleanly today:
+
+- **Already live (guests keep running):** plain parity promote/demote via
+  `zpool reparity --online` (datasets stay mounted; only a brief, transparent
+  per-dataset I/O suspend, on the order of a txg — not a guest outage), capacity
+  grow via `zpool replace` + autoexpand (stock), and the async/throttle/status
+  controls. Encrypted and multi-vdev pools reshape live too.
+- **Offline today (require `zpool export` → guests stop):** the shared-graph
+  paths (snapshot/clone-preserving reshape), codec normalization of shared
+  blocks, dedup/BRT re-key, and width contraction. These run as an **offline
+  libzpool tool** (`zhack …` on the exported pool) because the block-pointer
+  rewrite touches snapshot deadlists / clone livelists / DDT / BRT accounting
+  that the online sweep (`dmu_buf_will_rewrite` on live datasets) cannot reach —
+  so the online engine currently *fail-closed refuses* when snapshots pin
+  old-geometry blocks.
+
+**Why this is closeable, and the plan.** The offline passes are already ordinary
+`dsl_sync_task`s; they are "offline" only because the tool opens the pool in
+userspace rather than driving the kernel-imported pool. Moving them behind the
+same ioctl path `zpool reparity --online` already uses makes them run on the live
+pool. The key enabling observation: **snapshots are immutable**, so a
+snapshot-pinned block has no concurrent writer and can be safely rewritten by an
+in-kernel sync task without export; live head/clone blocks get the existing
+online-envelope (CoW + compare-and-swap on the BP) treatment; the
+deadlist/livelist/DDT/BRT/`ds_unique`/`DD_USED_SNAP` reconciliation runs as sync
+tasks exactly as it does offline. This is the "restricted in-kernel rewrite
+primitive" in the questions below — and for the Proxmox use case the answer
+needs to be in-kernel/online, not an offline tool. Contraction additionally
+needs the reflow + metaslab-shrink to run without the current export/import
+cycle; that is the hardest of the online conversions and is sequenced last.
 
 ---
 
