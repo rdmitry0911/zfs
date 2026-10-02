@@ -63,18 +63,20 @@ without stopping guests):
 
 | Capability | What it does | Label | Live? (no export) |
 |---|---|---|---|
-| **A. Parity reshape** | raidz1 ↔ raidz2 ↔ raidz3 (promote / demote) | CORE/NEW, NATIVE | ✅ plain pool (`--online`) |
+| **A. Parity reshape** | raidz1 ↔ raidz2 ↔ raidz3 (promote / demote) | CORE/NEW, NATIVE | ✅ plain pool (`--online`), **incl. the pool the host itself boots from** |
 | **B. Width contraction** | remove a disk from a raidz in place (N → N-1) | CORE/NEW, NATIVE | ❌ needs export today |
-| **C. Online operation** | do A while imported and mounted | NATIVE | ✅ (brief per-dataset suspend) |
-| **D. Shared-graph reshape** | preserve snapshots/clones across A/B | EXPERIMENTAL | ❌ offline tool (export) |
-| **E. Feature coverage** | enc / multi-vdev / gang / DDT / BRT under A/B | NATIVE (dedup opt-in) | ⚠️ enc/multi-vdev live; dedup/BRT offline |
+| **C. Online operation** | do A while imported and mounted | NATIVE | ✅ (chunked-suspend default, or fully-live `nosuspend` sweep) |
+| **D. Shared-graph reshape** | preserve snapshots/clones across A/B | EXPERIMENTAL | ✅ **live procedure** (epoch + in-pool `send\|recv`); single-command in-place = open (§1.1) |
+| **E. Feature coverage** | enc / multi-vdev / gang / DDT / BRT under A/B | NATIVE (dedup opt-in) | ⚠️ enc/multi-vdev live; in-place DDT/BRT re-key offline (dedup survives the live `send\|recv` route) |
 | **F. Perf & observability** | background sweep, throttle, status, cancel | NATIVE | ✅ |
-| **G. Codec normalization** | re-checksum / re-compress the existing corpus | EXPERIMENTAL | ⚠️ unshared live (`zfs rewrite`); shared offline |
+| **G. Codec normalization** | re-checksum / re-compress the existing corpus | EXPERIMENTAL | ✅ **live procedure** (recv-side codec); in-place tool offline |
 | **Capacity grow** | replace disks with larger / grow leaves | EXISTING-PRIMITIVES | ✅ `zpool replace` + autoexpand (stock) |
 
-Closing the ❌/⚠️ rows to ✅ — making the shared-graph, contraction, and codec
-paths run **in-kernel online** rather than via an offline exported-pool tool — is
-the main remaining work; see §1.1.
+With the validated **live procedure** (§1.1), every row except width contraction
+(B) now runs without stopping the pool's consumers — including the case where the
+*host itself* is booted from the pool being reshaped. What remains open is (a)
+contraction without export and (b) a literal *single-command in-place* variant of
+D/G, which needs a new in-kernel rewrite primitive (§1.1, question 3).
 
 **One shared foundation underlies A, B, C, D.** A small on-disk *layout-epoch
 table* per top-level RAIDZ vdev records `{start_txg, logical_width, parity}`,
@@ -98,33 +100,55 @@ operation must not **export the pool**, because export unmounts everything and
 stops the guests. By that bar the package splits cleanly today:
 
 - **Already live (guests keep running):** plain parity promote/demote via
-  `zpool reparity --online` (datasets stay mounted; only a brief, transparent
-  per-dataset I/O suspend, on the order of a txg — not a guest outage), capacity
-  grow via `zpool replace` + autoexpand (stock), and the async/throttle/status
-  controls. Encrypted and multi-vdev pools reshape live too.
-- **Offline today (require `zpool export` → guests stop):** the shared-graph
-  paths (snapshot/clone-preserving reshape), codec normalization of shared
-  blocks, dedup/BRT re-key, and width contraction. These run as an **offline
-  libzpool tool** (`zhack …` on the exported pool) because the block-pointer
-  rewrite touches snapshot deadlists / clone livelists / DDT / BRT accounting
-  that the online sweep (`dmu_buf_will_rewrite` on live datasets) cannot reach —
-  so the online engine currently *fail-closed refuses* when snapshots pin
-  old-geometry blocks.
+  `zpool reparity --online` (datasets stay mounted), capacity grow via
+  `zpool replace` + autoexpand (stock), and the async/throttle/status controls.
+  Encrypted and multi-vdev pools reshape live too.
+- **Live via a validated procedure (no export, no new kernel code):** the
+  shared-graph paths (snapshot/clone-preserving reshape) and codec
+  normalization. The engine's fail-closed design makes this composable:
+  `reparity --online` establishes the **persistent** parity epoch up front and,
+  when snapshots pin old-geometry blocks, returns EAGAIN *without* committing —
+  the epoch stays active, so every new write already lands at the target
+  geometry. The operator then relocates the snapshotted data **inside the same
+  pool** (`zfs send -R … | zfs recv …`, optionally with recv-side
+  `-o compression/-o checksum` for codec changes — snapshots preserved on the
+  copy), destroys the old dataset, and re-runs `reparity` → census clean →
+  commit. *Validated:* raidz1→2 preserving snapshots commits and genuinely
+  survives 2-disk loss (a parity-1 control fails the same test); codec
+  off→zstd / fletcher4→sha256 with byte-identical data; a concurrent writer
+  never lost its mount. For VM disks the switch to the copy is a live storage
+  migration (qemu drive-mirror) — guests never stop.
+- **The self-hosting bar — the pool the host *boots from* — also holds.** On a
+  system whose root *is* the raidz pool being reshaped (validated on a real
+  ZFS-root boot rig): the default chunked-suspend online sweep **deadlocks**
+  (suspending the root takes its teardown lock as writer against the host's own
+  writeback/reclaim), but the fully-live `nosuspend` sweep (pure
+  `dmu_buf_will_rewrite` CoW, a one-tunable opt-in in the series) reshapes the
+  booted-from pool with the OS running: commit at parity 2, data intact, a
+  heartbeat writing to the root throughout saw **zero** failures, and the
+  root-BE's own snapshots are handled live by relocating them to an in-pool
+  sibling dataset before the commit — no reboot at any point.
+- **Offline today (require `zpool export`):** width contraction, and the
+  *single-command in-place* form of the shared-graph/codec rewrite (`zhack …`
+  on the exported pool).
 
-**Why this is closeable, and the plan.** The offline passes are already ordinary
-`dsl_sync_task`s; they are "offline" only because the tool opens the pool in
-userspace rather than driving the kernel-imported pool. Moving them behind the
-same ioctl path `zpool reparity --online` already uses makes them run on the live
-pool. The key enabling observation: **snapshots are immutable**, so a
-snapshot-pinned block has no concurrent writer and can be safely rewritten by an
-in-kernel sync task without export; live head/clone blocks get the existing
-online-envelope (CoW + compare-and-swap on the BP) treatment; the
-deadlist/livelist/DDT/BRT/`ds_unique`/`DD_USED_SNAP` reconciliation runs as sync
-tasks exactly as it does offline. This is the "restricted in-kernel rewrite
-primitive" in the questions below — and for the Proxmox use case the answer
-needs to be in-kernel/online, not an offline tool. Contraction additionally
-needs the reflow + metaslab-shrink to run without the current export/import
-cycle; that is the hardest of the online conversions and is sequenced last.
+**What we learned about making D/G a single in-kernel command.** We implemented
+and tested the obvious plan — relocating the offline BPR passes behind the same
+ioctl the online engine uses (the engine itself relocates cleanly into a module
+shared by libzpool and the kernel). The snapshot-tree half works: snapshots are
+immutable, and a sync-task rewrite of snapshot trees on the live pool commits
+and survives 2-disk loss. But every variant that touches the **live head's
+deadlist** — full tree rewrite, deadlist-only remap, with or without
+`zfs_suspend_fs` — hits fatal races against the host's own writers (six
+distinct kernel-panic modes, fully characterized). The offline machinery
+fundamentally assumes exported-pool quiescence that a live imported pool cannot
+provide; per-fs suspend is not enough. A correct single-command in-place variant
+therefore needs a **new, txg-integrated relocation primitive** for
+deadlist-referenced blocks (hooked into ZFS's own deadlist maintenance), which
+is genuine new infrastructure — that is exactly question 3 below. Meanwhile the
+live procedure above covers the operational need without it. Contraction
+additionally needs the reflow + metaslab-shrink to run without the current
+export/import cycle; that is the hardest conversion and is sequenced last.
 
 ---
 
@@ -190,24 +214,42 @@ C(4,1) single losses and fails all C(4,2); fault-injected child + scrub repairs
 from parity. *Remaining:* large-pool scale.
 
 ### C. Online operation  **[NATIVE]**
-`zpool reparity --online` reshapes each mounted dataset in place via ZFS's own
-suspend/resume (chunked `zfs_suspend_fs`/resume): mount never dropped, concurrent
-reads/writes preserved. A concurrent-write redundancy edge (a write racing the
-epoch-establishment txg) is closed by making the epoch effective at
-`append_txg + 1`.
+`zpool reparity --online` reshapes each mounted dataset in place. Two sweep
+modes: the default chunked `zfs_suspend_fs`/resume (mount never dropped, brief
+per-batch pauses), and an opt-in fully-live sweep
+(`reparity_online_nosuspend=1`) that never suspends — the rewrite is a plain
+`dmu_buf_will_rewrite` CoW tx serialized against concurrent writes by the DMU.
+A concurrent-write redundancy edge (a write racing the epoch-establishment txg)
+is closed by making the epoch effective at `append_txg + 1`.
 *Validated:* concurrent fsync'd writer during promotion, no lost writes, mount
-preserved, survives 2-disk loss. *Remaining:* a literal zero-I/O-pause lock-free
-CoW/CAS path that removes the brief per-dataset suspend windows entirely.
+preserved, survives 2-disk loss. The `nosuspend` mode is additionally proven on
+the **self-hosting** case — reshaping the pool the OS itself is booted from —
+where it is *required*: suspending the root deadlocks against the host's own
+writeback/reclaim (teardown-lock cycle, reproduced and root-caused), while the
+fully-live sweep commits with a zero-failure heartbeat on the running root.
+*Remaining:* heavier concurrent-load soak of `nosuspend` before making it the
+default.
 
 ### D. Shared-graph reshape — snapshots & clones  **[EXPERIMENTAL]**
 Reshaping a pool with snapshots/clones means re-encoding **shared** blocks
 without breaking deadlists, livelists, bpobj, `ds_unique`, or DDT/BRT refcounts.
-Done today by an **offline** libzpool tool (`zhack snap_bpr`) that rewrites each
-shared block once, re-points every reference, and reconciles the accounting.
-*Validated:* origin + clone survive 2-disk loss, destroys are leak-free
-(`freeing` settles to 0, `zdb -bb` "No leaks"). **This is the least mature piece
-and the main thing we want direction on** — specifically whether upstream would
-prefer a restricted in-kernel rewrite primitive over an offline tool.
+Two routes today:
+- **Live procedure (no export, no new code — validated):** epoch active after
+  the fail-closed EAGAIN → in-pool `zfs send -R | zfs recv` writes the dataset
+  incl. all snapshots at the target geometry → destroy old → re-run → commit
+  (§1.1). Covers the operational need, at the cost of a transient second copy
+  and a dataset rename/switch.
+- **Single-command in-place:** the **offline** libzpool tool (`zhack snap_bpr`)
+  rewrites each shared block once, re-points every reference, and reconciles
+  the accounting. *Validated:* origin + clone survive 2-disk loss, destroys are
+  leak-free (`freeing` settles to 0, `zdb -bb` "No leaks").
+**This remains the least mature piece and the main thing we want direction
+on.** We have empirical data now (§1.1): running the same BPR passes in-kernel
+on the *live* pool works for immutable snapshot trees but is fundamentally
+unsafe for the live head's deadlist (six characterized panic modes; per-fs
+suspend insufficient) — so a true in-place online variant needs a new
+txg-integrated deadlist-relocation primitive, not an adaptation of the offline
+tool (question 3).
 
 ### E. Feature-class coverage  **[NATIVE, dedup opt-in]**
 - **Encryption:** key-oblivious — RAIDZ parity is below encryption (over
@@ -229,7 +271,11 @@ never starves foreground I/O). Cancel leaves the op uncommitted/revertible.
 existing corpus (incl. snapshot/clone-pinned blocks) to a target
 checksum+compressor, with DDT **re-key** (dedup preserved), BRT DVA-remap,
 encryption refused (offline, key-oblivious), and a fail-closed psize-growth
-guard. Offline libzpool tool; same maturity caveat as D.
+guard. Offline libzpool tool; same maturity caveat as D. The **live route** is
+the same procedure as D with recv-side properties — *validated:*
+`zfs recv -o compression=zstd -o checksum=sha256` rewrote an off/fletcher4
+corpus live (ratio 1.00→205x on compressible data), byte-identical content,
+snapshots preserved.
 
 ---
 
@@ -286,10 +332,21 @@ Prototype validated in a disposable Ubuntu QEMU/KVM lab VM against
   survive `target` losses with leak-free destroys;
 - contraction: N→N-1 tunable-free on default `log_spacemap`;
 - ZTS functional cases added (`raidz_parity_epochs_pos`, `raidz_recon_pos`,
-  `reparity_*`, `normalize_bpr_pos`).
+  `reparity_*`, `normalize_bpr_pos`);
+- the **live procedure** for snapshots/codec (§1.1): control-tested 2-disk
+  survival (parity-1 control fails import with 2 missing; the reshaped pool
+  imports DEGRADED with snapshot checksums intact), codec change byte-identical,
+  concurrent writer's mount never dropped;
+- the **self-hosting case**: a nested rig direct-kernel-boots from a raidz ZFS
+  root and reshapes it from within — default suspend sweep deadlock reproduced
+  and root-caused (root teardown-lock vs the host's own writeback/reclaim),
+  `nosuspend` sweep commits parity 2 with a zero-failure heartbeat on the
+  running root, data intact, 2-disk survival; the root's own snapshots handled
+  live via the in-pool sibling relocation (no reboot).
 
-Explicit gaps: large-pool scale + long-duration soak, a full ZTS matrix under
-upstream CI, and hardening of the offline shared-graph/codec tooling (D, G).
+Explicit gaps: large-pool scale + long-duration soak (incl. `nosuspend` under
+heavy load before default-on), a full ZTS matrix under upstream CI, and
+hardening of the offline shared-graph/codec tooling (D, G).
 
 ---
 
@@ -316,9 +373,15 @@ Happy to split/reorder/reshape however review prefers.
    OpenZFS wants upstream, and is the shared layout-epoch-table approach the
    right direction (vs. an expansion-style dedicated reflow per operation)?
 2. On-disk format review (Section 5) — before we treat it as stable.
-3. For the corpus re-encode, and especially the shared snapshot/clone case:
-   the CoW + metadata-dirtying sweep as implemented, vs. a dedicated restricted
-   in-kernel rewrite primitive? (Sections D, G are offline today.)
+3. For the corpus re-encode, and especially the shared snapshot/clone case: we
+   now have empirical data that the offline BPR passes cannot be safely driven
+   on a live imported pool (the live head's deadlist races the host's own
+   writers — six characterized failure modes; per-fs suspend insufficient),
+   while the *operational* need is covered by the epoch + in-pool `send|recv`
+   procedure (§1.1). Is a dedicated **txg-integrated deadlist-relocation
+   primitive** (so D/G become a single in-place online command) something
+   upstream would want pursued, or is the offline tool + live procedure the
+   right long-term shape?
 4. What validation bar (ZTS/ztest additions, fault campaigns, scale/soak) would
    you want before considering the series?
 5. Should width contraction (B) and parity reshape (A) land as one feature or
