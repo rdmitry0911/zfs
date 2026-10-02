@@ -14,12 +14,18 @@
 > zero residual. No change to the RAIDZ row encoding, BP format, ASIZE, ashift,
 > or vdev type. **Validated prototype** (device-loss matrices, crash cutpoints,
 > KASAN, soak, online, snapshots/clones/encryption/multi-vdev) — not a finished
-> feature. **Honest gap up front:** the plain parity-reshape and capacity-grow
-> paths are already fully online (guests stay live); the shared-graph
-> (snapshot/clone), codec, and contraction paths are currently **offline
-> (require `zpool export`, which stops guests)** — closing that gap (in-kernel
-> online for those paths) is the main remaining work and a key question for
-> maintainers. See §1.1 and the per-feature "Live?" column.
+> feature. **Liveness status up front:** parity reshape and capacity grow are
+> fully online (guests stay live) — including reshaping **the pool the host
+> itself boots from** (validated on a ZFS-root rig; requires the fully-live
+> no-suspend sweep, since suspending the root deadlocks against the host's own
+> writeback). Snapshot/clone-preserving reshape and codec changes run live via a
+> validated **procedure** (the engine's persistent epoch + fail-closed EAGAIN +
+> in-pool `send|recv` + re-run → commit) rather than a single command. What
+> still needs export: **width contraction**, and the *single-command in-place*
+> form of the shared-graph/codec rewrite — we have empirical data (six
+> characterized failure modes) that the latter needs a new txg-integrated
+> deadlist-relocation primitive, a key question for maintainers. See §1.1 and
+> the per-feature "Live?" column.
 
 ## 0. How to read this
 
