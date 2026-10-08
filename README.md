@@ -69,3 +69,9 @@ Generally, if a distribution is following an LTS kernel, it should work well wit
 All FreeBSD releases receiving [security support](https://www.freebsd.org/security/#sup) are supported by OpenZFS.
 
 **Supported FreeBSD releases**: **15.1**, **14.4**.
+
+## Related project by this fork’s maintainer
+
+[escrow-box](https://github.com/abx-takt/escrow-box) is our prototype for TPM-sealed
+conditional release of secrets, including source-code escrow with a reproducible-build check.
+See the [project overview and limitations](https://taktcycles.com/projects/escrow-box.html).
