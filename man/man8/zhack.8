@@ -1,0 +1,220 @@
+.\" SPDX-License-Identifier: CDDL-1.0
+.\"
+.\" CDDL HEADER START
+.\"
+.\" The contents of this file are subject to the terms of the
+.\" Common Development and Distribution License (the "License").
+.\" You may not use this file except in compliance with the License.
+.\"
+.\" You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
+.\" or https://opensource.org/licenses/CDDL-1.0.
+.\" See the License for the specific language governing permissions
+.\" and limitations under the License.
+.\"
+.\" When distributing Covered Code, include this CDDL HEADER in each
+.\" file and include the License file at usr/src/OPENSOLARIS.LICENSE.
+.\" If applicable, add the following below this CDDL HEADER, with the
+.\" fields enclosed by brackets "[]" replaced with your own identifying
+.\" information: Portions Copyright [yyyy] [name of copyright owner]
+.\"
+.\" CDDL HEADER END
+.\"
+.\" Copyright (c) 2026 Dmitry R.
+.\"
+.Dd September 25, 2026
+.Dt ZHACK 8
+.Os
+.
+.Sh NAME
+.Nm zhack
+.Nd libzpool debugging tool
+.Sh SYNOPSIS
+.Nm
+.Op Fl c Ar cachefile
+.Op Fl d Ar dir
+.Op Fl o Ar var Ns = Ns Ar value
+.Op Fl G
+.Ar subcommand Op Ar arguments
+.
+.Sh DESCRIPTION
+.Nm
+is a debugging tool that performs low-level, unsupported modifications to a ZFS
+storage pool using the userspace
+.Sy libzpool
+implementation.
+It is intended for developers and for recovery of otherwise-unimportable pools.
+.Pp
+.Sy Most subcommands write directly to on-disk structures with little or no
+.Sy validation and can irreversibly corrupt a pool .
+Use them only on pools whose data is disposable or already backed up.
+.
+.Sh GLOBAL OPTIONS
+.Bl -tag -width "-o var=value"
+.It Fl c Ar cachefile
+Read the pool configuration from the given
+.Ar cachefile .
+.It Fl d Ar dir
+Search
+.Ar dir
+for the pool's vdevs when importing
+.Pq may be given more than once .
+.It Fl o Ar var Ns = Ns Ar value
+Set the libzpool tunable
+.Ar var
+to the unsigned 32-bit integer
+.Ar value .
+.It Fl G
+Dump the
+.Sy zfs_dbgmsg
+buffer to standard error before exiting.
+.El
+.
+.Sh SUBCOMMANDS
+.Ss General
+.Bl -tag -width Ds
+.It Xo
+.Nm
+.Cm feature stat
+.Ar pool
+.Xc
+Print information about the features enabled on
+.Ar pool .
+.It Xo
+.Nm
+.Cm feature enable
+.Op Fl r
+.Op Fl d Ar description
+.Ar pool Ar feature
+.Xc
+Add
+.Ar feature
+.Pq a feature GUID
+to the pool's enabled features.
+.It Xo
+.Nm
+.Cm feature ref
+.Op Fl md
+.Ar pool Ar feature
+.Xc
+Change the reference count of
+.Ar feature .
+.It Xo
+.Nm
+.Cm label repair
+.Op Fl cu
+.Ar device
+.Xc
+Repair the labels of
+.Ar device .
+.It Xo
+.Nm
+.Cm metaslab leak
+.Ar pool
+.Xc
+Apply an allocation map produced by
+.Xr zdb 8
+to
+.Ar pool .
+.El
+.
+.Ss RAIDZ parity-reshape toolkit
+These subcommands implement the offline, crash-resumable primitives used by
+.Xr zpool-reparity 8
+to reshape a RAIDZ pool's parity level in place, and by the accompanying
+verifiers.
+They operate on an exported pool imported through
+.Nm .
+.Bl -tag -width Ds
+.It Xo
+.Nm
+.Cm raidz_epochs
+.Ar pool Ar top-vdev-id Ar start : Ns Ar width : Ns Ar parity Ns ...
+.Xc
+Write the RAIDZ parity-epoch table
+.Pq one or more Ar start : Ns Ar width : Ns Ar parity No tuples
+to the top-level vdev's ZAP verbatim and activate the
+.Sy raidz_parity_epochs
+feature.
+No validation is performed, so damaged tables can be injected for testing;
+disposable pools only.
+.It Xo
+.Nm
+.Cm reparity
+.Ar pool
+.Xc
+Sweep the Meta Object Set, re-encoding pool metadata at the parity level
+declared by the current epoch table.
+.It Xo
+.Nm
+.Cm reparity_commit
+.Ar pool Ar vdev_guid
+.Xc
+Census the vdev and, if every reachable block conforms to the target parity,
+write the commit marker that finalizes the reshape.
+Refuses
+.Pq fail-closed
+if any block does not conform.
+.It Xo
+.Nm
+.Cm reparity_commit_raw
+.Ar pool Ar vdev_guid Ar parity Ar completion Ar digest
+.Xc
+Write a commit marker with the supplied fields directly, bypassing the census.
+For testing the reconstruction path's response to a forged or inconsistent
+marker; never use on a real pool.
+.It Xo
+.Nm
+.Cm normalize_verify
+.Ar pool Ar checksum-name Ar compress-name
+.Xc
+Verify that every file-data block conforms to the given checksum and
+compression, failing closed on any traversal error.
+.It Xo
+.Nm
+.Cm placement_verify
+.Ar pool Ar excluded_vdev_id
+.Xc
+Verify that no file-data block is placed on the excluded vdev, failing closed
+on any traversal error.
+.It Xo
+.Nm
+.Cm snap_bpr
+.Ar pool Op Ar snapshot
+.Xc
+Rewrite block pointers so that snapshot-referenced blocks are re-encoded at the
+new parity level while preserving their logical birth times, allowing a reshape
+to complete without destroying snapshots.
+With no
+.Ar snapshot ,
+all snapshots are processed.
+.It Xo
+.Nm
+.Cm snap_repoint
+.Ar pool Ar snapshot Ar dataset
+.Xc
+Repoint
+.Ar snapshot
+at the given source
+.Ar dataset .
+.It Xo
+.Nm
+.Cm snap_reanchor
+.Ar pool Ar snapshot Ar creation_txg Op Ar prev_snap_txg
+.Xc
+Rewrite a snapshot's creation transaction group
+.Pq and optionally its predecessor's
+in the snapshot chain.
+.It Xo
+.Nm
+.Cm raidz_contract
+.Ar pool Ar vdev_guid Ar target_width Ar dataset Ns ...
+.Xc
+Reduce the logical width of a RAIDZ top-level vdev to
+.Ar target_width ,
+reflowing the affected datasets.
+.El
+.
+.Sh SEE ALSO
+.Xr zdb 8 ,
+.Xr zpool-reparity 8 ,
+.Xr zpool-features 7
