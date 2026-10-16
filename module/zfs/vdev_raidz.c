@@ -2024,6 +2024,28 @@ vdev_raidz_reconstruct_general(raidz_row_t *rr, int *tgts, int ntgts)
 	}
 
 	/*
+	 * If every reconstruction target is a parity column there are no data
+	 * columns to solve for.  Return here rather than calling
+	 * vdev_raidz_matrix_reconstruct() with nmissing_rows == 0 (which would
+	 * dereference the uninitialized missing_rows[0]).  combrec and the
+	 * known-missing path always pass at least one data column, so this is
+	 * only a guard.
+	 */
+	if (nmissing_rows == 0) {
+		if (bufs != NULL) {
+			for (c = rr->rr_firstdatacol; c < rr->rr_cols; c++) {
+				raidz_col_t *col = &rr->rr_col[c];
+				if (bufs[c] != NULL) {
+					abd_free(col->rc_abd);
+					col->rc_abd = bufs[c];
+				}
+			}
+			kmem_free(bufs, rr->rr_cols * sizeof (abd_t *));
+		}
+		return;
+	}
+
+	/*
 	 * Figure out which parity columns to use to help generate the missing
 	 * data columns.
 	 */
@@ -2198,6 +2220,25 @@ vdev_raidz_reconstruct_row(raidz_map_t *rm, raidz_row_t *rr,
 	vdev_raidz_reconstruct_general(rr, tgts, ntgts);
 }
 
+/*
+ * The number of failed children that every block of the vdev survives: the
+ * lowest parity of any layout the vdev has held, which is not necessarily the
+ * parity of the layout new blocks are written in.
+ */
+static uint64_t
+vdev_raidz_min_nparity(vdev_t *vd)
+{
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	uint64_t min = vdrz->vd_nparity;
+
+	mutex_enter(&vdrz->vd_expand_lock);
+	for (uint64_t i = 0; i < vdrz->vd_parity_epoch_count; i++)
+		min = MIN(min, vdrz->vd_parity_epochs[3 * i + 2]);
+	mutex_exit(&vdrz->vd_expand_lock);
+
+	return (min);
+}
+
 static int
 vdev_raidz_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
     uint64_t *logical_ashift, uint64_t *physical_ashift, cred_t *cr)
@@ -2250,7 +2291,7 @@ vdev_raidz_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 		*max_asize *= vd->vdev_children;
 	}
 
-	if (numerrors > nparity) {
+	if (numerrors > vdev_raidz_min_nparity(vd)) {
 		vd->vdev_stat.vs_aux = VDEV_AUX_NO_REPLICAS;
 		return (lasterror);
 	}
@@ -2267,47 +2308,117 @@ vdev_raidz_close(vdev_t *vd)
 	}
 }
 
+typedef struct vdev_raidz_layout {
+	uint64_t vrl_width;
+	uint64_t vrl_nparity;
+} vdev_raidz_layout_t;
+
 /*
- * Return the logical width to use, given the txg in which the allocation
- * happened.
+ * Return the complete RAIDZ layout for the txg in which an allocation
+ * happened.  Width and parity must travel together so callers do not
+ * accidentally combine values selected from different layout epochs.
  */
-static uint64_t
-vdev_raidz_get_logical_width_locked(vdev_raidz_t *vdrz, uint64_t txg)
+static vdev_raidz_layout_t
+vdev_raidz_layout_for_alloc_locked(vdev_raidz_t *vdrz, uint64_t txg)
 {
 	ASSERT(MUTEX_HELD(&vdrz->vd_expand_lock));
+
+	/*
+	 * A loaded parity-epoch table fully determines the pair: load
+	 * rejects tables that do not start at txg 0 or that coexist with
+	 * expansion history, so the last entry at or before txg is always
+	 * defined and width/parity cannot be combined across sources.
+	 */
+	if (vdrz->vd_parity_epochs != NULL) {
+		const uint64_t *table = vdrz->vd_parity_epochs;
+		uint64_t entries = vdrz->vd_parity_epoch_count;
+
+		vdev_raidz_layout_t layout = {
+			.vrl_width = table[1],
+			.vrl_nparity = table[2],
+		};
+
+		for (uint64_t i = 1; i < entries; i++) {
+			if (table[3 * i] > txg)
+				break;
+			layout.vrl_width = table[3 * i + 1];
+			layout.vrl_nparity = table[3 * i + 2];
+		}
+		return (layout);
+	}
 
 	reflow_node_t lookup = {
 		.re_txg = txg,
 	};
 	avl_index_t where;
-
-	uint64_t width;
+	vdev_raidz_layout_t layout = {
+		.vrl_nparity = vdrz->vd_nparity,
+	};
 	reflow_node_t *re = avl_find(&vdrz->vd_expand_txgs, &lookup, &where);
 	if (re != NULL) {
-		width = re->re_logical_width;
+		layout.vrl_width = re->re_logical_width;
 	} else {
 		re = avl_nearest(&vdrz->vd_expand_txgs, where, AVL_BEFORE);
 		if (re != NULL)
-			width = re->re_logical_width;
+			layout.vrl_width = re->re_logical_width;
 		else
-			width = vdrz->vd_original_width;
+			layout.vrl_width = vdrz->vd_original_width;
 	}
-	return (width);
+	return (layout);
 }
 
-static uint64_t
-vdev_raidz_get_logical_width(vdev_raidz_t *vdrz, uint64_t txg)
+static vdev_raidz_layout_t
+vdev_raidz_layout_for_alloc(vdev_raidz_t *vdrz, uint64_t txg)
 {
 	mutex_enter(&vdrz->vd_expand_lock);
-	uint64_t width = vdev_raidz_get_logical_width_locked(vdrz, txg);
+	vdev_raidz_layout_t layout =
+	    vdev_raidz_layout_for_alloc_locked(vdrz, txg);
 	mutex_exit(&vdrz->vd_expand_lock);
 
-	return (width);
+	if (zfs_flags & ZFS_DEBUG_RAIDZ_RECONSTRUCT) {
+		zfs_dbgmsg("layout_for_alloc(txg=%llu width=%llu parity=%llu "
+		    "src=%s)",
+		    (u_longlong_t)txg, (u_longlong_t)layout.vrl_width,
+		    (u_longlong_t)layout.vrl_nparity,
+		    vdrz->vd_parity_epochs != NULL ? "epochs" : "legacy");
+	}
+	return (layout);
 }
 
 /*
- * Return whether allocations born in these txgs use the same logical
- * RAIDZ column width.
+ * Keep BP layout selection distinct from new-allocation selection even though
+ * both paths intentionally have identical behavior before mixed-parity epochs.
+ */
+static vdev_raidz_layout_t
+vdev_raidz_layout_for_bp(vdev_raidz_t *vdrz, const blkptr_t *bp)
+{
+	return (vdev_raidz_layout_for_alloc(vdrz,
+	    BP_GET_PHYSICAL_BIRTH(bp)));
+}
+
+/*
+ * The logical width and the parity of the layout that the blocks of the
+ * top-level RAID-Z vdev vd born in txg have, the one the I/O path maps them
+ * with, for consumers outside it such as zdb.  Either pointer may be NULL.
+ */
+void
+vdev_raidz_layout_for_birth(vdev_t *vd, uint64_t txg, uint64_t *widthp,
+    uint64_t *nparityp)
+{
+	ASSERT3P(vd->vdev_ops, ==, &vdev_raidz_ops);
+
+	vdev_raidz_layout_t layout =
+	    vdev_raidz_layout_for_alloc(vd->vdev_tsd, txg);
+
+	if (widthp != NULL)
+		*widthp = layout.vrl_width;
+	if (nparityp != NULL)
+		*nparityp = layout.vrl_nparity;
+}
+
+/*
+ * DDT extension requires the complete allocation layout to match, including
+ * parity as well as logical column width.
  */
 boolean_t
 vdev_raidz_same_logical_width(vdev_t *vd, uint64_t txg1, uint64_t txg2)
@@ -2321,9 +2432,12 @@ vdev_raidz_same_logical_width(vdev_t *vd, uint64_t txg1, uint64_t txg2)
 
 	vdev_raidz_t *vdrz = vd->vdev_tsd;
 	mutex_enter(&vdrz->vd_expand_lock);
-	boolean_t same = avl_is_empty(&vdrz->vd_expand_txgs) ||
-	    vdev_raidz_get_logical_width_locked(vdrz, txg1) ==
-	    vdev_raidz_get_logical_width_locked(vdrz, txg2);
+	vdev_raidz_layout_t layout1 =
+	    vdev_raidz_layout_for_alloc_locked(vdrz, txg1);
+	vdev_raidz_layout_t layout2 =
+	    vdev_raidz_layout_for_alloc_locked(vdrz, txg2);
+	boolean_t same = layout1.vrl_width == layout2.vrl_width &&
+	    layout1.vrl_nparity == layout2.vrl_nparity;
 	mutex_exit(&vdrz->vd_expand_lock);
 
 	return (same);
@@ -2343,9 +2457,9 @@ vdev_raidz_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t txg)
 	vdev_raidz_t *vdrz = vd->vdev_tsd;
 	uint64_t psize;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	uint64_t nparity = vdrz->vd_nparity;
-
-	uint64_t cols = vdev_raidz_get_logical_width(vdrz, txg);
+	vdev_raidz_layout_t layout = vdev_raidz_layout_for_alloc(vdrz, txg);
+	uint64_t nparity = layout.vrl_nparity;
+	uint64_t cols = layout.vrl_width;
 
 	ASSERT0(asize % (1 << ashift));
 
@@ -2368,17 +2482,18 @@ vdev_raidz_asize_to_psize(vdev_t *vd, uint64_t asize, uint64_t txg)
  * Note: If the RAIDZ vdev has been expanded, older BP's may have allocated
  * more space due to the lower data-to-parity ratio.  In this case it's
  * important to pass in the correct txg.  Note that vdev_gang_header_asize()
- * relies on a constant asize for psize=SPA_GANGBLOCKSIZE=SPA_MINBLOCKSIZE,
- * regardless of txg.  This is assured because for a single data sector, we
- * allocate P+1 sectors regardless of width ("cols", which is at least P+1).
+ * relies on an asize for psize=SPA_GANGBLOCKSIZE=SPA_MINBLOCKSIZE that does
+ * not depend on the width at the given txg.  This is assured because for a
+ * single data sector, we allocate P+1 sectors regardless of width ("cols",
+ * which is at least P+1).  It does depend on the parity at the given txg, so
+ * callers pass the physical birth txg of the block.
  */
 static uint64_t
-vdev_raidz_psize_to_asize_width(vdev_t *vd, uint64_t psize, uint64_t cols)
+vdev_raidz_psize_to_asize_width(vdev_t *vd, uint64_t psize, uint64_t cols,
+    uint64_t nparity)
 {
-	vdev_raidz_t *vdrz = vd->vdev_tsd;
 	uint64_t asize;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
-	uint64_t nparity = vdrz->vd_nparity;
 
 	ASSERT3U(cols, >, nparity);
 
@@ -2391,21 +2506,22 @@ static uint64_t
 vdev_raidz_psize_to_asize(vdev_t *vd, uint64_t psize, uint64_t txg)
 {
 	vdev_raidz_t *vdrz = vd->vdev_tsd;
-	uint64_t cols = vdev_raidz_get_logical_width(vdrz, txg);
-	uint64_t asize =
-	    vdev_raidz_psize_to_asize_width(vd, psize, cols);
+	vdev_raidz_layout_t layout = vdev_raidz_layout_for_alloc(vdrz, txg);
+	uint64_t asize = vdev_raidz_psize_to_asize_width(vd, psize,
+	    layout.vrl_width, layout.vrl_nparity);
 
 #ifdef ZFS_DEBUG
 	uint64_t asize_new = vdev_raidz_psize_to_asize_width(vd, psize,
-	    vdrz->vd_physical_width);
-	VERIFY3U(asize_new, <=, asize);
+	    vdrz->vd_physical_width, layout.vrl_nparity);
+	if (vdrz->vd_physical_width >= layout.vrl_width)
+		VERIFY3U(asize_new, <=, asize);
 #endif
 
 	return (asize);
 }
 
 static boolean_t
-vdev_raidz_io_exceeds_dva(zio_t *zio, uint64_t logical_width,
+vdev_raidz_io_exceeds_dva(zio_t *zio, vdev_raidz_layout_t layout,
     uint64_t *required_asizep, uint64_t *owned_asizep)
 {
 	vdev_t *vd = zio->io_vd;
@@ -2425,7 +2541,7 @@ vdev_raidz_io_exceeds_dva(zio_t *zio, uint64_t logical_width,
 		return (B_FALSE);
 
 	*required_asizep = vdev_raidz_psize_to_asize_width(vd, zio->io_size,
-	    logical_width);
+	    layout.vrl_width, layout.vrl_nparity);
 	*owned_asizep = 0;
 	for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
 		const dva_t *dva = &bp->blk_dva[d];
@@ -2435,7 +2551,8 @@ vdev_raidz_io_exceeds_dva(zio_t *zio, uint64_t logical_width,
 			continue;
 
 		uint64_t asize = DVA_GET_GANG(dva) ?
-		    vdev_gang_header_asize(tvd) : DVA_GET_ASIZE(dva);
+		    vdev_gang_header_asize(tvd, BP_GET_PHYSICAL_BIRTH(bp)) :
+		    DVA_GET_ASIZE(dva);
 		/*
 		 * A second DVA at the same top vdev and offset can only
 		 * occur in an already-malformed BP; keep the smallest owned
@@ -2789,14 +2906,19 @@ vdev_raidz_io_start(zio_t *zio)
 	vdev_raidz_t *vdrz = vd->vdev_tsd;
 	raidz_map_t *rm;
 
-	uint64_t logical_width = vdev_raidz_get_logical_width(vdrz,
-	    BP_GET_PHYSICAL_BIRTH(zio->io_bp));
-	if (logical_width != vdrz->vd_physical_width) {
+	vdev_raidz_layout_t layout = vdev_raidz_layout_for_bp(vdrz, zio->io_bp);
+	if (zfs_flags & ZFS_DEBUG_RAIDZ_RECONSTRUCT)
+		zfs_dbgmsg("io_start: vrl_width=%llu phys=%d "
+		    "off=%llu type=%d", (u_longlong_t)layout.vrl_width,
+		    vdrz->vd_physical_width,
+		    (u_longlong_t)zio->io_offset, (int)zio->io_type);
+	if (layout.vrl_width != vdrz->vd_physical_width ||
+	    layout.vrl_nparity != vdrz->vd_nparity) {
 		if (BP_GET_DEDUP(zio->io_bp)) {
 			uint64_t required_asize;
 			uint64_t owned_asize;
 
-			if (vdev_raidz_io_exceeds_dva(zio, logical_width,
+			if (vdev_raidz_io_exceeds_dva(zio, layout,
 			    &required_asize, &owned_asize)) {
 				if (owned_asize == 0) {
 					zfs_dbgmsg("%s: rejecting "
@@ -2824,7 +2946,8 @@ vdev_raidz_io_start(zio_t *zio)
 				return;
 			}
 		}
-
+	}
+	if (layout.vrl_width != vdrz->vd_physical_width) {
 		zfs_locked_range_t *lr = NULL;
 		uint64_t synced_offset = UINT64_MAX;
 		uint64_t next_offset = UINT64_MAX;
@@ -2865,12 +2988,13 @@ vdev_raidz_io_start(zio_t *zio)
 
 		rm = vdev_raidz_map_alloc_expanded(zio,
 		    tvd->vdev_ashift, vdrz->vd_physical_width,
-		    logical_width, vdrz->vd_nparity,
+		    layout.vrl_width, layout.vrl_nparity,
 		    synced_offset, next_offset, use_scratch);
 		rm->rm_lr = lr;
 	} else {
 		rm = vdev_raidz_map_alloc(zio,
-		    tvd->vdev_ashift, logical_width, vdrz->vd_nparity);
+		    tvd->vdev_ashift, layout.vrl_width,
+		    layout.vrl_nparity);
 	}
 	rm->rm_original_width = vdrz->vd_original_width;
 
@@ -2883,7 +3007,7 @@ vdev_raidz_io_start(zio_t *zio)
 			vdev_raidz_io_start_write(zio, rm->rm_row[i]);
 		}
 
-		if (logical_width == vdrz->vd_physical_width) {
+		if (layout.vrl_width == vdrz->vd_physical_width) {
 			raidz_start_skip_writes(zio);
 		}
 	} else {
@@ -3169,7 +3293,7 @@ vdev_child_slow_outlier(zio_t *zio)
 		    cvd->vdev_state != VDEV_STATE_HEALTHY;
 
 		/* We can't sit out more disks than we have parity */
-		if (sitting && ++sitouts >= vdev_get_nparity(vd))
+		if (sitting && ++sitouts >= vdev_get_min_nparity(vd))
 			skip = B_TRUE;
 
 		mutex_enter(&cvd->vdev_stat_lock);
@@ -3474,7 +3598,7 @@ raidz_simulate_failure(int physical_width, int original_width, int ashift,
  * returns 0 on successful reconstruction
  */
 static int
-raidz_reconstruct(zio_t *zio, int *ltgts, int ntgts, int nparity)
+raidz_reconstruct(zio_t *zio, int *ltgts, int ntgts)
 {
 	vdev_t *vd = zio->io_vd;
 	raidz_map_t *rm = zio->io_vsd;
@@ -3510,7 +3634,7 @@ raidz_reconstruct(zio_t *zio, int *ltgts, int ntgts, int nparity)
 			ASSERT0(rc->rc_need_orig_restore);
 			if (rc->rc_error != 0) {
 				dead++;
-				if (c >= nparity)
+				if (c >= rr->rr_firstdatacol)
 					dead_data++;
 				continue;
 			}
@@ -3531,7 +3655,7 @@ raidz_reconstruct(zio_t *zio, int *ltgts, int ntgts, int nparity)
 					rc->rc_need_orig_restore = B_TRUE;
 
 					dead++;
-					if (c >= nparity)
+					if (c >= rr->rr_firstdatacol)
 						dead_data++;
 					/*
 					 * Note: simulating failure of a
@@ -3542,8 +3666,8 @@ raidz_reconstruct(zio_t *zio, int *ltgts, int ntgts, int nparity)
 					 * also more than the size of my_tgts.
 					 * This check prevents accessing past
 					 * the end of my_tgts.  The "dead >
-					 * nparity" check below will fail this
-					 * reconstruction attempt.
+					 * rr_firstdatacol" check below will
+					 * fail this reconstruction attempt.
 					 */
 					if (t < VDEV_RAIDZ_MAXPARITY) {
 						my_tgts[t++] = c;
@@ -3558,7 +3682,11 @@ raidz_reconstruct(zio_t *zio, int *ltgts, int ntgts, int nparity)
 				}
 			}
 		}
-		if (dead > nparity) {
+		/*
+		 * The parity of a row is that of the layout the block was
+		 * born in, which need not be the vdev's own.
+		 */
+		if (dead > rr->rr_firstdatacol) {
 			/* reconstruction not possible */
 			if (dbgmsg) {
 				zfs_dbgmsg("reconstruction not possible; "
@@ -3678,19 +3806,23 @@ static int
 vdev_raidz_combrec(zio_t *zio)
 {
 	vdev_t *vd = zio->io_vd;
-	int nparity = vdev_get_nparity(vd);
 	raidz_map_t *rm = zio->io_vsd;
 	int physical_width = zio->io_vd->vdev_children;
+	int nparity = 0;
 
 	if (vd->vdev_ops == &vdev_draid_ops) {
 		vdev_draid_config_t *vdc = vd->vdev_tsd;
-		nparity = vdc->vdc_nparity;
 		physical_width = vdc->vdc_children;
 	}
 
 	int original_width = (rm->rm_original_width != 0) ?
 	    rm->rm_original_width : physical_width;
 
+	/*
+	 * The parity of a block is that of the layout it was born in, not
+	 * the vdev's, so each row is bounded by its own parity columns and
+	 * the search goes as far as the largest of them.
+	 */
 	for (int i = 0; i < rm->rm_nrows; i++) {
 		raidz_row_t *rr = rm->rm_row[i];
 		int total_errors = 0;
@@ -3700,8 +3832,10 @@ vdev_raidz_combrec(zio_t *zio)
 				total_errors++;
 		}
 
-		if (total_errors > nparity)
+		if (total_errors > rr->rr_firstdatacol)
 			return (vdev_raidz_worst_error(rr));
+
+		nparity = MAX(nparity, rr->rr_firstdatacol);
 	}
 
 	for (int num_failures = 1; num_failures <= nparity; num_failures++) {
@@ -3730,8 +3864,7 @@ vdev_raidz_combrec(zio_t *zio)
 		ltgts[num_failures] = n;
 
 		for (;;) {
-			int err = raidz_reconstruct(zio, ltgts, num_failures,
-			    nparity);
+			int err = raidz_reconstruct(zio, ltgts, num_failures);
 			if (err == EINVAL) {
 				/*
 				 * Reconstruction not possible with this #
@@ -4170,8 +4303,7 @@ done:
 static void
 vdev_raidz_state_change(vdev_t *vd, int faulted, int degraded)
 {
-	vdev_raidz_t *vdrz = vd->vdev_tsd;
-	if (faulted > vdrz->vd_nparity)
+	if (faulted > vdev_raidz_min_nparity(vd))
 		vdev_set_state(vd, B_FALSE, VDEV_STATE_CANT_OPEN,
 		    VDEV_AUX_NO_REPLICAS);
 	else if (degraded + faulted != 0)
@@ -4200,7 +4332,9 @@ vdev_raidz_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
 		return (B_TRUE);
 
 	uint64_t dcols = vd->vdev_children;
-	uint64_t nparity = vdrz->vd_nparity;
+	vdev_raidz_layout_t layout =
+	    vdev_raidz_layout_for_alloc(vdrz, phys_birth);
+	uint64_t nparity = layout.vrl_nparity;
 	uint64_t ashift = vd->vdev_top->vdev_ashift;
 	/* The starting RAIDZ (parent) vdev sector of the block. */
 	uint64_t b = DVA_GET_OFFSET(dva) >> ashift;
@@ -4208,25 +4342,20 @@ vdev_raidz_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
 	uint64_t s = ((psize - 1) >> ashift) + 1;
 	/* The first column for this stripe. */
 	uint64_t f = b % dcols;
+	/*
+	 * The block is laid out in rows of the layout's width, each with
+	 * nparity parity columns, over consecutive children.  A layout
+	 * narrower than the vdev, from an epoch or a previous expansion,
+	 * can need several rows where a full-width one needs one.
+	 */
+	uint64_t ncols = s + nparity *
+	    howmany(s, layout.vrl_width - nparity);
 
 	/* Unreachable by sequential resilver. */
 	ASSERT3U(phys_birth, !=, TXG_UNKNOWN);
 
 	if (!vdev_dtl_contains(vd, DTL_PARTIAL, phys_birth, 1))
 		return (B_FALSE);
-
-	if (s + nparity >= dcols)
-		return (B_TRUE);
-
-	/*
-	 * The block is laid out in rows of the logical width it was born
-	 * with, each with nparity parity columns, over consecutive
-	 * children.  A block born before an expansion can need several
-	 * rows where a block of the vdev's width needs one.
-	 */
-	uint64_t ncols = s + nparity *
-	    howmany(s, vdev_raidz_get_logical_width(vdrz, phys_birth) -
-	    nparity);
 
 	if (ncols >= dcols)
 		return (B_TRUE);
@@ -6078,6 +6207,7 @@ vdev_ops_t vdev_raidz_ops = {
 	.vdev_op_metaslab_init = NULL,
 	.vdev_op_config_generate = vdev_raidz_config_generate,
 	.vdev_op_nparity = vdev_raidz_nparity,
+	.vdev_op_min_nparity = vdev_raidz_min_nparity,
 	.vdev_op_ndisks = vdev_raidz_ndisks,
 	.vdev_op_alloc_factor = vdev_raidz_alloc_factor,
 	.vdev_op_type = VDEV_TYPE_RAIDZ,	/* name of this vdev type */
