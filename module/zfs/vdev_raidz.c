@@ -343,6 +343,15 @@ static
 unsigned long raidz_expand_max_reflow_bytes = 0;
 
 /*
+ * Rescue tunable: ignore the parity-epoch table, both the copy in the label
+ * and MOS config and the one in the vdev ZAP, so that the data of a pool
+ * whose table is damaged can be read.  Blocks born in an epoch that changed
+ * the parity decode wrongly while it is set, so a pool with the feature
+ * active can then only be imported read-only.
+ */
+static int raidz_ignore_parity_epochs = 0;
+
+/*
  * For testing only: pause the raidz expansion at a certain point.
  */
 uint_t raidz_expand_pause_point = 0;
@@ -5521,6 +5530,7 @@ vdev_raidz_attach_sync(void *arg, dmu_tx_t *tx)
 	ASSERT3U(raidvd->vdev_children, ==, vdrz->vd_physical_width + 1);
 	ASSERT3P(raidvd->vdev_child[raidvd->vdev_children - 1], ==,
 	    new_child);
+	ASSERT(!vdev_raidz_has_parity_epochs(raidvd));
 
 	spa_feature_incr(spa, SPA_FEATURE_RAIDZ_EXPANSION, tx);
 
@@ -5897,6 +5907,102 @@ vdev_raidz_parity_epochs_set(vdev_t *vd, const uint64_t *table,
 	return (0);
 }
 
+/*
+ * Until vdev_raidz_load() replaces it, the in-core table is the copy that
+ * vdev_raidz_init() took from the label or the MOS config, which reading the
+ * MOS needs.  That copy is not authoritative, the vdev ZAP copy is: the
+ * setter writes both in the same txg, so a copy of the config that the ZAP
+ * lacks or contradicts was written some other way, and a ZAP copy that the
+ * config lacks is not the one the MOS was read with.  Log how the copy of
+ * the config differs from the ZAP copy, NULL if there is none, before it is
+ * replaced or dropped, and have the config rewritten from what remains.
+ *
+ * Without a ZAP copy, return B_TRUE instead, and change nothing, if the copy
+ * of the config cannot be dropped: it has an epoch of another layout than
+ * the vdev's that the pool may hold blocks of, one that starts in a txg that
+ * has synced or that could have been open when the last one did.
+ */
+static boolean_t
+vdev_raidz_parity_epochs_reconcile(vdev_t *vd, const uint64_t *table,
+    uint64_t nent)
+{
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	spa_t *spa = vd->vdev_spa;
+	uint64_t reach = spa_last_synced_txg(spa) + TXG_CONCURRENT_STATES;
+	uint64_t cfg[3] = { 0, 0, 0 };
+	uint64_t ncfg;
+	uint64_t i = 0;
+	boolean_t lost = B_FALSE;
+
+	mutex_enter(&vdrz->vd_expand_lock);
+	ncfg = vdrz->vd_parity_epoch_count;
+	if (vdrz->vd_parity_epochs != NULL) {
+		const uint64_t *cur = vdrz->vd_parity_epochs;
+
+		while (i < ncfg && i < nent &&
+		    memcmp(&cur[3 * i], &table[3 * i], sizeof (cfg)) == 0)
+			i++;
+		if (i < ncfg)
+			memcpy(cfg, &cur[3 * i], sizeof (cfg));
+
+		for (uint64_t j = 1; table == NULL && j < ncfg; j++) {
+			if (cur[3 * j] <= reach &&
+			    (cur[3 * j + 1] != vdrz->vd_physical_width ||
+			    cur[3 * j + 2] != vdrz->vd_nparity)) {
+				memcpy(cfg, &cur[3 * j], sizeof (cfg));
+				lost = B_TRUE;
+				break;
+			}
+		}
+	}
+	mutex_exit(&vdrz->vd_expand_lock);
+
+	if (lost) {
+		vdev_dbgmsg(vd, "vdev_raidz_load: no parity epoch table in "
+		    "the vdev ZAP, and the config's has an epoch of width "
+		    "%llu and parity %llu from txg %llu, which the pool may "
+		    "hold blocks of: they cannot be read without it",
+		    (u_longlong_t)cfg[1], (u_longlong_t)cfg[2],
+		    (u_longlong_t)cfg[0]);
+		return (B_TRUE);
+	}
+
+	if (i == ncfg && i == nent)
+		return (B_FALSE);
+
+	if (ncfg == 0) {
+		vdev_dbgmsg(vd, "vdev_raidz_load: no parity epoch table in "
+		    "the config, using the %llu entries of the vdev ZAP's",
+		    (u_longlong_t)nent);
+	} else if (table == NULL) {
+		vdev_dbgmsg(vd, "vdev_raidz_load: no parity epoch table in "
+		    "the vdev ZAP, dropping the %llu entries of the config's: "
+		    "the pool holds no block of an epoch they add",
+		    (u_longlong_t)ncfg);
+	} else {
+		vdev_dbgmsg(vd, "vdev_raidz_load: the parity epoch table of "
+		    "the config (%llu entries) differs from the vdev ZAP's "
+		    "(%llu entries) at entry %llu, using the vdev ZAP's",
+		    (u_longlong_t)ncfg, (u_longlong_t)nent, (u_longlong_t)i);
+		if (i < ncfg) {
+			vdev_dbgmsg(vd, "vdev_raidz_load: config entry %llu: "
+			    "%llu:%llu:%llu", (u_longlong_t)i,
+			    (u_longlong_t)cfg[0], (u_longlong_t)cfg[1],
+			    (u_longlong_t)cfg[2]);
+		}
+		if (i < nent) {
+			vdev_dbgmsg(vd, "vdev_raidz_load: vdev ZAP entry %llu: "
+			    "%llu:%llu:%llu", (u_longlong_t)i,
+			    (u_longlong_t)table[3 * i],
+			    (u_longlong_t)table[3 * i + 1],
+			    (u_longlong_t)table[3 * i + 2]);
+		}
+	}
+	if (spa_writeable(spa))
+		spa_async_request(spa, SPA_ASYNC_CONFIG_UPDATE);
+	return (B_FALSE);
+}
+
 int
 vdev_raidz_load(vdev_t *vd)
 {
@@ -5908,6 +6014,8 @@ vdev_raidz_load(vdev_t *vd)
 	uint64_t end_time = 0;
 	uint64_t bytes_copied = 0;
 
+	vdrz->vd_parity_epochs_refusal = VDEV_RAIDZ_REFUSED_NONE;
+	vdrz->vd_parity_epochs_dropped = B_FALSE;
 	if (vd->vdev_top_zap != 0) {
 		err = zap_lookup(vd->vdev_spa->spa_meta_objset,
 		    vd->vdev_top_zap, VDEV_TOP_ZAP_RAIDZ_EXPAND_STATE,
@@ -5935,6 +6043,136 @@ vdev_raidz_load(vdev_t *vd)
 	}
 
 	/*
+	 * With the table ignored, blocks would be written in the vdev's own
+	 * layout whatever epoch they are born in, and the config rewrite
+	 * would drop the table from the labels.  Only a read-only import is
+	 * safe.
+	 */
+	if (raidz_ignore_parity_epochs && spa_writeable(vd->vdev_spa) &&
+	    (vdrz->vd_parity_epochs_config_present ||
+	    spa_feature_is_active(vd->vdev_spa,
+	    SPA_FEATURE_RAIDZ_PARITY_EPOCHS))) {
+		spa_load_failed(vd->vdev_spa, "raidz_ignore_parity_epochs "
+		    "is set with stored parity epochs: import read-only");
+		vdrz->vd_parity_epochs_refusal = VDEV_RAIDZ_REFUSED_IGNORED;
+		return (SET_ERROR(EROFS));
+	}
+
+	/*
+	 * Load the persisted parity-epoch table if the raidz_parity_epochs
+	 * feature has written one.  The table is {start physical-birth txg,
+	 * logical width, parity} triplets sorted by start, which must be
+	 * valid for this vdev or the vdev fails to load.  Layout selection
+	 * consumes it as soon as it is installed.  A config-only table is
+	 * retained for read-only recovery, and permits writing only once it
+	 * is dropped, which it can be when no block depends on it.
+	 */
+	if (!raidz_ignore_parity_epochs) {
+		uint64_t int_size = 0;
+		uint64_t num_ints = 0;
+
+		err = ENOENT;
+		if (vd->vdev_top_zap != 0) {
+			err = zap_length(vd->vdev_spa->spa_meta_objset,
+			    vd->vdev_top_zap, VDEV_TOP_ZAP_RAIDZ_PARITY_EPOCHS,
+			    &int_size, &num_ints);
+		}
+		if (err == 0) {
+			const char *why = NULL;
+
+			if (int_size != sizeof (uint64_t) || num_ints == 0 ||
+			    (num_ints % 3) != 0) {
+				vdev_dbgmsg(vd, "vdev_raidz_load: rejecting "
+				    "parity epoch table [error=%d]: it is not "
+				    "made of whole uint64 triplets", EINVAL);
+				return (SET_ERROR(EINVAL));
+			}
+
+			/*
+			 * Expansion history and a parity-epoch table are
+			 * mutually exclusive until their combination is
+			 * defined; refuse rather than guess.  Say so before
+			 * the shape check, which a table written before the
+			 * expansion would fail on its width.
+			 */
+			if (avl_numnodes(&vdrz->vd_expand_txgs) != 0 ||
+			    state != DSS_NONE) {
+				vdev_dbgmsg(vd, "vdev_raidz_load: parity epoch "
+				    "table together with expansion state");
+				vdrz->vd_parity_epochs_refusal =
+				    VDEV_RAIDZ_REFUSED_EXPANDED;
+				return (SET_ERROR(ENOTSUP));
+			}
+
+			uint64_t *table = kmem_alloc(
+			    num_ints * sizeof (uint64_t), KM_SLEEP);
+			err = zap_lookup(vd->vdev_spa->spa_meta_objset,
+			    vd->vdev_top_zap,
+			    VDEV_TOP_ZAP_RAIDZ_PARITY_EPOCHS,
+			    sizeof (uint64_t), num_ints, table);
+			if (err == 0) {
+				err = vdev_raidz_parity_epochs_check(table,
+				    num_ints / 3, vdrz->vd_physical_width,
+				    vdrz->vd_nparity, &why);
+			} else {
+				why = "it cannot be read";
+			}
+			if (err != 0) {
+				vdev_dbgmsg(vd, "vdev_raidz_load: rejecting "
+				    "parity epoch table [error=%d]: %s", err,
+				    why);
+				kmem_free(table,
+				    num_ints * sizeof (uint64_t));
+				return (err);
+			}
+			/*
+			 * The ZAP copy is authoritative: it replaces the copy
+			 * vdev_raidz_init() took from the label or MOS config.
+			 */
+			(void) vdev_raidz_parity_epochs_reconcile(vd, table,
+			    num_ints / 3);
+			vdev_raidz_parity_epochs_install(vd, table,
+			    num_ints / 3);
+			kmem_free(table, num_ints * sizeof (uint64_t));
+		} else if (err == ENOENT) {
+			if (vdrz->vd_parity_epochs_config_present &&
+			    !vdev_raidz_has_parity_epochs(vd)) {
+				spa_load_failed(vd->vdev_spa,
+				    "invalid config-only parity epoch table");
+				return (SET_ERROR(EINVAL));
+			}
+			/*
+			 * A config-only table may already describe live blocks.
+			 * A read-only import keeps it for recovery reads.  A
+			 * writable one drops it if no block can depend on it,
+			 * and is refused otherwise: it must not erase the
+			 * layout of those blocks, or write without the ZAP copy
+			 * and active feature that protect it.
+			 */
+			if (vdev_raidz_has_parity_epochs(vd) &&
+			    !spa_writeable(vd->vdev_spa)) {
+				vdev_dbgmsg(vd, "vdev_raidz_load: no parity "
+				    "epoch table in the vdev ZAP, preserving "
+				    "the config table for read-only recovery");
+			} else if (vdev_raidz_has_parity_epochs(vd)) {
+				if (vdev_raidz_parity_epochs_reconcile(vd,
+				    NULL, 0)) {
+					spa_load_failed(vd->vdev_spa,
+					    "config-only parity epoch table: "
+					    "import read-only for recovery");
+					vdrz->vd_parity_epochs_refusal =
+					    VDEV_RAIDZ_REFUSED_CONFIG;
+					return (SET_ERROR(EROFS));
+				}
+				vdev_raidz_parity_epochs_install(vd, NULL, 0);
+				vdrz->vd_parity_epochs_dropped = B_TRUE;
+			}
+		} else {
+			return (err);
+		}
+	}
+
+	/*
 	 * If we are in the middle of expansion, vre_state should have
 	 * already been set by vdev_raidz_init().
 	 */
@@ -5945,6 +6183,91 @@ vdev_raidz_load(vdev_t *vd)
 	vdrz->vn_vre.vre_bytes_copied = bytes_copied;
 
 	return (0);
+}
+
+/*
+ * After vdev_load() of the root vdev failed: tell zpool import, in the load
+ * info, when a parity-epoch table is why, so that it does not report a
+ * read-only device or an unsupported version.  The top-level vdevs load in
+ * parallel, so each one only records its reason, and this reads them once
+ * they are done.
+ */
+void
+vdev_raidz_load_info(vdev_t *rvd, nvlist_t *info)
+{
+	for (uint64_t c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *tvd = rvd->vdev_child[c];
+		vdev_raidz_t *vdrz;
+
+		if (tvd->vdev_ops != &vdev_raidz_ops)
+			continue;
+		vdrz = tvd->vdev_tsd;
+		if (vdrz->vd_parity_epochs_refusal ==
+		    VDEV_RAIDZ_REFUSED_CONFIG) {
+			fnvlist_add_boolean(info,
+			    ZPOOL_CONFIG_RAIDZ_EPOCHS_RDONLY);
+		} else if (vdrz->vd_parity_epochs_refusal ==
+		    VDEV_RAIDZ_REFUSED_IGNORED) {
+			fnvlist_add_boolean(info,
+			    ZPOOL_CONFIG_RAIDZ_EPOCHS_IGNORED);
+		} else if (vdrz->vd_parity_epochs_refusal ==
+		    VDEV_RAIDZ_REFUSED_EXPANDED) {
+			fnvlist_add_boolean(info,
+			    ZPOOL_CONFIG_RAIDZ_EPOCHS_EXPANDED);
+		}
+	}
+}
+
+/* Whether a leaf under vd holds a label written after txg. */
+static boolean_t
+vdev_raidz_label_newer(vdev_t *vd, uint64_t txg)
+{
+	if (vd->vdev_ops->vdev_op_leaf)
+		return (vd->vdev_label_txg > txg);
+	for (uint64_t c = 0; c < vd->vdev_children; c++) {
+		if (vdev_raidz_label_newer(vd->vdev_child[c], txg))
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
+ * Before the first txg of a writable import syncs, have it rewrite the
+ * config of each raidz vdev whose labels may describe another layout than
+ * the one it writes with: a vdev whose config-only table vdev_raidz_load()
+ * dropped, or one with a label newer than the MOS config the load took its
+ * vdev tree from.  Labels and MOS config are written in the same txgs, so
+ * such a label was left by the txgs a rewind (-F, -T, checkpoint) discards,
+ * with the parity-epoch table or expansion state they had.  The config
+ * update of spa_import() only runs after the first txgs, which a rewind
+ * numbers above every uberblock on disk: they can be past the start of an
+ * epoch the labels still describe, and a crash before that update would
+ * leave labels by which their blocks are read with the wrong layout.
+ */
+void
+vdev_raidz_dirty_stale_labels(spa_t *spa)
+{
+	vdev_t *rvd = spa->spa_root_vdev;
+	uint64_t config_txg;
+
+	if (nvlist_lookup_uint64(spa->spa_config, ZPOOL_CONFIG_POOL_TXG,
+	    &config_txg) != 0)
+		config_txg = UINT64_MAX;
+
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_WRITER);
+	for (uint64_t c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *tvd = rvd->vdev_child[c];
+		vdev_raidz_t *vdrz;
+
+		if (tvd->vdev_ops != &vdev_raidz_ops)
+			continue;
+		vdrz = tvd->vdev_tsd;
+		if (vdrz->vd_parity_epochs_dropped ||
+		    vdev_raidz_label_newer(tvd, config_txg))
+			vdev_config_dirty(tvd);
+		vdrz->vd_parity_epochs_dropped = B_FALSE;
+	}
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
 }
 
 int
@@ -5988,6 +6311,178 @@ spa_raidz_expand_get_stats(spa_t *spa, pool_raidz_expand_stat_t *pres)
 	pres->pres_start_time = vre->vre_start_time;
 	pres->pres_end_time = vre->vre_end_time;
 	pres->pres_waiting_for_resilver = vre->vre_waiting_for_resilver;
+
+	return (0);
+}
+
+/*
+ * Set the expansion state of a RAID-Z vdev from its config nv: the reflow
+ * in progress, if any, and the txgs of the expansions it has completed.
+ * The caller holds vd_expand_lock unless vdrz is not in use yet.
+ */
+static void
+vdev_raidz_config_expansion(spa_t *spa, vdev_raidz_t *vdrz, nvlist_t *nv)
+{
+	boolean_t reflow_in_progress =
+	    nvlist_exists(nv, ZPOOL_CONFIG_RAIDZ_EXPANDING);
+	if (reflow_in_progress) {
+		spa->spa_raidz_expand = &vdrz->vn_vre;
+		vdrz->vn_vre.vre_state = DSS_SCANNING;
+	}
+
+	vdrz->vd_original_width = vdrz->vd_physical_width;
+	uint64_t *txgs;
+	unsigned int txgs_size = 0;
+	int error = nvlist_lookup_uint64_array(nv,
+	    ZPOOL_CONFIG_RAIDZ_EXPAND_TXGS, &txgs, &txgs_size);
+	if (error == 0) {
+		for (int i = 0; i < txgs_size; i++) {
+			reflow_node_t *re = kmem_zalloc(sizeof (*re), KM_SLEEP);
+			re->re_txg = txgs[txgs_size - i - 1];
+			re->re_logical_width = vdrz->vd_physical_width - i;
+
+			if (reflow_in_progress)
+				re->re_logical_width--;
+
+			avl_add(&vdrz->vd_expand_txgs, re);
+		}
+
+		vdrz->vd_original_width = vdrz->vd_physical_width - txgs_size;
+	}
+	if (reflow_in_progress) {
+		vdrz->vd_original_width--;
+		zfs_dbgmsg("reflow_in_progress, %llu wide, %d prior expansions",
+		    (u_longlong_t)vdrz->vd_physical_width, txgs_size);
+	}
+}
+
+/*
+ * Check the parity-epoch table tbl, of size uint64s, that config nv gives a
+ * RAID-Z vdev of this width and parity.  On EINVAL, *why says why.
+ */
+static int
+vdev_raidz_config_epochs_check(nvlist_t *nv, const uint64_t *tbl,
+    unsigned int size, uint64_t width, uint64_t nparity, const char **why)
+{
+	if (size == 0 || (size % 3) != 0) {
+		*why = "it is not made of whole uint64 triplets";
+		return (SET_ERROR(EINVAL));
+	}
+	if (nvlist_exists(nv, ZPOOL_CONFIG_RAIDZ_EXPANDING) ||
+	    nvlist_exists(nv, ZPOOL_CONFIG_RAIDZ_EXPAND_TXGS)) {
+		*why = "the vdev has expansion state or history";
+		return (SET_ERROR(EINVAL));
+	}
+	return (vdev_raidz_parity_epochs_check(tbl, size / 3, width, nparity,
+	    why));
+}
+
+/*
+ * Replace the layout that the config of a top-level RAID-Z vdev gave it, its
+ * expansion state and its parity-epoch table, with the one nv, the config of
+ * the vdev in a newer label, describes, for spa_load() to read the MOS with.
+ * Only that layout changes, on a vdev tree that is not in use yet.
+ * vdev_raidz_open() has already opened the vdev with the layout of the
+ * config, to size it and to count the children it can do without, which does
+ * not matter here: DVAs are not checked against that size while the config
+ * is untrusted, and the MOS config replaces this vdev tree.
+ *
+ * The table of the label replaces that of the config even when it holds
+ * fewer epochs: after a rewind, the labels of the new timeline lack the
+ * epochs added after the txg rewound to, which a cachefile written before
+ * the rewind may still have.
+ *
+ * *changed says whether the layout differed.  Returns EINVAL, with nothing
+ * changed and *why saying why, if nv does not describe this vdev at its
+ * width and parity with a valid layout.
+ */
+int
+vdev_raidz_config_from_label(vdev_t *vd, nvlist_t *nv, boolean_t *changed,
+    const char **why)
+{
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	spa_t *spa = vd->vdev_spa;
+	nvlist_t **child;
+	uint_t children;
+	uint64_t guid;
+	uint64_t nparity;
+	uint64_t *txgs = NULL;
+	unsigned int txgs_size = 0;
+	uint64_t *pe = NULL;
+	unsigned int pe_size = 0;
+	const char *type;
+	boolean_t expanding = nvlist_exists(nv, ZPOOL_CONFIG_RAIDZ_EXPANDING);
+	reflow_node_t *re;
+
+	ASSERT3P(vd->vdev_ops, ==, &vdev_raidz_ops);
+	ASSERT3P(vd, ==, vd->vdev_top);
+	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == SCL_ALL);
+
+	*changed = B_FALSE;
+	*why = NULL;
+	(void) nvlist_lookup_uint64_array(nv, ZPOOL_CONFIG_RAIDZ_EXPAND_TXGS,
+	    &txgs, &txgs_size);
+	if (!raidz_ignore_parity_epochs) {
+		(void) nvlist_lookup_uint64_array(nv,
+		    ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS, &pe, &pe_size);
+	}
+	if (nvlist_lookup_string(nv, ZPOOL_CONFIG_TYPE, &type) != 0 ||
+	    strcmp(type, VDEV_TYPE_RAIDZ) != 0 ||
+	    nvlist_lookup_uint64(nv, ZPOOL_CONFIG_GUID, &guid) != 0 ||
+	    guid != vd->vdev_guid) {
+		*why = "it describes another vdev";
+	} else if (nvlist_lookup_uint64(nv, ZPOOL_CONFIG_NPARITY,
+	    &nparity) != 0 || nparity != vdrz->vd_nparity) {
+		*why = "its parity differs";
+	} else if (nvlist_lookup_nvlist_array(nv, ZPOOL_CONFIG_CHILDREN,
+	    &child, &children) != 0 || children != vdrz->vd_physical_width) {
+		*why = "its width differs";
+	} else if (expanding && spa->spa_raidz_expand != NULL &&
+	    spa->spa_raidz_expand != &vdrz->vn_vre) {
+		*why = "another vdev is expanding";
+	} else if (txgs_size + (expanding ? 1 : 0) + nparity >= children) {
+		*why = "its expansions leave too few columns";
+	} else {
+		for (unsigned int i = 1; i < txgs_size; i++) {
+			if (txgs[i] <= txgs[i - 1])
+				*why = "its expansion txgs do not increase";
+		}
+		if (*why == NULL && pe != NULL)
+			(void) vdev_raidz_config_epochs_check(nv, pe, pe_size,
+			    children, nparity, why);
+	}
+	if (*why != NULL)
+		return (SET_ERROR(EINVAL));
+
+	mutex_enter(&vdrz->vd_expand_lock);
+	*changed = expanding != (vdrz->vn_vre.vre_state == DSS_SCANNING) ||
+	    txgs_size != avl_numnodes(&vdrz->vd_expand_txgs) ||
+	    (pe_size / 3) != vdrz->vd_parity_epoch_count ||
+	    (pe != NULL && memcmp(pe, vdrz->vd_parity_epochs,
+	    pe_size * sizeof (uint64_t)) != 0);
+	re = avl_first(&vdrz->vd_expand_txgs);
+	for (unsigned int i = 0; !*changed && i < txgs_size; i++) {
+		*changed = re->re_txg != txgs[i];
+		re = AVL_NEXT(&vdrz->vd_expand_txgs, re);
+	}
+	if (*changed) {
+		if (spa->spa_raidz_expand == &vdrz->vn_vre)
+			spa->spa_raidz_expand = NULL;
+		vdrz->vn_vre.vre_state = DSS_NONE;
+		vd->vdev_rz_expanding = expanding;
+		while ((re = avl_first(&vdrz->vd_expand_txgs)) != NULL) {
+			avl_remove(&vdrz->vd_expand_txgs, re);
+			kmem_free(re, sizeof (*re));
+		}
+		vdev_raidz_config_expansion(spa, vdrz, nv);
+	}
+	mutex_exit(&vdrz->vd_expand_lock);
+
+	if (*changed) {
+		vdrz->vd_parity_epochs_config_present =
+		    nvlist_exists(nv, ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS);
+		vdev_raidz_parity_epochs_install(vd, pe, pe_size / 3);
+	}
 
 	return (0);
 }
@@ -6050,36 +6545,36 @@ vdev_raidz_init(spa_t *spa, nvlist_t *nv, void **tsd)
 	(void) nvlist_lookup_uint64(nv, ZPOOL_CONFIG_ID,
 	    &vdrz->vn_vre.vre_vdev_id);
 
-	boolean_t reflow_in_progress =
-	    nvlist_exists(nv, ZPOOL_CONFIG_RAIDZ_EXPANDING);
-	if (reflow_in_progress) {
-		spa->spa_raidz_expand = &vdrz->vn_vre;
-		vdrz->vn_vre.vre_state = DSS_SCANNING;
-	}
+	vdev_raidz_config_expansion(spa, vdrz, nv);
 
-	vdrz->vd_original_width = children;
-	uint64_t *txgs;
-	unsigned int txgs_size = 0;
-	error = nvlist_lookup_uint64_array(nv, ZPOOL_CONFIG_RAIDZ_EXPAND_TXGS,
-	    &txgs, &txgs_size);
-	if (error == 0) {
-		for (int i = 0; i < txgs_size; i++) {
-			reflow_node_t *re = kmem_zalloc(sizeof (*re), KM_SLEEP);
-			re->re_txg = txgs[txgs_size - i - 1];
-			re->re_logical_width = vdrz->vd_physical_width - i;
+	vdrz->vd_parity_epochs_config_present =
+	    nvlist_exists(nv, ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS);
+	uint64_t *pe_label;
+	unsigned int pe_label_size = 0;
+	if (!raidz_ignore_parity_epochs &&
+	    nvlist_lookup_uint64_array(nv, ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS,
+	    &pe_label, &pe_label_size) == 0) {
+		const char *why = NULL;
 
-			if (reflow_in_progress)
-				re->re_logical_width--;
-
-			avl_add(&vdrz->vd_expand_txgs, re);
+		/*
+		 * Validate BEFORE the table can influence any read.  A
+		 * malformed or tampered label table, or one next to
+		 * expansion state, is ignored (the authoritative ZAP copy
+		 * loads later and refuses the same cases).
+		 */
+		if (vdev_raidz_config_epochs_check(nv, pe_label,
+		    pe_label_size, children, nparity, &why) == 0) {
+			uint64_t *table = kmem_alloc(
+			    pe_label_size * sizeof (uint64_t), KM_SLEEP);
+			for (unsigned int i = 0; i < pe_label_size; i++)
+				table[i] = pe_label[i];
+			vdrz->vd_parity_epochs = table;
+			vdrz->vd_parity_epoch_count = pe_label_size / 3;
+		} else {
+			zfs_dbgmsg("%s: raidz vdev %lld: ignoring the parity "
+			    "epoch table of the config: %s", spa_name(spa),
+			    (longlong_t)vdrz->vn_vre.vre_vdev_id, why);
 		}
-
-		vdrz->vd_original_width = vdrz->vd_physical_width - txgs_size;
-	}
-	if (reflow_in_progress) {
-		vdrz->vd_original_width--;
-		zfs_dbgmsg("reflow_in_progress, %u wide, %d prior expansions",
-		    children, txgs_size);
 	}
 
 	*tsd = vdrz;
@@ -6159,6 +6654,11 @@ vdev_raidz_config_generate(vdev_t *vd, nvlist_t *nv)
 
 		kmem_free(txgs, sizeof (uint64_t) * count);
 	}
+
+	if (vdrz->vd_parity_epochs != NULL && vdrz->vd_parity_epoch_count > 0) {
+		fnvlist_add_uint64_array(nv, ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS,
+		    vdrz->vd_parity_epochs, vdrz->vd_parity_epoch_count * 3);
+	}
 	mutex_exit(&vdrz->vd_expand_lock);
 }
 
@@ -6237,6 +6737,8 @@ vdev_ops_t vdev_raidz_ops = {
 
 ZFS_MODULE_PARAM(zfs_vdev, raidz_, expand_max_reflow_bytes, ULONG, ZMOD_RW,
 	"For testing, pause RAIDZ expansion after reflowing this many bytes");
+ZFS_MODULE_PARAM(zfs_vdev, raidz_, ignore_parity_epochs, INT, ZMOD_RW,
+	"Rescue: ignore the RAIDZ parity-epoch table (import read-only)");
 ZFS_MODULE_PARAM(zfs_vdev, raidz_, expand_max_copy_bytes, ULONG, ZMOD_RW,
 	"Max amount of concurrent i/o for RAIDZ expansion");
 ZFS_MODULE_PARAM(zfs_vdev, raidz_, io_aggregate_rows, ULONG, ZMOD_RW,
