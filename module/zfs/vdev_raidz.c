@@ -5359,6 +5359,26 @@ vdev_raidz_attach_check(vdev_t *new_child)
 	return (0);
 }
 
+/*
+ * A parity-epoch table and expansion history are mutually exclusive
+ * (vdev_raidz_load() refuses a vdev that has both), so an expansion must not
+ * start on a vdev that has a table.
+ */
+boolean_t
+vdev_raidz_has_parity_epochs(vdev_t *vd)
+{
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	boolean_t has;
+
+	ASSERT3P(vd->vdev_ops, ==, &vdev_raidz_ops);
+
+	mutex_enter(&vdrz->vd_expand_lock);
+	has = (vdrz->vd_parity_epochs != NULL);
+	mutex_exit(&vdrz->vd_expand_lock);
+
+	return (has);
+}
+
 void
 vdev_raidz_attach_sync(void *arg, dmu_tx_t *tx)
 {
@@ -5413,6 +5433,339 @@ vdev_raidz_attach_sync(void *arg, dmu_tx_t *tx)
 	    "%s vdev %llu new width %llu", spa_name(spa),
 	    (unsigned long long)raidvd->vdev_id,
 	    (unsigned long long)raidvd->vdev_children);
+}
+
+/*
+ * Most parity-epoch triplets that fit in one ZAP value.  A longer table
+ * cannot have been stored, so a longer one from a label is corrupt.
+ */
+#define	VDEV_RAIDZ_MAX_PARITY_EPOCHS \
+	(ZAP_MAXVALUELEN / (3 * sizeof (uint64_t)))
+
+/*
+ * Check a parity-epoch table read from disk, from the vdev label or from the
+ * top-level vdev ZAP, against the vdev it was found on.  Layout selection and
+ * the map allocators behind it trust the table, so what they rely on must be
+ * checked before the table can influence any I/O.
+ *
+ * The first entry stands for every block that predates the table, so it must
+ * be the vdev's own geometry, {0, width, nparity}.  Later entries may describe
+ * a narrower logical stripe, but cannot address children the vdev lacks.
+ * This does not change the physical topology; expansion history remains
+ * incompatible with a parity-epoch table.
+ *
+ * On EINVAL, *why, if why is not NULL, says which rule the table breaks.
+ */
+static int
+vdev_raidz_parity_epochs_check(const uint64_t *tbl, uint64_t nent,
+    uint64_t width, uint64_t nparity, const char **why)
+{
+	const char *rule = NULL;
+
+	if (nent == 0)
+		rule = "it has no entry";
+	else if (nent > VDEV_RAIDZ_MAX_PARITY_EPOCHS)
+		rule = "it has more entries than a ZAP value holds";
+	else if (width > UINT8_MAX)
+		rule = "the vdev has more children than a table describes";
+	else if (tbl[0] != 0)
+		rule = "the first entry does not start at txg 0";
+	else if (tbl[2] != nparity)
+		rule = "the first entry does not have the parity of the vdev";
+	else if (tbl[1] != width)
+		rule = "the first entry does not have the width of the vdev";
+
+	for (uint64_t i = 0; rule == NULL && i < nent; i++) {
+		uint64_t parity = tbl[3 * i + 2];
+		uint64_t logical_width = tbl[3 * i + 1];
+
+		if (parity < 1 || parity > VDEV_RAIDZ_MAXPARITY)
+			rule = "an entry has a parity outside 1 to 3";
+		else if (logical_width > width)
+			rule = "an entry exceeds the width of the vdev";
+		else if (logical_width <= parity)
+			rule = "an entry has no data column";
+		else if (i > 0 && tbl[3 * i] <= tbl[3 * (i - 1)])
+			rule = "the starts of the entries do not increase";
+	}
+
+	if (rule == NULL)
+		return (0);
+	if (why != NULL)
+		*why = rule;
+	return (SET_ERROR(EINVAL));
+}
+
+/*
+ * Replace the in-core parity-epoch table of a top-level RAID-Z vdev with a
+ * copy of the nent triplets at table; nent == 0 removes it.  Nothing is
+ * validated and nothing is written to disk.  This is the one place that
+ * replaces the table of a vdev in use: readers take vd_expand_lock to see
+ * the pointer and the count together, and the old table is freed after the
+ * lock is dropped.
+ */
+void
+vdev_raidz_parity_epochs_install(vdev_t *vd, const uint64_t *table,
+    uint64_t nent)
+{
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	uint64_t *copy = NULL;
+	uint64_t *old;
+	uint64_t old_nent;
+
+	ASSERT3P(vd->vdev_ops, ==, &vdev_raidz_ops);
+	ASSERT((table == NULL) == (nent == 0));
+
+	if (nent != 0) {
+		copy = kmem_alloc(nent * 3 * sizeof (uint64_t), KM_SLEEP);
+		memcpy(copy, table, nent * 3 * sizeof (uint64_t));
+	}
+
+	mutex_enter(&vdrz->vd_expand_lock);
+	old = vdrz->vd_parity_epochs;
+	old_nent = vdrz->vd_parity_epoch_count;
+	vdrz->vd_parity_epochs = copy;
+	vdrz->vd_parity_epoch_count = nent;
+	mutex_exit(&vdrz->vd_expand_lock);
+
+	if (old != NULL)
+		kmem_free(old, old_nent * 3 * sizeof (uint64_t));
+}
+
+/*
+ * The first txg at which an epoch added by a sync task running in tx may
+ * start.  Blocks are laid out by the epoch of their physical birth txg and
+ * nothing already written is re-encoded.  While the txg of tx syncs, the
+ * txgs after it can already be open, and the ZIL and dmu_sync() write
+ * blocks born in them in open context, laid out by the table they found.
+ * The first txg that cannot be open yet is TXG_CONCURRENT_STATES later, as
+ * for the width a completed RAID-Z expansion records.
+ */
+uint64_t
+vdev_raidz_parity_epochs_first_start(dmu_tx_t *tx)
+{
+	return (dmu_tx_get_txg(tx) + TXG_CONCURRENT_STATES);
+}
+
+/*
+ * The children of a raidz vdev that vdev_propagate_state() counts as
+ * faulted: those that cannot be read, or written while the pool is.
+ */
+static uint64_t
+vdev_raidz_unavailable_children(vdev_t *vd)
+{
+	spa_t *spa = vd->vdev_spa;
+	uint64_t n = 0;
+
+	for (uint64_t c = 0; c < vd->vdev_children; c++) {
+		vdev_t *cvd = vd->vdev_child[c];
+
+		if (!vdev_readable(cvd) ||
+		    (!vdev_writeable(cvd) && spa_writeable(spa)))
+			n++;
+	}
+	return (n);
+}
+
+/*
+ * What vdev_raidz_parity_epochs_set_check() and _set_check_tx() decide.  A
+ * first of 0 leaves out the rule on the start of added epochs, which needs
+ * the txg of the sync task.  Without health, the rule on the children that
+ * are unavailable is left out.
+ */
+static int
+vdev_raidz_parity_epochs_verdict(vdev_t *vd, const uint64_t *table,
+    uint64_t nent, uint64_t first, boolean_t health, const char **why)
+{
+	vdev_raidz_t *vdrz;
+	uint64_t base[3];
+	const uint64_t *cur;
+	uint64_t ncur;
+	boolean_t expanded;
+	boolean_t extends;
+	int error;
+
+	if (vd->vdev_ops != &vdev_raidz_ops || vd != vd->vdev_top ||
+	    vd->vdev_top_zap == 0) {
+		if (why != NULL)
+			*why = "not a top-level raidz vdev with a ZAP";
+		return (SET_ERROR(EINVAL));
+	}
+	if (!spa_feature_is_enabled(vd->vdev_spa,
+	    SPA_FEATURE_RAIDZ_PARITY_EPOCHS)) {
+		if (why != NULL)
+			*why = "feature@raidz_parity_epochs is not enabled";
+		return (SET_ERROR(ENOTSUP));
+	}
+
+	vdrz = vd->vdev_tsd;
+	mutex_enter(&vdrz->vd_expand_lock);
+	expanded = !avl_is_empty(&vdrz->vd_expand_txgs);
+	mutex_exit(&vdrz->vd_expand_lock);
+	/*
+	 * An attach whose sync task has not run yet shows as a child beyond
+	 * the physical width.
+	 */
+	if (expanded || vdrz->vn_vre.vre_state != DSS_NONE ||
+	    vdrz->vd_original_width != vdrz->vd_physical_width ||
+	    vd->vdev_children != vdrz->vd_physical_width) {
+		if (why != NULL)
+			*why = "the vdev has expansion state or history";
+		return (SET_ERROR(ENOTSUP));
+	}
+
+	error = vdev_raidz_parity_epochs_check(table, nent,
+	    vdrz->vd_physical_width, vdrz->vd_nparity, why);
+	if (error != 0)
+		return (error);
+
+	/*
+	 * The blocks of the epochs the vdev has are on disk, so a table may
+	 * only add epochs to them.  A vdev without a table has one epoch, its
+	 * own geometry.
+	 */
+	base[0] = 0;
+	base[1] = vdrz->vd_physical_width;
+	base[2] = vdrz->vd_nparity;
+	mutex_enter(&vdrz->vd_expand_lock);
+	cur = vdrz->vd_parity_epochs != NULL ? vdrz->vd_parity_epochs : base;
+	ncur = vdrz->vd_parity_epochs != NULL ?
+	    vdrz->vd_parity_epoch_count : 1;
+	extends = nent >= ncur &&
+	    memcmp(table, cur, ncur * 3 * sizeof (uint64_t)) == 0;
+	mutex_exit(&vdrz->vd_expand_lock);
+	if (!extends) {
+		if (why != NULL)
+			*why = "it changes or drops an epoch the vdev has";
+		return (SET_ERROR(EINVAL));
+	}
+
+	/* The starts increase, so the first added epoch is the earliest. */
+	if (first != 0 && nent > ncur && table[3 * ncur] < first) {
+		if (why != NULL)
+			*why = "an added epoch starts too early";
+		return (SET_ERROR(ERANGE));
+	}
+
+	/*
+	 * The blocks of an added epoch are written to the children the vdev
+	 * has now, and the vdev opens only while no more of its children are
+	 * missing than the lowest parity of its table: an epoch of a lower
+	 * parity than the children it cannot use leaves those blocks
+	 * unwritable and the vdev unable to open.
+	 */
+	if (health) {
+		uint64_t out = vdev_raidz_unavailable_children(vd);
+
+		for (uint64_t i = ncur; i < nent; i++) {
+			if (table[3 * i + 2] < out) {
+				if (why != NULL) {
+					*why = "an added epoch has less parity "
+					    "than the vdev has children it "
+					    "cannot read or write";
+				}
+				return (SET_ERROR(ENXIO));
+			}
+		}
+	}
+
+	return (0);
+}
+
+/*
+ * Say whether vdev_raidz_parity_epochs_set() would accept the table on this
+ * vdev, as far as that can be told before its sync task is queued, with no
+ * side effects.  The rule on when added epochs start is left to
+ * vdev_raidz_parity_epochs_set_check_tx().  The caller holds the spa config
+ * lock as reader, which keeps the vdev tree stable.  A dsl_sync_task() check
+ * function runs with the pool config lock held, and spa_sync() takes them in
+ * the other order: in open context, take the spa config lock before
+ * dsl_sync_task(), or only try to take it in the check function, never wait
+ * for it there.
+ *
+ * EINVAL: not a top-level RAID-Z vdev with a top-level ZAP, a table that
+ *	   does not fit this vdev (see vdev_raidz_parity_epochs_check()), or
+ *	   one that changes or drops an epoch the vdev has.
+ * ENOTSUP: the feature is not enabled, or the vdev has expansion state or
+ *	   history, which cannot coexist with a table.
+ * ENXIO:  an added epoch has a lower parity than the number of children of
+ *	   the vdev that cannot be read or written now.
+ * On an error, *why, if why is not NULL, says which rule was broken.
+ */
+int
+vdev_raidz_parity_epochs_set_check(vdev_t *vd, const uint64_t *table,
+    uint64_t nent, const char **why)
+{
+	return (vdev_raidz_parity_epochs_verdict(vd, table, nent, 0, B_TRUE,
+	    why));
+}
+
+/*
+ * vdev_raidz_parity_epochs_set_check() for a sync task running in tx, which
+ * also refuses, with ERANGE, a table whose first added epoch starts before
+ * vdev_raidz_parity_epochs_first_start(tx).  Call it from the check function
+ * of the task, in syncing context, where its verdict is the one
+ * vdev_raidz_parity_epochs_set() reaches in the sync function.
+ */
+int
+vdev_raidz_parity_epochs_set_check_tx(vdev_t *vd, const uint64_t *table,
+    uint64_t nent, dmu_tx_t *tx, const char **why)
+{
+	return (vdev_raidz_parity_epochs_verdict(vd, table, nent,
+	    vdev_raidz_parity_epochs_first_start(tx), B_TRUE, why));
+}
+
+/*
+ * Store a parity-epoch table on a top-level RAID-Z vdev: write the vdev ZAP
+ * entry, activate the feature if this is the first table, replace the
+ * in-core table, dirty the config so that the labels and the MOS config
+ * carry it, and have the cachefile rewritten.  The ZAP entry and the in-core
+ * table change in the same txg.
+ *
+ * The table must keep every epoch the vdev has and may only add epochs, each
+ * starting at or after vdev_raidz_parity_epochs_first_start(tx): an epoch
+ * that starts earlier would describe blocks already written with another
+ * layout.
+ *
+ * Syncing context only, as a dsl_sync_task() sync function, with the spa
+ * config lock held as reader (spa_sync() holds it).  Returns the error of
+ * vdev_raidz_parity_epochs_set_check_tx() with nothing changed: a caller
+ * whose check function got 0 from it for the same table cannot see it fail.
+ * The rule on unavailable children is left to that check function, so that
+ * a child that fails between the two cannot make this one fail.
+ */
+int
+vdev_raidz_parity_epochs_set(vdev_t *vd, const uint64_t *table,
+    uint64_t nent, dmu_tx_t *tx)
+{
+	spa_t *spa = vd->vdev_spa;
+	int error;
+
+	ASSERT(dmu_tx_is_syncing(tx));
+	ASSERT(spa_config_held(spa, SCL_CONFIG, RW_READER));
+
+	error = vdev_raidz_parity_epochs_verdict(vd, table, nent,
+	    vdev_raidz_parity_epochs_first_start(tx), B_FALSE, NULL);
+	if (error != 0)
+		return (error);
+
+	VERIFY0(zap_update(spa->spa_meta_objset, vd->vdev_top_zap,
+	    VDEV_TOP_ZAP_RAIDZ_PARITY_EPOCHS, sizeof (uint64_t), nent * 3,
+	    table, tx));
+	if (!spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_PARITY_EPOCHS))
+		spa_feature_incr(spa, SPA_FEATURE_RAIDZ_PARITY_EPOCHS, tx);
+
+	vdev_raidz_parity_epochs_install(vd, table, nent);
+	vdev_config_dirty(vd);
+	/*
+	 * Nothing else rewrites the cachefile after this sync task, as
+	 * spa_vdev_config_exit() does after the other changes of the vdev
+	 * tree; until it is rewritten, an open from it takes the table from
+	 * the labels.
+	 */
+	spa_async_request(spa, SPA_ASYNC_CONFIG_UPDATE);
+
+	return (0);
 }
 
 int
@@ -5618,6 +5971,12 @@ vdev_raidz_fini(vdev_t *vd)
 		kmem_free(re, sizeof (*re));
 	avl_destroy(&vdrz->vd_expand_txgs);
 	mutex_destroy(&vdrz->vd_expand_lock);
+	if (vdrz->vd_parity_epochs != NULL) {
+		kmem_free(vdrz->vd_parity_epochs,
+		    vdrz->vd_parity_epoch_count * 3 * sizeof (uint64_t));
+		vdrz->vd_parity_epochs = NULL;
+		vdrz->vd_parity_epoch_count = 0;
+	}
 	mutex_destroy(&vdrz->vn_vre.vre_lock);
 	cv_destroy(&vdrz->vn_vre.vre_cv);
 	zfs_rangelock_fini(&vdrz->vn_vre.vre_rangelock);
