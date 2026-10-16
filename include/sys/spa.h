@@ -1112,6 +1112,8 @@ extern uint64_t spa_freeze_txg(spa_t *spa);
 extern uint64_t spa_get_worst_case_asize(spa_t *spa, uint64_t lsize);
 extern void spa_get_min_alloc_range(spa_t *spa, uint64_t *min, uint64_t *max);
 extern uint64_t spa_get_dspace(spa_t *spa);
+extern uint64_t spa_estimate_available(spa_t *, uint64_t, uint64_t,
+    boolean_t, uint64_t);
 extern uint64_t spa_get_checkpoint_space(spa_t *spa);
 extern uint64_t spa_get_slop_space(spa_t *spa);
 extern void spa_update_dspace(spa_t *spa);

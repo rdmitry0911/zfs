@@ -94,6 +94,25 @@ Because space is shared within a pool, availability can be limited by any number
 of factors, including physical pool size, quotas, reservations, or other
 datasets within the pool.
 .Pp
+On pools with RAID-Z parity epochs, the estimate accounts for the current
+allocation layout and the file system's
+.Sy recordsize .
+It describes uncompressed records, accounts for
+.Sy copies
+and eligible
+.Sy special_small_blocks ,
+and leaves the special class's metadata reserve available for metadata.
+Small data uses the eligible special budget before falling back to the
+normal class.
+Compression, metadata, allocation balancing and different record sizes can
+change the amount actually written.
+Quotas and reservations continue to use the original, stable accounting
+units, so changing an epoch does not revalue
+.Sy used
+or
+.Sy referenced .
+The estimate is refreshed after transaction groups sync.
+.Pp
 This property can also be referred to by its shortened column name,
 .Sy avail .
 .It Sy compressratio

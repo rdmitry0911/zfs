@@ -434,6 +434,10 @@ struct spa {
 	uint64_t	spa_dedup_checksum;	/* default dedup checksum */
 	uint64_t	spa_dspace;		/* dspace in normal class */
 	uint64_t	spa_rdspace;		/* raw (non-dedup) --//-- */
+	/* Current normal-class payload / stable DSL budget, 16.16. */
+	uint64_t	spa_available_ratio[2][SPA_MAXBLOCKSHIFT + 1];
+	/* Stable budget available for eligible small data. */
+	uint64_t	spa_available_special;
 	boolean_t	spa_active_ddt_prune;	/* ddt prune process active */
 	brt_vdev_t	**spa_brt_vdevs;	/* array of per-vdev BRTs */
 	uint64_t	spa_brt_nvdevs;		/* number of vdevs in BRT */

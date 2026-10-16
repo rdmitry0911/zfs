@@ -2081,6 +2081,113 @@ spa_get_dspace(spa_t *spa)
 	return (spa->spa_dspace);
 }
 
+/*
+ * DSL budgets and reservations use the original, immutable deflation ratio.
+ * A different parity epoch changes how much of that budget the next record
+ * costs.  Translate only the displayed capacity, after DSL has imposed all
+ * its limits; never revalue existing blocks or change admission accounting.
+ *
+ * Weight the current layouts by their remaining normal-class space.  This is
+ * an estimate for uncompressed records, just as legacy capacity uses a typical
+ * 128K record. The special class is used only for eligible small data, with
+ * its metadata reserve left available to metadata.
+ */
+static uint64_t
+spa_available_ratio(spa_t *spa, uint64_t psize, metaslab_class_t *mc,
+    uint64_t *freep)
+{
+	uint64_t weight_sum = 0;
+	uint64_t ratio_sum = 0;
+	boolean_t changed = B_FALSE;
+	int weight_shift = MAX((int)highbit64(
+	    metaslab_class_get_dspace(mc)) - 40, 0);
+	*freep = 0;
+
+	uint64_t txg = spa_open_txg(spa);
+	vdev_t *rvd = spa->spa_root_vdev;
+	for (uint64_t c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *vd = rvd->vdev_child[c];
+		metaslab_group_t *mg = vd->vdev_mg;
+		uint64_t ratio = 1 << 16;
+		uint64_t space;
+
+		if (mg == NULL || mg->mg_class != mc ||
+		    vd->vdev_noalloc || vdev_is_dead(vd))
+			continue;
+
+		mutex_enter(&vd->vdev_stat_lock);
+		space = vd->vdev_stat.vs_space > vd->vdev_stat.vs_alloc ?
+		    vd->vdev_stat.vs_space - vd->vdev_stat.vs_alloc : 0;
+		mutex_exit(&vd->vdev_stat_lock);
+		if (space == 0)
+			continue;
+
+		if (vd->vdev_ops == &vdev_raidz_ops &&
+		    vdev_raidz_has_parity_epochs(vd)) {
+			uint64_t asize =
+			    vdev_psize_to_asize_txg(vd, psize, txg);
+			uint64_t old_asize = vdev_psize_to_asize_txg(vd,
+			    psize, 0);
+
+			if (asize != old_asize) {
+				uint64_t cost = vdev_deflated_space(vd, asize);
+				ratio = (psize << 16) / cost;
+				changed = B_TRUE;
+			}
+		}
+
+		uint64_t free = vdev_deflated_space(vd, space);
+		*freep += free;
+		/* Keep full precision unless the pool needs wider products. */
+		uint64_t weight = MAX(1, free >> weight_shift);
+		weight_sum += weight;
+		ratio_sum += weight * ratio;
+	}
+	if (!changed || weight_sum == 0)
+		return (1 << 16);
+	return (ratio_sum / weight_sum);
+}
+
+static uint64_t
+spa_scale_available(uint64_t available, uint64_t ratio)
+{
+	uint64_t fraction = ((available & 0xffff) * ratio) >> 16;
+	uint64_t whole = available >> 16;
+	if (ratio != 0 && whole > (UINT64_MAX - fraction) / ratio)
+		return (UINT64_MAX);
+	return (whole * ratio + fraction);
+}
+
+uint64_t
+spa_estimate_available(spa_t *spa, uint64_t available, uint64_t psize,
+    boolean_t small, uint64_t copies)
+{
+	if (available == 0 || !spa_feature_is_active(spa,
+	    SPA_FEATURE_RAIDZ_PARITY_EPOCHS))
+		return (available);
+
+	/*
+	 * Callers can hold the DSL config lock.  Taking the SPA config lock
+	 * here would invert spa_sync's lock order. Sample estimates cached
+	 * at import and after every synced txg instead.
+	 */
+	uint_t shift = highbit64(psize) - 1;
+	if (shift < SPA_MINBLOCKSHIFT || shift > SPA_MAXBLOCKSHIFT)
+		shift = SPA_OLD_MAXBLOCKSHIFT;
+	uint64_t ratio = atomic_load_64(&spa->spa_available_ratio[0][shift]);
+	if (ratio == 0)
+		return (available);
+	uint64_t special = small ? MIN(available,
+	    atomic_load_64(&spa->spa_available_special)) : 0;
+	uint64_t special_ratio = atomic_load_64(
+	    &spa->spa_available_ratio[1][shift]);
+	uint64_t normal = spa_scale_available(available - special, ratio);
+	special = spa_scale_available(special, special_ratio);
+	uint64_t payload = normal > UINT64_MAX - special ?
+	    UINT64_MAX : normal + special;
+	return (payload / MAX(1, copies));
+}
+
 uint64_t
 spa_get_checkpoint_space(spa_t *spa)
 {
@@ -2118,6 +2225,29 @@ spa_update_dspace(spa_t *spa)
 	    metaslab_class_get_dalloc(spa_dedup_class(spa)) +
 	    ddt_get_dedup_dspace(spa) +
 	    brt_get_dspace(spa);
+
+	if (spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_PARITY_EPOCHS)) {
+		uint64_t normal_free, special_free;
+		for (uint_t shift = SPA_MINBLOCKSHIFT;
+		    shift <= SPA_MAXBLOCKSHIFT; shift++) {
+			atomic_store_64(&spa->spa_available_ratio[0][shift],
+			    spa_available_ratio(spa, 1ULL << shift,
+			    spa_normal_class(spa), &normal_free));
+			atomic_store_64(&spa->spa_available_ratio[1][shift],
+			    spa_available_ratio(spa, 1ULL << shift,
+			    spa_special_class(spa), &special_free));
+		}
+		metaslab_class_t *mc = spa_special_class(spa);
+		uint64_t space = metaslab_class_get_dspace(mc);
+		uint64_t allocated = metaslab_class_get_dalloc(mc);
+		uint64_t percent = 100 - MIN(100U,
+		    zfs_special_class_metadata_reserve_pct);
+		uint64_t limit = space / 100 * percent +
+		    (space % 100) * percent / 100;
+		atomic_store_64(&spa->spa_available_special,
+		    limit > allocated ?
+		    MIN(special_free, limit - allocated) : 0);
+	}
 }
 
 /*

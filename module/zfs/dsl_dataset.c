@@ -2778,7 +2778,33 @@ dsl_get_available(dsl_dataset_t *ds)
 			availbytes = 0;
 		}
 	}
-	return (availbytes);
+	spa_t *spa = ds->ds_dir->dd_pool->dp_spa;
+	uint64_t recordsize = SPA_OLD_MAXBLOCKSIZE;
+	uint64_t small = 0;
+	uint64_t copies = 1;
+	if (spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_PARITY_EPOCHS)) {
+		dsl_pool_t *dp = ds->ds_dir->dd_pool;
+		/* statfs reaches this getter without the DSL config lock. */
+		boolean_t need_config = !dsl_pool_config_held(dp);
+		if (need_config)
+			dsl_pool_config_enter(dp, FTAG);
+		(void) dsl_prop_get_int_ds(ds,
+		    zfs_prop_to_name(ZFS_PROP_RECORDSIZE), &recordsize);
+		(void) dsl_prop_get_int_ds(ds,
+		    zfs_prop_to_name(ZFS_PROP_SPECIAL_SMALL_BLOCKS), &small);
+		(void) dsl_prop_get_int_ds(ds,
+		    zfs_prop_to_name(ZFS_PROP_COPIES), &copies);
+		objset_t *os;
+		dmu_object_info_t doi;
+		if (dmu_objset_from_ds(ds, &os) == 0 &&
+		    dmu_objset_type(os) == DMU_OST_ZVOL &&
+		    dmu_object_info(os, ZVOL_OBJ, &doi) == 0)
+			recordsize = doi.doi_data_block_size;
+		if (need_config)
+			dsl_pool_config_exit(dp, FTAG);
+	}
+	return (spa_estimate_available(spa, availbytes, recordsize,
+	    small >= recordsize, copies));
 }
 
 int
@@ -3075,20 +3101,7 @@ dsl_dataset_space(dsl_dataset_t *ds,
     uint64_t *usedobjsp, uint64_t *availobjsp)
 {
 	*refdbytesp = dsl_dataset_phys(ds)->ds_referenced_bytes;
-	*availbytesp = dsl_dir_space_available(ds->ds_dir, NULL, 0, TRUE);
-	if (ds->ds_reserved > dsl_dataset_phys(ds)->ds_unique_bytes)
-		*availbytesp +=
-		    ds->ds_reserved - dsl_dataset_phys(ds)->ds_unique_bytes;
-	if (ds->ds_quota != 0) {
-		/*
-		 * Adjust available bytes according to refquota
-		 */
-		if (*refdbytesp < ds->ds_quota)
-			*availbytesp = MIN(*availbytesp,
-			    ds->ds_quota - *refdbytesp);
-		else
-			*availbytesp = 0;
-	}
+	*availbytesp = dsl_get_available(ds);
 	rrw_enter(&ds->ds_bp_rwlock, RW_READER, FTAG);
 	*usedobjsp = BP_GET_FILL(&dsl_dataset_phys(ds)->ds_bp);
 	rrw_exit(&ds->ds_bp_rwlock, FTAG);
