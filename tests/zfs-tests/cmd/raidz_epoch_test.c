@@ -147,7 +147,8 @@ usage(void)
 	    "       raidz_epoch_test read <dir> <pool> <object> <blocksize> "
 	    "[readonly]\n"
 	    "       raidz_epoch_test state <dir> <pool> open|offline|fault\n"
-	    "       raidz_epoch_test boundary <dir> <pool>\n");
+	    "       raidz_epoch_test boundary <dir> <pool>\n"
+	    "       raidz_epoch_test retirement-create <dir> <pool>\n");
 	exit(2);
 }
 
@@ -384,6 +385,56 @@ store_table_sync(void *arg, dmu_tx_t *tx)
 
 	VERIFY0(vdev_raidz_parity_epochs_set(spa->spa_root_vdev->vdev_child[0],
 	    ta->ta_table, ta->ta_entries, tx));
+}
+
+/*
+ * Keep every pre-epoch allocation on the mirror. The new RAID-Z vdev must
+ * still be empty when it is passivated; never manufacture a successful census.
+ */
+static int
+do_retirement_create(const char *dir, const char *pool)
+{
+	nvlist_t *leaves[2];
+	nvlist_t *mirror = fnvlist_alloc();
+	char path[PATH_BUF];
+	spa_t *spa;
+	int error;
+
+	for (int c = 0; c < 2; c++) {
+		(void) snprintf(path, sizeof (path), "%s/m%d", dir, c);
+		error = make_file(path, VDEV_FILE_SIZE);
+		if (error != 0)
+			return (error);
+		leaves[c] = file_vdev(path);
+	}
+	fnvlist_add_string(mirror, ZPOOL_CONFIG_TYPE, VDEV_TYPE_MIRROR);
+	fnvlist_add_nvlist_array(mirror, ZPOOL_CONFIG_CHILDREN,
+	    (const nvlist_t * const *)leaves, 2);
+	error = create_pool(pool, mirror);
+	fnvlist_free(mirror);
+	for (int c = 0; c < 2; c++)
+		fnvlist_free(leaves[c]);
+	if (error != 0)
+		return (error);
+
+	VERIFY0(spa_open(pool, &spa, FTAG));
+	nvlist_t *raid = raidz_config(dir, 5, 1, vdev_path, NULL, 0);
+	nvlist_t *root = root_config(raid);
+	error = spa_vdev_add(spa, root, B_FALSE);
+	fnvlist_free(root);
+	fnvlist_free(raid);
+	if (error == 0) {
+		vdev_t *vd = spa->spa_root_vdev->vdev_child[1];
+		error = spa_vdev_noalloc(spa, vd->vdev_guid);
+		txg_wait_synced(spa_get_dsl(spa), 0);
+		uint64_t allocated = vd->vdev_stat.vs_alloc;
+		(void) printf("RESULT retirement-create allocated=%llu\n",
+		    (u_longlong_t)allocated);
+		if (allocated != 0)
+			error = EBUSY;
+	}
+	close_pool(spa, pool);
+	return (error);
 }
 
 static int
@@ -1217,6 +1268,8 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "create") == 0 && argc >= 6) {
 		rv = do_create(argv[2], argv[3], atoi(argv[4]), atoi(argv[5]),
 		    argc >= 7 ? atoi(argv[6]) : 0);
+	} else if (strcmp(argv[1], "retirement-create") == 0 && argc == 4) {
+		rv = do_retirement_create(argv[2], argv[3]);
 	} else if (strcmp(argv[1], "forge") == 0 && argc == 7) {
 		rv = do_forge(argv[2], argv[3], atoi(argv[4]), atoi(argv[5]),
 		    argv[6]);

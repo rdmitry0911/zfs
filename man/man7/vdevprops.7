@@ -81,6 +81,10 @@ Percent of fragmentation in this vdev
 The minimum level of parity guaranteed for blocks on this vdev.
 For a RAID-Z vdev with a parity-epoch table, this is the lowest parity in
 that table, including the original layout.
+A certificate from the
+.Sy raidz_epoch_retirement
+feature may raise this minimum after proving complete strong coverage.
+Any epoch appended after the certificate still bounds the reported parity.
 .It Sy failure_domain
 Failure domain id of this child vdev in
 .Sy dRAID

@@ -1084,6 +1084,8 @@ typedef struct zpool_load_policy {
 	"org.openzfs:raidz_expand_bytes_copied"
 #define	VDEV_TOP_ZAP_RAIDZ_PARITY_EPOCHS \
 	"org.openzfs:raidz_parity_epochs"
+#define	VDEV_TOP_ZAP_RAIDZ_RETIREMENT \
+	"org.openzfs:raidz_epoch_retirement"
 
 /* vdev metaslab allocation bias */
 #define	VDEV_ALLOC_BIAS_LOG		"log"

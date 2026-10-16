@@ -927,6 +927,42 @@ amount usable space in the pool.
 See
 .Xr zpool-attach 8 .
 .
+.feature org.openzfs raidz_epoch_retirement yes raidz_parity_epochs
+Records a certified minimum parity for a top-level RAID-Z vdev while retaining
+every parity-epoch layout descriptor.
+The certificate becomes authoritative only after loading the selected MOS;
+a claim from newer labels cannot raise the guarantee of an older rewind.
+Software that does not support this feature cannot write a pool with an
+active certificate, even if it supports parity epochs.
+It may import read-only with the older conservative failure tolerance.
+.Pp
+The feature becomes
+.Sy active
+when
+.Nm zhack Cm raidz_retire Fl w
+commits the first certificate.
+This debug operation requires an exported pool, reads it without modifying it,
+and compares the physical references it visits with the complete allocation
+map of the target vdev.
+Weak blocks, unvisited allocated space, read errors, checkpoint state and
+nonempty intent-log headers refuse certification.
+Incomplete support for gang children or shared physical references refuses
+the operation rather than claiming additional tolerance.
+.Pp
+The writable reopen must select exactly the MOS root and epoch table that
+were checked, and the sync task rechecks these identities and the exclusion
+of checkpoints.
+Every current and future allocation epoch must have at least the requested
+parity.
+Appending a weaker epoch after certification immediately lowers the claimed
+guarantee, including before that epoch begins.
+An interrupted or refused census leaves the original guarantee in effect.
+.Pp
+This operation does not rewrite data, snapshots, clones or MOS metadata,
+and cannot retire an epoch while such weak allocations remain.
+It does not remove table entries or reclaim their finite table capacity.
+The feature remains active while certificates are retained.
+.
 .feature org.openzfs raidz_parity_epochs no none
 This feature persists a per-top-level-vdev table of
 .Sy {physical-birth-txg , logical-width , parity}
@@ -972,6 +1008,10 @@ imported.
 Where the epochs of a vdev differ in parity, the redundancy assumed for the vdev
 as a whole, for instance when deciding whether it can still be opened or
 whether a device can be taken offline, is the lowest parity in its table.
+A certified
+.Sy raidz_epoch_retirement
+floor may replace the historical minimum; every epoch appended after that
+certificate still bounds the guarantee.
 Reads, writes, scrubs and resilvers use the width and parity of each block's
 epoch.
 .Pp
@@ -988,6 +1028,8 @@ vdev property
 reports the lowest parity in the table, and
 .Nm zdb Fl m
 prints the table itself.
+An authoritative retirement certificate changes the property to its certified
+floor, bounded by all later epochs.
 .Pp
 A table found in the MOS configuration, without a copy in the vdev ZAP, was
 not stored by

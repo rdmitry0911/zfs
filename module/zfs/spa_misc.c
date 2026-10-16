@@ -2887,6 +2887,7 @@ boolean_t
 spa_self_heal_allowed(spa_t *spa)
 {
 	return (spa_writeable(spa) &&
+	    atomic_load_64(&spa->spa_raidz_retirement_loading) == 0 &&
 	    (spa->spa_load_state == SPA_LOAD_NONE ||
 	    spa->spa_load_max_txg == UINT64_MAX || spa->spa_sync_on));
 }

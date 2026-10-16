@@ -2231,8 +2231,8 @@ vdev_raidz_reconstruct_row(raidz_map_t *rm, raidz_row_t *rr,
 
 /*
  * The number of failed children that every block of the vdev survives: the
- * lowest parity of any layout the vdev has held, which is not necessarily the
- * parity of the layout new blocks are written in.
+ * lowest historical parity unless a selected-MOS certificate proves a floor.
+ * Every later epoch still bounds the claim, even before its start txg.
  */
 static uint64_t
 vdev_raidz_min_nparity(vdev_t *vd)
@@ -2241,8 +2241,16 @@ vdev_raidz_min_nparity(vdev_t *vd)
 	uint64_t min = vdrz->vd_nparity;
 
 	mutex_enter(&vdrz->vd_expand_lock);
-	for (uint64_t i = 0; i < vdrz->vd_parity_epoch_count; i++)
-		min = MIN(min, vdrz->vd_parity_epochs[3 * i + 2]);
+	if (vdrz->vd_retirement_parity != 0)
+		min = vdrz->vd_retirement_parity;
+	for (uint64_t i = 0; i < vdrz->vd_parity_epoch_count; i++) {
+		if (vdrz->vd_retirement_provisional) {
+			min = MAX(min, vdrz->vd_parity_epochs[3 * i + 2]);
+		} else if (vdrz->vd_retirement_parity == 0 ||
+		    vdrz->vd_parity_epochs[3 * i] > vdrz->vd_retirement_txg) {
+			min = MIN(min, vdrz->vd_parity_epochs[3 * i + 2]);
+		}
+	}
 	mutex_exit(&vdrz->vd_expand_lock);
 
 	return (min);
@@ -2300,6 +2308,16 @@ vdev_raidz_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 		*max_asize *= vd->vdev_children;
 	}
 
+	if (numerrors > vdev_raidz_min_nparity(vd) &&
+	    vd->vdev_spa->spa_load_state != SPA_LOAD_NONE) {
+		/*
+		 * A newer certified floor is in the MOS, not in trusted labels.
+		 * Permit only the load to try reading it. vdev_raidz_load()
+		 * must authenticate that floor before any writing can start.
+		 */
+		atomic_store_64(&vd->vdev_spa->spa_raidz_retirement_loading, 1);
+		vdrz->vd_retirement_provisional = B_TRUE;
+	}
 	if (numerrors > vdev_raidz_min_nparity(vd)) {
 		vd->vdev_stat.vs_aux = VDEV_AUX_NO_REPLICAS;
 		return (lasterror);
@@ -6013,6 +6031,7 @@ vdev_raidz_load(vdev_t *vd)
 	uint64_t start_time = 0;
 	uint64_t end_time = 0;
 	uint64_t bytes_copied = 0;
+	boolean_t authoritative_epochs = B_FALSE;
 
 	vdrz->vd_parity_epochs_refusal = VDEV_RAIDZ_REFUSED_NONE;
 	vdrz->vd_parity_epochs_dropped = B_FALSE;
@@ -6133,6 +6152,7 @@ vdev_raidz_load(vdev_t *vd)
 			    num_ints / 3);
 			vdev_raidz_parity_epochs_install(vd, table,
 			    num_ints / 3);
+			authoritative_epochs = B_TRUE;
 			kmem_free(table, num_ints * sizeof (uint64_t));
 		} else if (err == ENOENT) {
 			if (vdrz->vd_parity_epochs_config_present &&
@@ -6171,6 +6191,41 @@ vdev_raidz_load(vdev_t *vd)
 			return (err);
 		}
 	}
+
+	/* Never take a retirement claim from a label or a newer MOS lineage. */
+	uint64_t certificate[2];
+	uint64_t int_size = 0;
+	uint64_t num_ints = 0;
+	err = vd->vdev_top_zap == 0 || raidz_ignore_parity_epochs ? ENOENT :
+	    zap_length(vd->vdev_spa->spa_meta_objset, vd->vdev_top_zap,
+	    VDEV_TOP_ZAP_RAIDZ_RETIREMENT, &int_size, &num_ints);
+	if (err == 0) {
+		if (int_size != sizeof (uint64_t) || num_ints != 2)
+			return (SET_ERROR(EINVAL));
+		err = zap_lookup(vd->vdev_spa->spa_meta_objset,
+		    vd->vdev_top_zap,
+		    VDEV_TOP_ZAP_RAIDZ_RETIREMENT, sizeof (uint64_t), 2,
+		    certificate);
+	}
+	if (err != 0 && err != ENOENT)
+		return (err);
+	if (err == 0 && (certificate[0] == 0 ||
+	    certificate[0] > VDEV_RAIDZ_MAXPARITY || certificate[1] == 0 ||
+	    certificate[1] > vd->vdev_spa->spa_uberblock.ub_txg ||
+	    !authoritative_epochs ||
+	    !spa_feature_is_active(vd->vdev_spa,
+	    SPA_FEATURE_RAIDZ_EPOCH_RETIREMENT)))
+		return (SET_ERROR(EINVAL));
+	mutex_enter(&vdrz->vd_expand_lock);
+	vdrz->vd_retirement_parity = err == 0 ? certificate[0] : 0;
+	vdrz->vd_retirement_txg = err == 0 ? certificate[1] : 0;
+	vdrz->vd_retirement_provisional = B_FALSE;
+	mutex_exit(&vdrz->vd_expand_lock);
+	uint64_t unreadable = 0;
+	for (uint64_t c = 0; c < vd->vdev_children; c++)
+		unreadable += !vdev_readable(vd->vdev_child[c]);
+	if (unreadable > vdev_raidz_min_nparity(vd))
+		return (SET_ERROR(ENXIO));
 
 	/*
 	 * If we are in the middle of expansion, vre_state should have

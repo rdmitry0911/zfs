@@ -768,6 +768,19 @@ zpool_feature_init(void)
 	    "Support for persisted mixed-parity RAIDZ layout epochs",
 	    ZFEATURE_FLAG_MOS, ZFEATURE_TYPE_BOOLEAN, NULL, sfeatures);
 
+	{
+		static const spa_feature_t retirement_deps[] = {
+			SPA_FEATURE_RAIDZ_PARITY_EPOCHS,
+			SPA_FEATURE_NONE
+		};
+		zfeature_register(SPA_FEATURE_RAIDZ_EPOCH_RETIREMENT,
+		    "org.openzfs:raidz_epoch_retirement",
+		    "raidz_epoch_retirement",
+		    "Certified minimum parity after an allocation census",
+		    ZFEATURE_FLAG_READONLY_COMPAT, ZFEATURE_TYPE_BOOLEAN,
+		    retirement_deps, sfeatures);
+	}
+
 	zfeature_register(SPA_FEATURE_FAST_DEDUP,
 	    "com.klarasystems:fast_dedup", "fast_dedup",
 	    "Support for advanced deduplication",

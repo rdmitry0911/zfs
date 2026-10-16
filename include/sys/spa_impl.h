@@ -267,6 +267,10 @@ struct spa {
 	metaslab_class_t *spa_special_embedded_log_class; /* log on special */
 	metaslab_class_t *spa_dedup_class;	/* dedup allocation class */
 	uint64_t	spa_first_txg;		/* first txg after spa_open() */
+	/* Identity of the selected MOS, before this import writes anything. */
+	blkptr_t	spa_load_rootbp;
+	/* Suppress repairs until every provisional floor has MOS authority. */
+	uint64_t	spa_raidz_retirement_loading;
 	uint64_t	spa_final_txg;		/* txg of export/destroy */
 	uint64_t	spa_freeze_txg;		/* freeze pool at this txg */
 	uint64_t	spa_load_max_txg;	/* best initial ub_txg */

@@ -5121,6 +5121,7 @@ spa_ld_open_rootbp(spa_t *spa)
 	int error = 0;
 	vdev_t *rvd = spa->spa_root_vdev;
 
+	spa->spa_load_rootbp = spa->spa_uberblock.ub_rootbp;
 	error = dsl_pool_init(spa, spa->spa_first_txg, &spa->spa_dsl_pool);
 	if (error != 0) {
 		spa_load_failed(spa, "unable to open rootbp in dsl_pool_init "
@@ -5816,6 +5817,8 @@ spa_ld_load_vdev_metadata(spa_t *spa)
 	vdev_dtl_reassess(rvd, 0, 0, B_FALSE, B_FALSE);
 	spa_config_exit(spa, SCL_ALL, FTAG);
 
+	/* Every provisional RAID-Z floor now has selected-MOS authority. */
+	atomic_store_64(&spa->spa_raidz_retirement_loading, 0);
 	return (0);
 }
 

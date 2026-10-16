@@ -228,6 +228,46 @@ The pool must be exported.
 .
 .It Xo
 .Nm zhack
+.Cm raidz_retire
+.Op Fl w
+.Ar pool
+.Ar vdev
+.Ar parity
+.Xc
+Prove that every allocated extent of top-level RAID-Z vdev
+.Ar vdev
+is accounted for by blocks with at least
+.Ar parity
+parity columns.
+The pool must be exported and the
+.Sy raidz_epoch_retirement
+feature must be enabled.
+The census runs read-only and verifies visited block checksums.
+Any weak reference, missing coverage, read error, checkpoint or nonempty
+intent-log header refuses the operation.
+Gang children and other physical references that cannot be accounted for
+completely cause refusal.
+.Pp
+Without
+.Fl w ,
+report the census without modifying the pool.
+With
+.Fl w ,
+reopen the same selected MOS for writing and commit a certificate in a sync
+task that rechecks the root, complete epoch table and checkpoint exclusion.
+The current and every future allocation layout must already meet the target.
+The certificate changes the vdev's claimed failure tolerance; all layout
+descriptors remain available for reading old pool states.
+Nothing is rewritten and retained weak snapshots or clones still prevent
+retirement.
+Use only disposable pools; this is a debug primitive, not a supported
+administrative conversion command.
+Exclusive administrative access is required throughout the operation.
+The kernel pool namespace must be queryable; unavailable or inconclusive
+inactivity checks cause refusal.
+.
+.It Xo
+.Nm zhack
 .Cm raidz_epochs
 .Op Fl f
 .Ar pool

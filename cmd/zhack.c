@@ -46,9 +46,16 @@
 #include <sys/dmu_tx.h>
 #include <sys/backtrace.h>
 #include <sys/dsl_dir.h>
+#include <sys/dsl_dataset.h>
+#include <sys/dmu_traverse.h>
+#include <sys/metaslab.h>
+#include <sys/arc.h>
+#include <sys/spa_log_spacemap.h>
 #include <sys/space_map.h>
 #include <zfeature_common.h>
 #include <libzutil.h>
+#include <libzfs_core.h>
+#include <sys/zfs_ioctl.h>
 #include <sys/metaslab_impl.h>
 #include <libzpool.h>
 
@@ -56,6 +63,7 @@ static importargs_t g_importargs;
 static char *g_pool;
 static boolean_t g_readonly;
 static boolean_t g_dump_dbgmsg;
+static boolean_t g_require_exported;
 
 /*
  * In readonly imports, metaslab space maps are not opened unless this is set.
@@ -141,7 +149,12 @@ usage(void)
 	    "        table stored; disposable pools only\n"
 	    "        -f write the vdev's top-level ZAP entry verbatim and\n"
 	    "        nothing else (no validation, so damaged tables can be\n"
-	    "        injected)\n");
+	    "        injected)\n"
+	    "    raidz_retire [-w] <exported-pool> <top-vdev-id> <parity>\n"
+	    "        DEBUG: prove the minimum parity against all allocated\n"
+	    "        space, retaining every layout descriptor; dry-run unless\n"
+	    "        -w commits the MOS certificate; incomplete coverage or\n"
+	    "        checkpoint state is refused; disposable pools only\n");
 	exit(1);
 }
 
@@ -218,6 +231,57 @@ space_delta_cb(dmu_object_type_t bonustype, const void *data,
 /*
  * Target is the dataset whose pool we want to open.
  */
+/* Check the kernel namespace too, including read-only and renamed imports. */
+static int
+zhack_retirement_inactive(uint64_t guid)
+{
+	int fd = open(ZFS_DEV, O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return (errno);
+	size_t size = 256 << 10;
+	int error;
+	nvlist_t *configs = NULL;
+	for (;;) {
+		zfs_cmd_t zc = { 0 };
+		void *buf = malloc(size);
+		if (buf == NULL) {
+			error = ENOMEM;
+			break;
+		}
+		zc.zc_nvlist_dst = (uint64_t)(uintptr_t)buf;
+		zc.zc_nvlist_dst_size = size;
+		error = lzc_ioctl_fd(fd, ZFS_IOC_POOL_CONFIGS, &zc) == 0 ?
+		    nvlist_unpack(buf, zc.zc_nvlist_dst_size, &configs, 0) :
+		    errno;
+		free(buf);
+		if (error != ENOMEM || size >= 64 << 20)
+			break;
+		size *= 2;
+	}
+	(void) close(fd);
+	if (error == EEXIST)
+		return (0);
+	if (error != 0)
+		return (error);
+	for (nvpair_t *pair = nvlist_next_nvpair(configs, NULL); pair != NULL;
+	    pair = nvlist_next_nvpair(configs, pair)) {
+		nvlist_t *config;
+		uint64_t active_guid;
+		if (nvpair_value_nvlist(pair, &config) != 0 ||
+		    nvlist_lookup_uint64(config, ZPOOL_CONFIG_POOL_GUID,
+		    &active_guid) != 0) {
+			error = EINVAL;
+			break;
+		}
+		if (active_guid == guid) {
+			error = EBUSY;
+			break;
+		}
+	}
+	fnvlist_free(configs);
+	return (error);
+}
+
 static void
 zhack_import(char *target, boolean_t readonly)
 {
@@ -231,7 +295,8 @@ zhack_import(char *target, boolean_t readonly)
 	dmu_objset_register_type(DMU_OST_ZFS, space_delta_cb);
 
 	g_readonly = readonly;
-	g_importargs.can_be_active = readonly;
+	/* Keep label state: libzpool tryimport has its own namespace. */
+	g_importargs.can_be_active = readonly || g_require_exported;
 	g_pool = strdup(target);
 
 	libpc_handle_t lpch = {
@@ -242,6 +307,23 @@ zhack_import(char *target, boolean_t readonly)
 	error = zpool_find_config(&lpch, target, &config, &g_importargs);
 	if (error)
 		fatal(NULL, FTAG, "cannot import '%s'", target);
+	if (g_require_exported) {
+		uint64_t state, guid;
+		if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_POOL_STATE,
+		    &state) != 0 || state != POOL_STATE_EXPORTED ||
+		    nvlist_lookup_uint64(config, ZPOOL_CONFIG_POOL_GUID,
+		    &guid) != 0) {
+			fnvlist_free(config);
+			fatal(NULL, FTAG,
+			    "retirement requires an explicitly exported pool");
+		}
+		error = zhack_retirement_inactive(guid);
+		if (error != 0) {
+			fnvlist_free(config);
+			fatal(NULL, FTAG,
+			    "pool inactivity check: %s", strerror(error));
+		}
+	}
 
 	props = NULL;
 	if (readonly) {
@@ -1863,6 +1945,407 @@ zhack_do_raidz_epochs(int argc, char **argv)
 	return (0);
 }
 
+/*
+ * A census may forget a block only after proving it covers every allocated
+ * extent of the target. A generic traversal alone is not such a proof: it
+ * prunes shared trees and omits other physical references. Unvisited ranges
+ * (including gang children, deferred frees or DDT variants) refuse retirement.
+ * Keep the layout descriptors; the certificate only changes claimed tolerance.
+ */
+typedef struct zhack_retirement {
+	uint64_t zr_vdev;
+	uint64_t zr_guid;
+	uint64_t zr_parity;
+	uint64_t zr_entries;
+	uint64_t *zr_table;
+	blkptr_t zr_root;
+	zfs_range_tree_t *zr_uncovered;
+	uint64_t zr_weak;
+	int zr_error;
+} zhack_retirement_t;
+
+static int
+zhack_retirement_layout(spa_t *spa, zhack_retirement_t *zr, vdev_t **vdp)
+{
+	vdev_t *vd = vdev_lookup_top(spa, zr->zr_vdev);
+	uint64_t parity;
+
+	if (vd == NULL || vd->vdev_ops != &vdev_raidz_ops ||
+	    !vdev_raidz_has_parity_epochs(vd) ||
+	    !spa_feature_is_enabled(spa, SPA_FEATURE_RAIDZ_EPOCH_RETIREMENT))
+		return (SET_ERROR(ENOTSUP));
+	if (spa_has_checkpoint(spa) || spa_get_checkpoint_space(spa) != 0 ||
+	    spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT))
+		return (SET_ERROR(EBUSY));
+	vdev_raidz_layout_for_birth(vd, spa_first_txg(spa), NULL, &parity);
+	if (parity < zr->zr_parity)
+		return (SET_ERROR(ERANGE));
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	mutex_enter(&vdrz->vd_expand_lock);
+	int error = 0;
+	for (uint64_t i = 0; i < vdrz->vd_parity_epoch_count; i++) {
+		if (vdrz->vd_parity_epochs[3 * i] > spa_first_txg(spa) &&
+		    vdrz->vd_parity_epochs[3 * i + 2] < zr->zr_parity)
+			error = ERANGE;
+	}
+	mutex_exit(&vdrz->vd_expand_lock);
+	*vdp = vd;
+	return (error);
+}
+
+/* Unclaimed intent records can introduce references on a writable import. */
+static int
+zhack_retirement_no_logs(spa_t *spa)
+{
+	dsl_pool_t *dp = spa_get_dsl(spa);
+	objset_t *mos = spa_meta_objset(spa);
+	uint64_t obj = 0;
+	int error;
+
+	while ((error = dmu_object_next(mos, &obj, B_FALSE, 0)) == 0) {
+		dmu_object_info_t doi;
+		error = dmu_object_info(mos, obj, &doi);
+		if (error != 0)
+			return (error);
+		if (doi.doi_bonus_type != DMU_OT_DSL_DATASET)
+			continue;
+		dsl_dataset_t *ds;
+		objset_t *os;
+		dsl_pool_config_enter(dp, FTAG);
+		error = dsl_dataset_hold_obj(dp, obj, FTAG, &ds);
+		if (error == 0) {
+			/* The synthetic origin has no objset or intent log. */
+			if (ds->ds_dir == dp->dp_origin_snap->ds_dir) {
+				if (!BP_IS_HOLE(&dsl_dataset_phys(ds)->ds_bp))
+					error = EIO;
+			} else {
+				error = dmu_objset_from_ds(ds, &os);
+				if (error == 0 &&
+				    !BP_IS_HOLE(&os->os_zil_header.zh_log))
+					error = EBUSY;
+			}
+			dsl_dataset_rele(ds, FTAG);
+		}
+		dsl_pool_config_exit(dp, FTAG);
+		if (error != 0)
+			return (error);
+	}
+	return (error == ESRCH ? 0 : error);
+}
+
+static int
+zhack_retirement_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, const dnode_phys_t *dnp, void *arg)
+{
+	(void) zilog, (void) zb, (void) dnp;
+	zhack_retirement_t *zr = arg;
+	if (zb->zb_level == ZB_DNODE_LEVEL)
+		return (0);
+	if (bp == NULL) {
+		zr->zr_error = EIO;
+		return (SET_ERROR(EIO));
+	}
+	if (BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp))
+		return (0);
+	boolean_t target = B_FALSE;
+	for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
+		const dva_t *dva = &bp->blk_dva[d];
+		if (DVA_GET_VDEV(dva) != zr->zr_vdev)
+			continue;
+		target = B_TRUE;
+		vdev_t *vd = vdev_lookup_top(spa, zr->zr_vdev);
+		uint64_t parity;
+		vdev_raidz_layout_for_birth(vd, BP_GET_PHYSICAL_BIRTH(bp),
+		    NULL, &parity);
+		if (parity < zr->zr_parity) {
+			zr->zr_weak++;
+			continue;
+		}
+		if (DVA_GET_GANG(dva)) {
+			zr->zr_error = ENOTSUP;
+			continue;
+		}
+		zfs_range_tree_clear(zr->zr_uncovered, DVA_GET_OFFSET(dva),
+		    DVA_GET_ASIZE(dva));
+	}
+	if (target) {
+		arc_buf_t *buf = NULL;
+		arc_flags_t flags = ARC_FLAG_WAIT;
+		int error = arc_read(NULL, spa, bp, arc_getbuf_func, &buf,
+		    ZIO_PRIORITY_SYNC_READ, ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW,
+		    &flags, zb);
+		if (buf != NULL)
+			arc_buf_destroy(buf, &buf);
+		if (error != 0) {
+			zr->zr_error = error;
+			return (error);
+		}
+	}
+	return (0);
+}
+
+static void
+zhack_retirement_add_allocated(void *arg, uint64_t start, uint64_t size)
+{
+	zfs_range_tree_add(arg, start, size);
+}
+
+static void
+zhack_retirement_uncovered(void *arg, uint64_t start, uint64_t size)
+{
+	uint_t *count = arg;
+	if ((*count)++ < 16) {
+		(void) printf("uncovered offset=%llx size=%llx\n",
+		    (u_longlong_t)start, (u_longlong_t)size);
+	}
+}
+
+typedef struct zhack_retirement_log {
+	zhack_retirement_t *zl_retirement;
+	vdev_t *zl_vdev;
+	uint64_t zl_txg;
+} zhack_retirement_log_t;
+
+static int
+zhack_retirement_log_entry(space_map_entry_t *sme, void *arg)
+{
+	zhack_retirement_log_t *zl = arg;
+	vdev_t *vd = zl->zl_vdev;
+	uint64_t start = sme->sme_offset;
+	uint64_t size = sme->sme_run;
+	if (sme->sme_vdev != vd->vdev_id)
+		return (0);
+	if (size == 0 || start >= vd->vdev_asize ||
+	    size > vd->vdev_asize - start)
+		return (SET_ERROR(EINVAL));
+	uint64_t index = start >> vd->vdev_ms_shift;
+	if (index >= vd->vdev_ms_count)
+		return (SET_ERROR(EINVAL));
+	metaslab_t *ms = vd->vdev_ms[index];
+	if (size > ms->ms_start + ms->ms_size - start)
+		return (SET_ERROR(EINVAL));
+	if (zl->zl_txg < metaslab_unflushed_txg(ms))
+		return (0);
+	zfs_range_tree_t *rt = zl->zl_retirement->zr_uncovered;
+	if (sme->sme_type == SM_ALLOC) {
+		uint64_t overlap, length;
+		if (zfs_range_tree_find_in(rt, start, size, &overlap, &length))
+			return (SET_ERROR(EINVAL));
+		zfs_range_tree_add(rt, start, size);
+	} else if (sme->sme_type == SM_FREE) {
+		if (!zfs_range_tree_contains(rt, start, size))
+			return (SET_ERROR(EINVAL));
+		zfs_range_tree_remove(rt, start, size);
+	} else {
+		return (SET_ERROR(EINVAL));
+	}
+	return (0);
+}
+
+static int
+zhack_retirement_logs(spa_t *spa, vdev_t *vd, zhack_retirement_t *zr)
+{
+	if (!spa_feature_is_active(spa, SPA_FEATURE_LOG_SPACEMAP))
+		return (0);
+	/* Read-only import loads log metadata but leaves entries unapplied. */
+	for (spa_log_sm_t *sls = avl_first(&spa->spa_sm_logs_by_txg);
+	    sls != NULL; sls = AVL_NEXT(&spa->spa_sm_logs_by_txg, sls)) {
+		space_map_t *sm = NULL;
+		zhack_retirement_log_t zl = { zr, vd, sls->sls_txg };
+		int error = space_map_open(&sm, spa_meta_objset(spa),
+		    sls->sls_sm_obj, 0, UINT64_MAX, SPA_MINBLOCKSHIFT);
+		if (error == 0) {
+			error = space_map_iterate(sm, space_map_length(sm),
+			    zhack_retirement_log_entry, &zl);
+		}
+		if (sm != NULL)
+			space_map_close(sm);
+		if (error != 0)
+			return (error);
+	}
+	return (0);
+}
+
+static int
+zhack_retirement_check(void *arg, dmu_tx_t *tx)
+{
+	zhack_retirement_t *zr = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	boolean_t sync = dmu_tx_is_syncing(tx);
+	if (!sync && !spa_config_tryenter(spa, SCL_CONFIG, FTAG, RW_READER))
+		return (SET_ERROR(EBUSY));
+	vdev_t *vd = NULL;
+	int error = zhack_retirement_layout(spa, zr, &vd);
+	if (error == 0 && (vd->vdev_guid != zr->zr_guid ||
+	    memcmp(&spa->spa_load_rootbp, &zr->zr_root, sizeof (zr->zr_root))))
+		error = ESTALE;
+	if (error == 0) {
+		vdev_raidz_t *vdrz = vd->vdev_tsd;
+		mutex_enter(&vdrz->vd_expand_lock);
+		if (zr->zr_entries != vdrz->vd_parity_epoch_count ||
+		    memcmp(zr->zr_table, vdrz->vd_parity_epochs,
+		    zr->zr_entries * 3 * sizeof (uint64_t)))
+			error = ESTALE;
+		mutex_exit(&vdrz->vd_expand_lock);
+	}
+	if (!sync)
+		spa_config_exit(spa, SCL_CONFIG, FTAG);
+	return (error);
+}
+
+static void
+zhack_retirement_sync(void *arg, dmu_tx_t *tx)
+{
+	zhack_retirement_t *zr = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	vdev_t *vd = vdev_lookup_top(spa, zr->zr_vdev);
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	uint64_t certificate[2] = { zr->zr_parity, dmu_tx_get_txg(tx) };
+
+	VERIFY0(zhack_retirement_check(arg, tx));
+	VERIFY0(zap_update(spa_meta_objset(spa), vd->vdev_top_zap,
+	    VDEV_TOP_ZAP_RAIDZ_RETIREMENT, sizeof (uint64_t), 2,
+	    certificate, tx));
+	if (!spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_EPOCH_RETIREMENT))
+		spa_feature_incr(spa, SPA_FEATURE_RAIDZ_EPOCH_RETIREMENT, tx);
+	mutex_enter(&vdrz->vd_expand_lock);
+	vdrz->vd_retirement_parity = certificate[0];
+	vdrz->vd_retirement_txg = certificate[1];
+	mutex_exit(&vdrz->vd_expand_lock);
+	vdev_config_dirty(vd);
+}
+
+static int
+zhack_do_raidz_retire(int argc, char **argv)
+{
+	zhack_retirement_t zr = { 0 };
+	boolean_t write = B_FALSE;
+	spa_t *spa;
+	int c, error;
+	char *end;
+
+	optind = 1;
+	while ((c = getopt(argc, argv, "+w")) != -1) {
+		if (c != 'w')
+			usage();
+		write = B_TRUE;
+	}
+	argc -= optind;
+	argv += optind;
+	if (argc != 3)
+		usage();
+	errno = 0;
+	zr.zr_vdev = strtoull(argv[1], &end, 10);
+	if (errno || end == argv[1] || *end != '\0' || argv[1][0] == '-')
+		fatal(NULL, FTAG, "invalid top-level vdev id: %s", argv[1]);
+	errno = 0;
+	zr.zr_parity = strtoull(argv[2], &end, 10);
+	if (errno || end == argv[2] || *end != '\0' || zr.zr_parity == 0 ||
+	    zr.zr_parity > VDEV_RAIDZ_MAXPARITY || argv[2][0] == '-')
+		fatal(NULL, FTAG, "invalid parity: %s", argv[2]);
+
+	/* The census must never run against an active or changing pool. */
+	g_require_exported = B_TRUE;
+	spa_mode_readable_spacemaps = B_TRUE;
+	zhack_spa_open(argv[0], B_TRUE, FTAG, &spa);
+	spa->spa_failmode = ZIO_FAILURE_MODE_CONTINUE;
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+	vdev_t *vd = NULL;
+	error = zhack_retirement_layout(spa, &zr, &vd);
+	if (error == 0)
+		error = zhack_retirement_no_logs(spa);
+	if (error != 0) {
+		spa_config_exit(spa, SCL_CONFIG, FTAG);
+		fatal(spa, FTAG, "retirement prerequisites: %s",
+		    strerror(error));
+	}
+	zr.zr_guid = vd->vdev_guid;
+	zr.zr_root = spa->spa_load_rootbp;
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	mutex_enter(&vdrz->vd_expand_lock);
+	zr.zr_entries = vdrz->vd_parity_epoch_count;
+	size_t size = zr.zr_entries * 3 * sizeof (uint64_t);
+	zr.zr_table = malloc(size);
+	if (zr.zr_table == NULL) {
+		mutex_exit(&vdrz->vd_expand_lock);
+		spa_config_exit(spa, SCL_CONFIG, FTAG);
+		fatal(spa, FTAG, "out of memory");
+	}
+	memcpy(zr.zr_table, vdrz->vd_parity_epochs, size);
+	mutex_exit(&vdrz->vd_expand_lock);
+	zr.zr_uncovered = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	    NULL, 0, 0);
+	for (uint64_t m = 0; m < vd->vdev_ms_count; m++) {
+		metaslab_t *ms = vd->vdev_ms[m];
+		zfs_range_tree_t *allocated = zfs_range_tree_create(NULL,
+		    ZFS_RANGE_SEG64, NULL, 0, 0);
+		mutex_enter(&ms->ms_lock);
+		/*
+		 * Allocator-free space excludes already freed deferred ranges.
+		 * Read the selected MOS allocation map instead. Replay its
+		 * unflushed logs below, as zdb's physical census does.
+		 */
+		error = ms->ms_sm == NULL ? 0 :
+		    space_map_load(ms->ms_sm, allocated, SM_ALLOC);
+		if (error == 0) {
+			zfs_range_tree_walk(allocated,
+			    zhack_retirement_add_allocated, zr.zr_uncovered);
+		}
+		mutex_exit(&ms->ms_lock);
+		zfs_range_tree_vacate(allocated, NULL, NULL);
+		zfs_range_tree_destroy(allocated);
+		if (error != 0) {
+			spa_config_exit(spa, SCL_CONFIG, FTAG);
+			fatal(spa, FTAG, "cannot load metaslab: %s",
+			    strerror(error));
+		}
+	}
+	error = zhack_retirement_logs(spa, vd, &zr);
+	if (error == 0) {
+		error = traverse_pool(spa, 0,
+		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
+		    zhack_retirement_cb, &zr);
+	}
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+	uint64_t uncovered = zfs_range_tree_space(zr.zr_uncovered);
+	(void) printf("vdev %llu: target=%llu weak=%llu uncovered=%llu "
+	    "traverse_error=%d census_error=%d\n", (u_longlong_t)zr.zr_vdev,
+	    (u_longlong_t)zr.zr_parity, (u_longlong_t)zr.zr_weak,
+	    (u_longlong_t)uncovered, error, zr.zr_error);
+	uint_t count = 0;
+	zfs_range_tree_walk(zr.zr_uncovered,
+	    zhack_retirement_uncovered, &count);
+	zfs_range_tree_vacate(zr.zr_uncovered, NULL, NULL);
+	zfs_range_tree_destroy(zr.zr_uncovered);
+	if (error || zr.zr_error || zr.zr_weak || uncovered)
+		fatal(spa, FTAG,
+		    "retirement refused: incomplete strong coverage");
+	spa_close(spa, FTAG);
+	if (write) {
+		/*
+		 * Reopen the same selected MOS for writing. The exported-pool
+		 * libzpool process admits no external snapshot, topology or
+		 * reference changes. Import writes use the checked strong
+		 * layouts. Recheck the table, selected root and checkpoint
+		 * exclusion in the sync task.
+		 */
+		/* A read-only spa is unloaded, never exported with writes. */
+		kernel_fini();
+		free(g_pool);
+		g_pool = NULL;
+		zhack_spa_open(argv[0], B_FALSE, FTAG, &spa);
+		error = dsl_sync_task(spa_name(spa), zhack_retirement_check,
+		    zhack_retirement_sync, &zr, 5, ZFS_SPACE_CHECK_NORMAL);
+		if (error != 0)
+			fatal(spa, FTAG, "retirement commit refused: %s",
+			    strerror(error));
+		spa_close(spa, FTAG);
+	}
+	free(zr.zr_table);
+	(void) printf("retirement %s\n", write ? "committed" : "census passed");
+	return (0);
+}
+
 static int
 zhack_do_metaslab(int argc, char **argv)
 {
@@ -2460,6 +2943,8 @@ main(int argc, char **argv)
 		rv = zhack_do_metaslab(argc, argv);
 	} else if (strcmp(subcommand, "raidz_epochs") == 0) {
 		rv = zhack_do_raidz_epochs(argc, argv);
+	} else if (strcmp(subcommand, "raidz_retire") == 0) {
+		rv = zhack_do_raidz_retire(argc, argv);
 	} else {
 		(void) fprintf(stderr, "error: unknown subcommand: %s\n",
 		    subcommand);

@@ -180,6 +180,11 @@ typedef struct vdev_raidz {
 	vdev_raidz_refusal_t vd_parity_epochs_refusal;
 	/* vdev_raidz_load() dropped a config-only table. */
 	boolean_t vd_parity_epochs_dropped;
+	/* Authoritative MOS certificate, protected by vd_expand_lock. */
+	uint64_t vd_retirement_parity;
+	uint64_t vd_retirement_txg;
+	/* A load may try reading the MOS before accepting its certificate. */
+	boolean_t vd_retirement_provisional;
 } vdev_raidz_t;
 
 extern int vdev_raidz_attach_check(vdev_t *);
