@@ -151,6 +151,12 @@ dontcache_reason = 'Kernel RWF_DONTCACHE support required'
 splice_fpos_reason = 'Kernel splice(2) does not lock the file position'
 
 #
+# Some tests skip themselves when kmemleak and CPU mitigations are enabled,
+# because they would run for too long.
+#
+kmemleak_reason = 'Skipped when kmemleak and CPU mitigations are enabled'
+
+#
 # Some statx fields are not supported by all kernels
 #
 statx_reason = 'Needed statx(2) field not supported on this kernel'
@@ -174,8 +180,6 @@ else:
 known = {
     'casenorm/mixed_none_lookup_ci': ['FAIL', 7633],
     'casenorm/mixed_formd_lookup_ci': ['FAIL', 7633],
-    'cli_root/zpool_import/import_rewind_device_replaced':
-        ['FAIL', rewind_reason],
     'cli_user/misc/zfs_share_001_neg': ['SKIP', na_reason],
     'cli_user/misc/zfs_unshare_001_neg': ['SKIP', na_reason],
     'pool_checkpoint/checkpoint_discard_busy': ['SKIP', 12053],
@@ -224,6 +228,8 @@ maybe = {
     'chattr/setup': ['SKIP', exec_reason],
     'channel_program/lua_core/setup': ['SKIP', zcp_reason],
     'channel_program/synctask_core/setup': ['SKIP', zcp_reason],
+    'cli_root/zpool_import/import_rewind_device_replaced':
+        ['FAIL', rewind_reason],
     'crtime/crtime_001_pos': ['SKIP', statx_reason],
     'cli_root/zfs_share/zfs_share_concurrent_shares': ['FAIL', known_reason],
     'cli_root/zfs_unshare/zfs_unshare_006_pos': ['SKIP', na_reason],
@@ -333,6 +339,7 @@ elif sys.platform.startswith('linux'):
             ['SKIP', cfr_reason],
         'block_cloning/block_cloning_large_offset':
             ['SKIP', cfr_reason],
+        'cli_root/zfs_get/zfs_get_009_pos': ['SKIP', kmemleak_reason],
         'cp_files/cp_files_002_pos': ['SKIP', cfr_reason],
         'events/events_002_pos': ['FAIL', 18271],
         'fault/auto_online_002_pos': ['FAIL', 11889],

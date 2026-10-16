@@ -565,6 +565,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/block_cloning/block_cloning_large_offset.ksh \
 	functional/block_cloning/block_cloning_after_device_removal.ksh \
 	functional/block_cloning/block_cloning_after_trunc.ksh \
+	functional/block_cloning/block_cloning_resilver_free.ksh \
 	functional/bootfs/bootfs_001_pos.ksh \
 	functional/bootfs/bootfs_002_neg.ksh \
 	functional/bootfs/bootfs_003_pos.ksh \
@@ -673,6 +674,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/channel_program/synctask_core/tst.promote_conflict.ksh \
 	functional/channel_program/synctask_core/tst.promote_multiple.ksh \
 	functional/channel_program/synctask_core/tst.promote_simple.ksh \
+	functional/channel_program/synctask_core/tst.readonly_pool.ksh \
 	functional/channel_program/synctask_core/tst.rollback_mult.ksh \
 	functional/channel_program/synctask_core/tst.rollback_one.ksh \
 	functional/channel_program/synctask_core/tst.set_props.ksh \
@@ -722,9 +724,11 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/cli_root/zdb/zdb_file_layout_002.ksh \
 	functional/cli_root/zdb/zdb_file_layout_003.ksh \
 	functional/cli_root/zdb/zdb_file_layout_neg.ksh \
+	functional/cli_root/zdb/zdb_il_saxattr.ksh \
 	functional/cli_root/zdb/zdb_object_range_neg.ksh \
 	functional/cli_root/zdb/zdb_object_range_pos.ksh \
 	functional/cli_root/zdb/zdb_objset_id.ksh \
+	functional/cli_root/zdb/zdb_read_block_birth.ksh \
 	functional/cli_root/zdb/zdb_recover_2.ksh \
 	functional/cli_root/zdb/zdb_recover.ksh \
 	functional/cli_root/zdb/zdb_tunables.ksh \
@@ -966,6 +970,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/cli_root/zfs_rewrite/setup.ksh \
 	functional/cli_root/zfs_rewrite/zfs_rewrite.ksh \
 	functional/cli_root/zfs_rewrite/zfs_rewrite_physical.ksh \
+	functional/cli_root/zfs_rewrite/zfs_rewrite_physical_accounting.ksh \
 	functional/cli_root/zfs_rewrite/zfs_rewrite_skip_clone.ksh \
 	functional/cli_root/zfs_rewrite/zfs_rewrite_skip_snapshot.ksh \
 	functional/cli_root/zfs_rollback/cleanup.ksh \
@@ -1252,6 +1257,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/cli_root/zpool_import/import_relax_metadata_damaged.ksh \
 	functional/cli_root/zpool_import/import_rewind_config_changed.ksh \
 	functional/cli_root/zpool_import/import_rewind_device_replaced.ksh \
+	functional/cli_root/zpool_import/import_rewind_dryrun_no_writes.ksh \
 	functional/cli_root/zpool_import/import_rewind_metadata_damaged.ksh \
 	functional/cli_root/zpool_import/setup.ksh \
 	functional/cli_root/zpool_import/zpool_import_001_pos.ksh \
@@ -1288,6 +1294,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/cli_root/zpool_import/zpool_import_missing_002_pos.ksh \
 	functional/cli_root/zpool_import/zpool_import_missing_003_pos.ksh \
 	functional/cli_root/zpool_import/zpool_import_rename_001_pos.ksh \
+	functional/cli_root/zpool_import/zpool_import_reguid_stale.ksh \
 	functional/cli_root/zpool_import/zpool_import_status.ksh \
 	functional/cli_root/zpool_import/zpool_import_parallel_admin.ksh \
 	functional/cli_root/zpool_import/zpool_import_parallel_neg.ksh \
@@ -1654,6 +1661,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/direct/dio_max_recordsize.ksh \
 	functional/direct/dio_mixed.ksh \
 	functional/direct/dio_mmap.ksh \
+	functional/direct/dio_nopwrite.ksh \
 	functional/direct/dio_overwrites.ksh \
 	functional/direct/dio_property.ksh \
 	functional/direct/dio_random.ksh \
@@ -1708,6 +1716,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/failmode/failmode_syncalways_continue.ksh \
 	functional/failmode/failmode_nowait_wait.ksh \
 	functional/failmode/failmode_vdev_state.ksh \
+	functional/failmode/failmode_dio_unwritable.ksh \
 	functional/failmode/setup.ksh \
 	functional/fallocate/cleanup.ksh \
 	functional/fallocate/fallocate_extend_timestamps.ksh \
@@ -1734,6 +1743,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/fault/scrub_after_resilver.ksh \
 	functional/fault/suspend_on_probe_errors.ksh \
 	functional/fault/suspend_resume_single.ksh \
+	functional/fault/suspend_zil_keep_first.ksh \
 	functional/fault/suspend_draid_fgroups.ksh \
 	functional/fault/setup.ksh \
 	functional/fault/zpool_status_-s.ksh \
@@ -1754,8 +1764,11 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/gang_blocks/cleanup.ksh \
 	functional/gang_blocks/gang_blocks_001_pos.ksh \
 	functional/gang_blocks/gang_blocks_ddt_copies.ksh \
+	functional/gang_blocks/gang_blocks_degraded_vdev.ksh \
 	functional/gang_blocks/gang_blocks_redundant.ksh \
+	functional/gang_blocks/gang_blocks_special_fallback.ksh \
 	functional/gang_blocks/gang_blocks_dyn_header_neg.ksh \
+	functional/gang_blocks/gang_blocks_dyn_header_import.ksh \
 	functional/gang_blocks/gang_blocks_dyn_header_pos.ksh \
 	functional/gang_blocks/gang_blocks_dyn_multi.ksh \
 	functional/gang_blocks/setup.ksh \
@@ -2019,7 +2032,30 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/raidz/raidz_expand_006_neg.ksh \
 	functional/raidz/raidz_expand_007_neg.ksh \
 	functional/raidz/raidz_expand_008_pos.ksh \
+	functional/raidz/raidz_expand_010_pos.ksh \
+	functional/raidz/raidz_expand_rewrite.ksh \
 	functional/raidz/raidz_zinject.ksh \
+	functional/raidz/raidz_parity_epochs_dedup_pos.ksh \
+	functional/raidz/raidz_detach_neg.ksh \
+	functional/raidz/raidz_parity_epochs_pos.ksh \
+	functional/raidz/raidz_parity_epochs_properties_pos.ksh \
+	functional/raidz/raidz_parity_epochs_resilver_pos.ksh \
+	functional/raidz/raidz_parity_epochs_append_neg.ksh \
+	functional/raidz/raidz_parity_epochs_cachefile_pos.ksh \
+	functional/raidz/raidz_parity_epochs_config_neg.ksh \
+	functional/raidz/raidz_parity_epochs_config_recovery_pos.ksh \
+	functional/raidz/raidz_parity_epochs_degraded_neg.ksh \
+	functional/raidz/raidz_parity_epochs_expand_neg.ksh \
+	functional/raidz/raidz_parity_epochs_gang.ksh \
+	functional/raidz/raidz_parity_epochs_import_neg.ksh \
+	functional/raidz/raidz_parity_epochs_label_pos.ksh \
+	functional/raidz/raidz_parity_epochs_layout_pos.ksh \
+	functional/raidz/raidz_parity_epochs_validate_neg.ksh \
+	functional/raidz/raidz_parity_epochs_width_neg.ksh \
+	functional/raidz/raidz_recon_mixed_pos.ksh \
+	functional/raidz/raidz_recon_pos.ksh \
+	functional/raidz/raidz_tolerance_epochs_pos.ksh \
+	functional/raidz/raidz_tolerance_marker_neg.ksh \
 	functional/raidz/setup.ksh \
 	functional/redacted_send/cleanup.ksh \
 	functional/redacted_send/redacted_compressed.ksh \
@@ -2089,6 +2125,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/removal/removal_check_space.ksh \
 	functional/removal/removal_condense_export.ksh \
 	functional/removal/removal_indirect_class.ksh \
+	functional/removal/removal_indirect_mapping_size.ksh \
 	functional/removal/removal_multiple_indirection.ksh \
 	functional/removal/removal_nopwrite.ksh \
 	functional/removal/removal_remap_deadlists.ksh \

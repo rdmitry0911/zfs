@@ -1445,8 +1445,7 @@ spa_vdev_config_exit(spa_t *spa, vdev_t *vd, uint64_t txg, int error,
 	 * is useful for ensuring that configurations are updated
 	 * transactionally.
 	 */
-	if (zio_injection_enabled)
-		zio_handle_panic_injection(spa, tag, 0);
+	zio_handle_panic_injection(spa, tag, 0);
 
 	/*
 	 * Note: this txg_wait_synced() is important because it ensures
@@ -2185,6 +2184,23 @@ spa_dedup_class(spa_t *spa)
 	return (spa->spa_dedup_class);
 }
 
+/*
+ * Whether gang headers can be larger than SPA_OLD_GANGBLOCKSIZE.  While a
+ * pool is being loaded, the MOS is read before the feature refcounts are,
+ * so spa_feature_is_active() is still false; the label's features_for_read
+ * lists dynamic_gang_header (a ZFEATURE_FLAG_MOS feature) when it is active.
+ */
+boolean_t
+spa_dynamic_gang_header(spa_t *spa)
+{
+	if (spa_feature_is_active(spa, SPA_FEATURE_DYNAMIC_GANG_HEADER))
+		return (B_TRUE);
+	return (spa->spa_load_state != SPA_LOAD_NONE &&
+	    spa->spa_label_features != NULL &&
+	    nvlist_exists(spa->spa_label_features,
+	    spa_feature_table[SPA_FEATURE_DYNAMIC_GANG_HEADER].fi_guid));
+}
+
 boolean_t
 spa_special_has_ddt(spa_t *spa)
 {
@@ -2207,6 +2223,16 @@ spa_preferred_class(spa_t *spa, const zio_t *zio)
 		ASSERT(mc != NULL);
 		return (mc);
 	}
+
+	/*
+	 * Allocations fall back from the dedup class to the special class
+	 * to the normal class.  The normal class is the last resort: a
+	 * block there has either failed in the other classes already or
+	 * never belonged in them, so the caller must gang it rather than
+	 * fall back again, or it would bounce between the classes forever.
+	 */
+	if (mc == spa_normal_class(spa))
+		return (mc);
 
 	/*
 	 * Override object type for the purposes of selecting a storage class.
@@ -2678,7 +2704,7 @@ spa_import_progress_remove(uint64_t pool_guid)
 			if (sip->pool_name)
 				spa_strfree(sip->pool_name);
 			if (sip->spa_load_notes)
-				spa_strfree(sip->spa_load_notes);
+				kmem_strfree(sip->spa_load_notes);
 			list_remove(&shl->procfs_list.pl_list, sip);
 			shl->size--;
 			kmem_free(sip, sizeof (spa_import_progress_t));
@@ -2842,6 +2868,27 @@ boolean_t
 spa_writeable(spa_t *spa)
 {
 	return (!!(spa->spa_mode & SPA_MODE_WRITE) && spa->spa_trust_config);
+}
+
+/*
+ * Whether a read that found a damaged copy may rewrite it with the good data
+ * in hand (self-healing, and resilver or rebuild repairs).
+ *
+ * Not while loading a txg other than the newest one (an explicitly requested
+ * txg, a rewind, or a dry run probing either) until the load commits to it by
+ * starting to sync: the blocks of an older txg may have been freed and their
+ * space reused by later txgs, so a copy failing its checksum is expected, and
+ * rewriting it would overwrite live blocks of those later txgs.  A dry run
+ * would damage the pool it promised not to modify, and a rewind that rejects
+ * this txg would damage the newer txgs, which are all that is left if no
+ * older txg loads either.
+ */
+boolean_t
+spa_self_heal_allowed(spa_t *spa)
+{
+	return (spa_writeable(spa) &&
+	    (spa->spa_load_state == SPA_LOAD_NONE ||
+	    spa->spa_load_max_txg == UINT64_MAX || spa->spa_sync_on));
 }
 
 /*

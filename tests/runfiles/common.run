@@ -86,7 +86,7 @@ tests = ['block_cloning_clone_mmap_cached',
     'block_cloning_lwb_buffer_overflow', 'block_cloning_clone_mmap_write',
     'block_cloning_rlimit_fsize', 'block_cloning_large_offset',
     'block_cloning_after_device_removal',
-    'block_cloning_after_trunc']
+    'block_cloning_after_trunc', 'block_cloning_resilver_free']
 tags = ['functional', 'block_cloning']
 
 [tests/functional/bootfs]
@@ -145,7 +145,7 @@ tests = ['tst.destroy_fs', 'tst.destroy_snap',
     'tst.rollback_one', 'tst.set_props', 'tst.snapshot_destroy', 'tst.snapshot_neg',
     'tst.snapshot_recursive', 'tst.snapshot_rename', 'tst.snapshot_simple',
     'tst.bookmark.create', 'tst.bookmark.copy', 'tst.clone',
-    'tst.terminate_by_signal'
+    'tst.readonly_pool', 'tst.terminate_by_signal'
     ]
 tags = ['functional', 'channel_program', 'synctask_core']
 
@@ -177,7 +177,9 @@ tests = ['zdb_002_pos', 'zdb_003_pos', 'zdb_004_pos', 'zdb_005_pos',
     'zdb_file_layout_001', 'zdb_file_layout_002', 'zdb_file_layout_003',
     'zdb_file_layout_neg', 'zdb_label_checksum', 'zdb_object_range_neg',
     'zdb_object_range_pos', 'zdb_objset_id', 'zdb_decompress_zstd',
-    'zdb_recover', 'zdb_recover_2', 'zdb_backup', 'zdb_tunables']
+    'zdb_recover', 'zdb_recover_2', 'zdb_backup', 'zdb_tunables',
+    'zdb_il_saxattr',
+    'zdb_read_block_birth']
 pre =
 post =
 tags = ['functional', 'cli_root', 'zdb']
@@ -247,6 +249,7 @@ tests = ['zfs_get_001_pos', 'zfs_get_002_pos', 'zfs_get_003_pos',
     'zfs_get_004_pos', 'zfs_get_005_neg', 'zfs_get_006_neg', 'zfs_get_007_neg',
     'zfs_get_008_pos', 'zfs_get_009_pos', 'zfs_get_010_neg']
 tags = ['functional', 'cli_root', 'zfs_get']
+timeout = 900
 
 [tests/functional/cli_root/zfs_ids_to_path]
 tests = ['zfs_ids_to_path_001_pos']
@@ -322,7 +325,7 @@ tags = ['functional', 'cli_root', 'zfs_reservation']
 
 [tests/functional/cli_root/zfs_rewrite]
 tests = ['zfs_rewrite', 'zfs_rewrite_physical', 'zfs_rewrite_skip_clone',
-    'zfs_rewrite_skip_snapshot']
+    'zfs_rewrite_skip_snapshot', 'zfs_rewrite_physical_accounting']
 tags = ['functional', 'cli_root', 'zfs_rewrite']
 
 [tests/functional/cli_root/zfs_rollback]
@@ -490,6 +493,7 @@ tests = ['zpool_import_001_pos', 'zpool_import_002_pos',
     'zpool_import_features_003_pos', 'zpool_import_missing_001_pos',
     'zpool_import_missing_002_pos', 'zpool_import_missing_003_pos',
     'zpool_import_rename_001_pos', 'zpool_import_all_001_pos',
+    'zpool_import_reguid_stale',
     'zpool_import_encrypted', 'zpool_import_encrypted_load',
     'zpool_import_errata3', 'zpool_import_errata4',
     'import_cachefile_device_added',
@@ -504,6 +508,7 @@ tests = ['zpool_import_001_pos', 'zpool_import_002_pos',
     'import_relax_metadata_damaged',
     'import_rewind_config_changed',
     'import_rewind_device_replaced',
+    'import_rewind_dryrun_no_writes',
     'import_rewind_metadata_damaged',
     'zpool_import_status', 'zpool_import_parallel_pos',
     'zpool_import_parallel_neg', 'zpool_import_parallel_admin']
@@ -749,9 +754,9 @@ tags = ['functional', 'delegate']
 [tests/functional/direct]
 tests = ['dio_aligned_block', 'dio_async_always', 'dio_async_fio_ioengines',
     'dio_compression', 'dio_dedup', 'dio_encryption', 'dio_grow_block',
-    'dio_max_recordsize', 'dio_mixed', 'dio_mmap', 'dio_overwrites',
-    'dio_property', 'dio_random', 'dio_read_verify', 'dio_recordsize',
-    'dio_unaligned_block', 'dio_unaligned_filesize']
+    'dio_max_recordsize', 'dio_mixed', 'dio_mmap', 'dio_nopwrite',
+    'dio_overwrites', 'dio_property', 'dio_random', 'dio_read_verify',
+    'dio_recordsize', 'dio_unaligned_block', 'dio_unaligned_filesize']
 tags = ['functional', 'direct']
 
 [tests/functional/exec]
@@ -768,7 +773,7 @@ tests = ['failmode_dmu_tx_wait', 'failmode_dmu_tx_continue',
     'failmode_msync_wait', 'failmode_msync_continue',
     'failmode_osync_wait', 'failmode_osync_continue',
     'failmode_syncalways_wait', 'failmode_syncalways_continue',
-    'failmode_vdev_state']
+    'failmode_vdev_state', 'failmode_dio_unwritable']
 tags = ['functional', 'failmode']
 
 [tests/functional/fallocate]
@@ -787,7 +792,9 @@ tags = ['functional', 'features', 'large_dnode']
 [tests/functional/gang_blocks]
 tests = ['gang_blocks_001_pos', 'gang_blocks_redundant',
     'gang_blocks_ddt_copies', 'gang_blocks_dyn_header_pos',
-    'gang_blocks_dyn_header_neg', 'gang_blocks_dyn_multi']
+    'gang_blocks_dyn_header_neg', 'gang_blocks_dyn_header_import',
+    'gang_blocks_dyn_multi', 'gang_blocks_special_fallback',
+    'gang_blocks_degraded_vdev']
 tags = ['functional', 'gang_blocks']
 
 [tests/functional/grow]
@@ -933,7 +940,21 @@ tests = ['raidz_001_neg', 'raidz_002_pos', 'raidz_dedup_overrun',
     'raidz_expand_001_pos',
     'raidz_expand_002_pos', 'raidz_expand_003_neg', 'raidz_expand_003_pos',
     'raidz_expand_004_pos', 'raidz_expand_005_pos', 'raidz_expand_006_neg',
-    'raidz_expand_007_neg', 'raidz_expand_008_pos', 'raidz_zinject']
+    'raidz_expand_007_neg', 'raidz_expand_008_pos', 'raidz_expand_010_pos',
+    'raidz_expand_rewrite',
+    'raidz_zinject', 'raidz_parity_epochs_pos', 'raidz_recon_pos',
+    'raidz_parity_epochs_dedup_pos', 'raidz_detach_neg',
+    'raidz_parity_epochs_expand_neg', 'raidz_parity_epochs_width_neg',
+    'raidz_recon_mixed_pos', 'raidz_tolerance_epochs_pos',
+    'raidz_tolerance_marker_neg', 'raidz_parity_epochs_validate_neg',
+    'raidz_parity_epochs_gang', 'raidz_parity_epochs_append_neg',
+    'raidz_parity_epochs_config_neg', 'raidz_parity_epochs_label_pos',
+    'raidz_parity_epochs_layout_pos',
+    'raidz_parity_epochs_cachefile_pos',
+    'raidz_parity_epochs_config_recovery_pos',
+    'raidz_parity_epochs_degraded_neg', 'raidz_parity_epochs_import_neg',
+    'raidz_parity_epochs_properties_pos',
+    'raidz_parity_epochs_resilver_pos']
 tags = ['functional', 'raidz']
 timeout = 1200
 
@@ -965,7 +986,7 @@ tags = ['functional', 'refreserv']
 pre =
 tests = ['removal_all_vdev', 'removal_cancel', 'removal_check_space',
     'removal_condense_export', 'removal_indirect_class',
-    'removal_multiple_indirection',
+    'removal_indirect_mapping_size', 'removal_multiple_indirection',
     'removal_nopwrite', 'removal_remap_deadlists',
     'removal_resume_export', 'removal_sanity', 'removal_with_add',
     'removal_with_create_fs', 'removal_with_dedup',

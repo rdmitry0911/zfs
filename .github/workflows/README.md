@@ -70,6 +70,64 @@ can also alter the selection. The `workflow_dispatch` trigger accepts
 `fedora_kernel_ver` (Fedora-only run with a chosen kernel) and
 `specific_os` (pin the matrix to one OS).
 
+### Reusing fork QEMU results
+
+PRs can reuse QEMU results from their source fork without a repository
+allowlist or additional configuration.
+
+For each requested OS, `test-config` looks for a successful job in the
+latest push run for the exact PR head SHA. The run must be completed and
+no more than seven days old. Build, test and summary steps must all have
+completed successfully on `ubuntu-24.04`.
+Push runs use full tests, so they also cover PRs requesting quick tests.
+`ZTS_OS_OVERRIDE` in a fork can reduce the available OS results; missing
+OS jobs still run in the base repository. Dispatch and PR runs are not
+reused because they can select different inputs or test suites.
+
+Reused matrix jobs report success with a link to the original job and
+logs. The cleanup summary links to these results; their artifacts remain
+in the fork. Failed jobs, unavailable API responses and incomplete runs
+fall back to normal testing. Only the latest run and its latest job
+results are considered, so an older success cannot replace a
+newer failure. Only completed workflows are reused, even if individual
+jobs in a running workflow have already finished.
+
+Fork results are reused only on the first workflow attempt. Requested
+reruns execute the selected jobs in the base repository, including
+selective QEMU matrix reruns that retain the original Setup outputs.
+
+This version checks run and step metadata and assumes the fork uses the
+standard full-testing push workflow. It does not compare workflow or
+script contents with the PR base, allowing its own PR to demonstrate
+reuse. Comparing CI files is deferred to a later change.
+
+### Reusing fork zloop results
+
+The `zloop` job uses the same helper, `reuse-ci.py zloop`, to find a
+successful push job for the exact PR head SHA. Push and PR jobs use
+the same build configuration (debug, ASAN and UBSAN) and test command.
+Dependency installation, autogen, configure, make, install and tests
+must all have succeeded on `ubuntu-24.04`. The same run age and source
+repository checks apply as for QEMU.
+
+A matching result skips build and testing in the PR job and links to
+the original job logs. Otherwise the usual zloop steps run. Successful
+zloop jobs do not upload artifacts, so reuse needs no artifact transfer.
+
+### Reusing other fork results
+
+`unit-tests`, `zfs-arm` and `checkstyle` also use `reuse-ci.py`, passing
+their workflow name. The helper specifies each workflow's file, runner,
+job name and required successful steps. All use the same SHA, run age,
+source repository and first-attempt checks as QEMU and zloop.
+
+Unit tests require the complete userspace build and test sequence on
+`ubuntu-24.04`. ARM requires dependency installation and the build/sanity
+test step on `ubuntu-24.04-arm`; manual runs with a custom GCC are not
+reused. Checkstyle requires prepare, configure, build, style, lint and
+ABI checks on `ubuntu-22.04`. Missing or failed results run normally,
+as do manually requested reruns.
+
 ### Supported guests
 
 Auto-selected:
@@ -115,7 +173,12 @@ looks for a *test commit*:
 For each test commit (up to four), a `Verify` job builds that commit with
 `--enable-debug` in one `ubuntu24` VM and runs the tests it adds or
 modifies; at least one of them must fail, be killed, hang or crash the
-kernel.  Another `Verify` job builds the PR head and runs the same tests;
+kernel. A positive test added after its implementation, or a test-only
+fix that should already pass, can declare `ZFS-Test-Expect: pass` in its
+commit message. That commit is still built and tested, with success
+required instead of failure. The default is `fail`; duplicate or invalid
+declarations are rejected. Another `Verify` job builds the PR head and runs
+the same tests;
 all of them must pass without kernel errors.  Tests run one at a time
 with `zfs-tests.sh -t`, and the VM is restarted after a crash or hang.
 The `Verdict` job collects the results.  PRs without a test commit finish
