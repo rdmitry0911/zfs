@@ -12547,6 +12547,8 @@ pr19262_journal_replay_clone(void *arg, void *record, boolean_t byteswap)
 static void
 pr19262_journal_clone_test(spa_t *spa)
 {
+	boolean_t checkpoint_first =
+	    getenv("PR19262_CHECKPOINT_BEFORE_MOVES") != NULL;
 	char name[] = "pr19262_tx/journal";
 	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
 	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COPIES, 2, B_FALSE));
@@ -12576,6 +12578,11 @@ pr19262_journal_clone_test(spa_t *spa)
 		dmu_tx_commit(tx);
 	}
 	txg_wait_synced(spa->spa_dsl_pool, 0);
+	if (checkpoint_first) {
+		VERIFY0(spa_checkpoint("pr19262_tx"));
+		(void) printf("PR19262_CP_BEFORE_MOVES txg=%llu\n",
+		    (u_longlong_t)spa->spa_checkpoint_txg);
+	}
 	ztest_pe_append_t append = { .pa_vdev = 0, .pa_width = 6,
 	    .pa_parity = 2, .pa_lead = TXG_CONCURRENT_STATES };
 	VERIFY0(dsl_sync_task(spa_name(spa), ztest_pe_append_check,
@@ -12596,6 +12603,9 @@ pr19262_journal_clone_test(spa_t *spa)
 	nvlist_t *label;
 	vdev_uberblock_load(spa->spa_root_vdev, &durable, &label);
 	fnvlist_free(label);
+	char *fault = getenv("PR19262_COPY_J_FAULT");
+	if (checkpoint_first && fault != NULL)
+		pr19262_engine_journal_fault(atoi(fault));
 	for (uint_t b = 0; b < 2; b++) {
 		VERIFY3U(BP_GET_NDVAS(&bps[b]), ==, 2);
 		for (int d = 0; d < 2; d++) {
@@ -12604,8 +12614,25 @@ pr19262_journal_clone_test(spa_t *spa)
 			void *copy;
 			VERIFY0(pr19262_engine_copy_begin(spa, &bps[b], d,
 			    birth, &copy));
-			VERIFY0(pr19262_engine_copy_run(copy, B_FALSE));
+			int error = pr19262_engine_copy_run(copy, B_FALSE);
 			pr19262_engine_inspect(spa, &bps[b], d, &after);
+			if (checkpoint_first && fault != NULL) {
+				VERIFY3S(error, ==, EIO);
+				VERIFY3U(before.p, ==, after.p);
+				VERIFY3U(after.versions, ==,
+				    before.versions + 1);
+				dmu_tx_commit(fence);
+				txg_wait_synced(spa->spa_dsl_pool, 0);
+				pr19262_engine_check(spa,
+				    "copy-J-error-quarantines-stage");
+				(void) printf("PR19262_COPY_J_ERROR error=%d "
+				    "oldp=%llu versions=%llu\n", error,
+				    (u_longlong_t)after.p,
+				    (u_longlong_t)after.versions);
+				(void) fflush(NULL);
+				_exit(0);
+			}
+			VERIFY0(error);
 			VERIFY3U(before.psize, ==, 163840);
 			VERIFY3U(after.psize, ==, 196608);
 			VERIFY3U(before.p, !=, after.p);
@@ -12614,6 +12641,15 @@ pr19262_journal_clone_test(spa_t *spa)
 			    (u_longlong_t)DVA_GET_OFFSET(&bps[b].blk_dva[d]),
 			    (u_longlong_t)before.p, (u_longlong_t)after.p);
 		}
+	}
+	if (checkpoint_first) {
+		dmu_tx_commit(fence);
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		pr19262_engine_check(spa, "moves-after-native-checkpoint");
+		(void) printf("PR19262_CP_MOVES_DURABLE txg=%llu\n",
+		    (u_longlong_t)spa_last_synced_txg(spa));
+		(void) fflush(NULL);
+		_exit(0);
 	}
 	dmu_tx_t *tx = pr19262_journal_clone_tx(os, objects[1], 0, 262144,
 	    131072, bps, 2);
@@ -12681,7 +12717,9 @@ pr19262_journal_cold(const char *directory)
 	int error = zpool_find_config(&handle, pool, &config, &args);
 	if (error == 0)
 		error = spa_import(pool, config, props,
-		    ZFS_IMPORT_MISSING_LOG | ZFS_IMPORT_SKIP_MMP);
+		    ZFS_IMPORT_MISSING_LOG | ZFS_IMPORT_SKIP_MMP |
+		    (getenv("PR19262_ENGINE_CHECKPOINT_PREVIEW") != NULL ?
+		    ZFS_IMPORT_CHECKPOINT : 0));
 	fnvlist_free(config);
 	fnvlist_free(props);
 	if (error != 0) {
@@ -12706,6 +12744,24 @@ pr19262_journal_cold(const char *directory)
 	uint64_t source_object = object;
 	if (clone)
 		VERIFY0(dmu_object_next(os, &object, B_FALSE, 0));
+	if (clone && getenv("PR19262_CHECKPOINT_BEFORE_MOVES") != NULL) {
+		blkptr_t source[2];
+		size_t count = 2;
+		VERIFY0(dmu_read_l0_bps(os, source_object, 0, 262144,
+		    source, &count));
+		VERIFY3U(count, ==, 2);
+		for (uint_t b = 0; b < 2; b++) {
+			for (int d = 0; d < BP_GET_NDVAS(&source[b]); d++) {
+				pr19262_engine_info_t info;
+				pr19262_engine_inspect(spa, &source[b], d,
+				    &info);
+				(void) printf("PR19262_CP_COLD_BIND block=%u "
+				    "dva=%d p=%llu asize=%llu\n", b, d,
+				    (u_longlong_t)info.p,
+				    (u_longlong_t)info.psize);
+			}
+		}
+	}
 	pr19262_j_replay_t r = { .os = os };
 	const zil_header_t *zh = dmu_objset_zil(os)->zl_header;
 	(void) printf("PR19262_J_HEADER claim=%llu blocks=%llu "
@@ -12737,8 +12793,13 @@ pr19262_journal_cold(const char *directory)
 		for (uint_t i = 0; i < 131072; i++)
 			VERIFY3U(((uint8_t *)data)[i], ==, expected);
 		if (clone) {
-			VERIFY0(dmu_read(os, source_object, b * 131072, 131072,
-			    data, DMU_READ_NO_PREFETCH));
+			error = dmu_read(os, source_object, b * 131072, 131072,
+			    data, DMU_READ_NO_PREFETCH);
+			if (error != 0) {
+				(void) printf("PR19262_CP_SOURCE_READ_ERROR "
+				    "block=%u error=%d\n", b, error);
+				goto out;
+			}
 			for (uint_t i = 0; i < 131072; i++)
 				VERIFY3U(((uint8_t *)data)[i], ==,
 				    removed ? 0 : (b == 0 ? 0x51 : 0xa7));
@@ -12793,11 +12854,12 @@ pr19262_journal_cold(const char *directory)
 	(void) printf("PR19262_J_COLD_PASS write=%u replayed=%llu ub=%llu\n",
 	    write, (u_longlong_t)r.count,
 	    (u_longlong_t)spa_last_synced_txg(spa));
+out:
 	kmem_free(data, 131072);
 	dmu_objset_disown(os, B_TRUE, FTAG);
 	spa_close(spa, FTAG);
 	kernel_fini();
-	return (0);
+	return (error == 0 ? 0 : 1);
 }
 
 static int

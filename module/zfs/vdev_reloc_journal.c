@@ -78,13 +78,17 @@ engine_journal_write(spa_t *spa, uint64_t page, abd_t *abd)
 	for (uint64_t i = 0; i < engine.vd->vdev_children; i++) {
 		vdev_t *vd = engine.vd->vdev_child[i];
 		uint64_t *w = abd_to_buf(abd);
-		boolean_t inject = i == 0 && w[1] == ENGINE_J_BIND &&
+		uint64_t fault_kind = engine_journal_fault_stage >= 4 ?
+		    ENGINE_J_HEAD : ENGINE_J_BIND;
+		boolean_t inject = i == 0 && w[1] == fault_kind &&
 		    w[3] == engine_journal_fault_seq;
-		int e = inject && engine_journal_fault_stage == 1 ? EIO :
+		int e = inject && (engine_journal_fault_stage == 1 ||
+		    engine_journal_fault_stage == 4) ? EIO :
 		    engine_store_io_at(vd, engine.journal_arena, page,
 		    1, abd, B_TRUE);
 		if (e == 0)
-			e = inject && engine_journal_fault_stage == 2 ? EIO :
+			e = inject && (engine_journal_fault_stage == 2 ||
+			    engine_journal_fault_stage == 5) ? EIO :
 			    pr19262_engine_metadata_flush(vd);
 		if (e != 0)
 			error = e;
@@ -196,6 +200,18 @@ engine_journal_apply(uint64_t *w)
 			return (EINVAL);
 		b->journal_seq = w[3];
 		b->ready |= w[17];
+		if (b->generation > e->current->generation) {
+			/* M may already quarantine a failed publication. */
+			VERIFY(b->retired);
+			b->retired = B_FALSE;
+			engine.retired -= b->size;
+			e->current->retired = B_TRUE;
+			if (!e->retired)
+				engine.retired += e->current->size;
+			e->current = b;
+			if (e->retired)
+				engine.retired += b->size;
+		}
 		return (0);
 	}
 	if (!engine_store_extent(w[10], w[11]))
@@ -207,7 +223,8 @@ engine_journal_apply(uint64_t *w)
 	if (e->current == NULL || b->generation > e->current->generation) {
 		if (e->current != NULL) {
 			e->current->retired = B_TRUE;
-			engine.retired += e->current->size;
+			if (!e->retired)
+				engine.retired += e->current->size;
 		}
 		e->current = b;
 		if (e->retired)
@@ -312,7 +329,8 @@ engine_journal_repair(spa_t *spa)
 }
 
 static int
-engine_journal_bind_hold(spa_t *spa, engine_hold_t *h)
+engine_journal_bind_impl(spa_t *spa, engine_hold_t *h,
+    engine_version_t *staging)
 {
 	if (h == NULL)
 		return (0);
@@ -325,9 +343,16 @@ engine_journal_bind_hold(spa_t *spa, engine_hold_t *h)
 	for (uint_t i = 0; error == 0 && i < h->count; i++) {
 		mutex_enter(&engine.lock);
 		engine_owner_t *e = h->owner[i];
-		while (e->copying)
+		while (e->copying && staging == NULL) {
+			/* The copier needs this lock to publish. */
+			mutex_exit(&engine.journal_lock);
 			cv_wait(&engine.changed, &engine.lock);
-		engine_version_t *b = e->current;
+			mutex_exit(&engine.lock);
+			mutex_enter(&engine.journal_lock);
+			mutex_enter(&engine.lock);
+		}
+		engine_version_t *b = staging != NULL ? staging : e->current;
+		ASSERT(staging == NULL || (h->count == 1 && e->copying));
 		if (b->journal_seq != 0) {
 			mutex_exit(&engine.lock);
 			continue;
@@ -379,6 +404,13 @@ engine_journal_bind_hold(spa_t *spa, engine_hold_t *h)
 			error = engine_journal_write(spa, seq % 2, page);
 			abd_free(page);
 		}
+		if (error == 0 && seq == engine_journal_fault_seq &&
+		    engine_journal_fault_stage == 6) {
+			(void) printf("PR19262_J_CRASH_AFTER_HEAD seq=%llu\n",
+			    (u_longlong_t)seq);
+			(void) fflush(NULL);
+			_exit(79);
+		}
 		mutex_enter(&engine.lock);
 		b->leases--;
 		if (error == 0) {
@@ -397,6 +429,20 @@ engine_journal_bind_hold(spa_t *spa, engine_hold_t *h)
 	mutex_exit(&engine.lock);
 	mutex_exit(&engine.journal_lock);
 	return (error);
+}
+
+static int
+engine_journal_bind_hold(spa_t *spa, engine_hold_t *h)
+{
+	return (engine_journal_bind_impl(spa, h, NULL));
+}
+
+static int
+engine_journal_bind_copy(engine_copy_t *c)
+{
+	/* The copy handle already pins its owner and source version. */
+	engine_hold_t h = { .count = 1, .owner = { c->owner } };
+	return (engine_journal_bind_impl(engine.spa, &h, c->stage));
 }
 
 int

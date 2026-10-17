@@ -75,6 +75,8 @@ typedef struct engine_copy {
 	uint64_t psize;
 } engine_copy_t;
 
+static int engine_journal_bind_copy(engine_copy_t *);
+
 static struct {
 	kmutex_t lock;
 	kmutex_t journal_lock;
@@ -935,6 +937,18 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 		error = ECKSUM;
 	abd_free(source);
 	abd_free(verify);
+	/* Flush data before publishing its J binding. */
+	if (error == 0 && engine.persistent) {
+		spa_t *spa = engine.spa;
+		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+		for (uint64_t i = 0; i < engine.vd->vdev_children; i++) {
+			int e = pr19262_engine_metadata_flush(
+			    engine.vd->vdev_child[i]);
+			if (e != 0)
+				error = e;
+		}
+		spa_config_exit(spa, SCL_ZIO, FTAG);
+	}
 	mutex_enter(&engine.lock);
 	engine_owner_t *e = c->owner;
 	VERIFY(e->copying);
@@ -942,12 +956,26 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 	VERIFY0(c->stage->leases);
 	if (error == 0 && e->retired)
 		error = ESTALE;
-	if (error == 0) {
+	boolean_t journal_attempted = error == 0 && engine.persistent;
+	if (error == 0)
 		c->stage->ready = B_TRUE;
+	mutex_exit(&engine.lock);
+	if (journal_attempted)
+		error = engine_journal_bind_copy(c);
+	mutex_enter(&engine.lock);
+	if (error == 0 && e->retired)
+		error = ESTALE;
+	if (error == 0) {
 		e->current = c->stage;
 		c->source->retired = B_TRUE;
 		engine.retired += c->source->size;
 		engine.copied++;
+		engine.revision++;
+	} else if (journal_attempted) {
+		/* A prepared record can survive a failed publication. */
+		c->stage->retired = B_TRUE;
+		engine.retired += c->stage->size;
+		engine.copy_aborts++;
 		engine.revision++;
 	} else {
 		VERIFY3P(e->versions, ==, c->stage);
