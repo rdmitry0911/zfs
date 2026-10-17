@@ -2539,6 +2539,10 @@ vdev_raidz_io_exceeds_dva(zio_t *zio, vdev_raidz_layout_t layout,
 
 	ASSERT3P(bp, !=, NULL);
 	ASSERT(BP_GET_DEDUP(bp));
+#ifndef _KERNEL
+	if (zio->io_pr19262_owner_mapped)
+		bp = &zio->io_pr19262_owner_bp;
+#endif
 
 	/*
 	 * Production RAIDZ expansion applies to a top-level RAIDZ; nested
@@ -2741,6 +2745,8 @@ static uint64_t
 pr19262_probe_actual_birth(zio_t *zio)
 {
 #ifndef _KERNEL
+	if (zio->io_pr19262_owner_mapped)
+		return (BP_GET_PHYSICAL_BIRTH(&zio->io_pr19262_owner_bp));
 	pr19262_probe_move_t move;
 	if (pr19262_probe_translate() && pr19262_probe_lookup(zio, &move))
 		return (move.dst_birth);
@@ -3021,6 +3027,10 @@ vdev_raidz_io_start(zio_t *zio)
 	raidz_map_t *rm;
 
 	const blkptr_t *layout_bp = zio->io_bp;
+#ifndef _KERNEL
+	if (zio->io_pr19262_owner_mapped)
+		layout_bp = &zio->io_pr19262_owner_bp;
+#endif
 #ifndef _KERNEL
 	blkptr_t physical_bp;
 	pr19262_probe_move_t probe_move;

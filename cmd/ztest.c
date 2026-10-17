@@ -11924,6 +11924,220 @@ ztest_run_init(void)
 }
 
 #include <sys/vdev_reloc_probe.h>
+#include <sys/vdev_reloc_engine.h>
+
+static void
+pr19262_runtime_raw(spa_t *spa, const blkptr_t *bp, void *expected,
+    uint64_t size)
+{
+	VERIFY3U(BP_GET_NDVAS(bp), ==, 2);
+	abd_t *abd = abd_alloc_for_io(size, B_FALSE);
+	for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
+		blkptr_t one = *bp;
+		BP_ZERO_DVAS(&one);
+		one.blk_dva[0] = bp->blk_dva[d];
+		VERIFY0(zio_wait(zio_read(NULL, spa, &one, abd, size,
+		    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
+		    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL)));
+		VERIFY0(abd_cmp_buf(abd, expected, size));
+	}
+	abd_free(abd);
+}
+
+static void
+pr19262_runtime_test(spa_t *spa)
+{
+	char name[] = "pr19262_tx/engine";
+	char snapshot[] = "pr19262_tx/engine@retained";
+	char clone[] = "pr19262_tx/clone";
+	uint64_t size = 131072;
+	uint64_t blocks = 8;
+	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COPIES, 2, B_FALSE));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+	    ZIO_COMPRESS_OFF, B_FALSE));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_DEDUP,
+	    ZIO_CHECKSUM_SHA256, B_FALSE));
+	objset_t *os;
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE,
+	    FTAG, &os));
+	void *data = kmem_alloc(size, KM_SLEEP);
+	void *readback = kmem_alloc(size, KM_SLEEP);
+	for (uint64_t i = 0; i < size / sizeof (uint64_t); i++)
+		((uint64_t *)data)[i] = i * 0x9e3779b97f4a7c15ULL;
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER, size,
+	    DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_write(tx, object, 0, size * blocks);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	for (uint64_t i = 0; i < blocks; i++)
+		dmu_write(os, object, i * size, size, data, tx, 0);
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	/* Exercise the common allocator rollback with automatic P ownership. */
+	dmu_tx_t *fence = dmu_tx_create(os);
+	VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_space(tx, 4096);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t fault_txg = dmu_tx_get_txg(tx);
+	dmu_tx_commit(tx);
+	blkptr_t failed = { 0 };
+	BP_SET_LSIZE(&failed, 4096);
+	BP_SET_PSIZE(&failed, 4096);
+	zio_alloc_list_t trace;
+	metaslab_trace_init(&trace);
+	pr19262_tx_fail_second(B_TRUE);
+	VERIFY3S(metaslab_alloc(spa, spa_normal_class(spa), 4096, &failed,
+	    2, fault_txg, NULL, 0, &trace, 0, FTAG), ==, ENOSPC);
+	pr19262_tx_fail_second(B_FALSE);
+	VERIFY0(BP_GET_NDVAS(&failed));
+	VERIFY0(BP_GET_PHYSICAL_BIRTH(&failed));
+	metaslab_trace_fini(&trace);
+	dmu_tx_commit(fence);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	pr19262_engine_check(spa, "native-second-DVA-rollback");
+	fence = dmu_tx_create(os);
+	VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
+	abd_t *fault_data = abd_alloc_for_io(16384, B_FALSE);
+	abd_copy_from_buf(fault_data, data, 16384);
+	zio_prop_t prop = { 0 };
+	prop.zp_checksum = ZIO_CHECKSUM_SHA256;
+	prop.zp_compress = ZIO_COMPRESS_OFF;
+	prop.zp_copies = 2;
+	prop.zp_type = DMU_OT_UINT64_OTHER;
+	blkptr_t write_error = { 0 };
+	uint64_t free_before_error = pr19262_engine_limit(spa, B_TRUE);
+	pr19262_engine_fail_writes(B_TRUE);
+	VERIFY3S(zio_wait(zio_write(NULL, spa, dmu_tx_get_txg(fence),
+	    &write_error, fault_data, 16384, 16384, &prop, NULL, NULL,
+	    NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY, NULL)), ==, EIO);
+	pr19262_engine_fail_writes(B_FALSE);
+	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==, free_before_error);
+	abd_free(fault_data);
+	dmu_tx_commit(fence);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	pr19262_engine_check(spa, "write-error-after-pairing");
+	blkptr_t *bp = kmem_alloc(blocks * sizeof (*bp), KM_SLEEP);
+	for (uint64_t i = 0; i < blocks; i++) {
+		dmu_buf_t *dbuf;
+		VERIFY0(dmu_buf_hold(os, object, i * size, FTAG, &dbuf,
+		    DMU_READ_NO_PREFETCH));
+		dmu_buf_impl_t *db = (dmu_buf_impl_t *)dbuf;
+		VERIFY3P(db->db_blkptr, !=, NULL);
+		bp[i] = *db->db_blkptr;
+		dmu_buf_rele(dbuf, FTAG);
+		pr19262_runtime_raw(spa, &bp[i], data, size);
+	}
+	pr19262_engine_check(spa, "data-and-MOS");
+	/* The real sorted queue holds all DVAs, even after a rotation. */
+	blkptr_t rotated = bp[0];
+	rotated.blk_dva[0] = bp[0].blk_dva[1];
+	rotated.blk_dva[1] = bp[0].blk_dva[0];
+	void *scan = pr19262_scan_probe_create(spa, &rotated);
+	pr19262_scan_probe_insert(scan, &rotated);
+	pr19262_engine_block_new(B_TRUE);
+	VERIFY0(pr19262_scan_probe_issue(scan));
+	pr19262_engine_block_new(B_FALSE);
+	nvlist_t *snaps = fnvlist_alloc();
+	fnvlist_add_boolean(snaps, snapshot);
+	VERIFY0(dsl_dataset_snapshot(snaps, NULL, NULL));
+	fnvlist_free(snaps);
+	VERIFY0(dsl_dataset_clone(clone, snapshot));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_DEDUP,
+	    ZIO_CHECKSUM_OFF, B_FALSE));
+	/* Retained roots keep the original allocations after head overwrite. */
+	memset(readback, 0xa5, size);
+	uint64_t old_gang = metaslab_force_ganging;
+	uint_t old_pct = metaslab_force_ganging_pct;
+	metaslab_force_ganging = 64 * 1024;
+	metaslab_force_ganging_pct = 100;
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_write(tx, object, 0, size * blocks);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	for (uint64_t i = 0; i < blocks; i++)
+		dmu_write(os, object, i * size, size, readback, tx, 0);
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	metaslab_force_ganging = old_gang;
+	metaslab_force_ganging_pct = old_pct;
+	for (uint64_t i = 0; i < blocks; i++)
+		pr19262_runtime_raw(spa, &bp[i], data, size);
+	dmu_buf_t *headbuf;
+	VERIFY0(dmu_buf_hold(os, object, 0, FTAG, &headbuf,
+	    DMU_READ_NO_PREFETCH));
+	blkptr_t headbp = *((dmu_buf_impl_t *)headbuf)->db_blkptr;
+	VERIFY(BP_IS_GANG(&headbp));
+	dmu_buf_rele(headbuf, FTAG);
+	abd_t *queued_data = abd_alloc_for_io(size, B_FALSE);
+	zio_t *queued = zio_read(NULL, spa, &headbp, queued_data, size,
+	    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW | ZIO_FLAG_SPECULATIVE, NULL);
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_free(tx, object, 0, DMU_OBJECT_END);
+	dmu_tx_mark_netfree(tx);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	VERIFY0(dmu_free_range(os, object, 0, DMU_OBJECT_END, tx));
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	VERIFY0(zio_wait(queued));
+	VERIFY0(abd_cmp_buf(queued_data, readback, size));
+	/* A fresh late read of the dead allocation must not inherit access. */
+	int late = zio_wait(zio_read(NULL, spa, &headbp, queued_data, size,
+	    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW | ZIO_FLAG_SPECULATIVE, NULL));
+	VERIFY3S(late, !=, 0);
+	abd_free(queued_data);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	for (int root = 0; root < 2; root++) {
+		const char *ds = root == 0 ? snapshot : clone;
+		VERIFY0(dmu_objset_own(ds, DMU_OST_OTHER, B_TRUE, B_TRUE,
+		    FTAG, &os));
+		for (uint64_t i = 0; i < blocks; i++) {
+			VERIFY0(dmu_read(os, object, i * size, size, readback,
+			    DMU_READ_NO_PREFETCH));
+			VERIFY0(memcmp(data, readback, size));
+		}
+		dmu_objset_disown(os, B_TRUE, FTAG);
+	}
+	pr19262_engine_check(spa, "retained-roots-after-final-free");
+	/* Read the actual MOS root through its unchanged V-BP. */
+	blkptr_t rootbp = spa->spa_uberblock.ub_rootbp;
+	abd_t *mos = abd_alloc_for_io(BP_GET_PSIZE(&rootbp), B_FALSE);
+	VERIFY0(zio_wait(zio_read(NULL, spa, &rootbp, mos,
+	    BP_GET_PSIZE(&rootbp), NULL, NULL, ZIO_PRIORITY_SYNC_READ,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL)));
+	abd_free(mos);
+	pr19262_engine_check(spa, "raw-MOS-root");
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE,
+	    FTAG, &os));
+	pr19262_engine_retired_limit(1);
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_space(tx, 4096);
+	VERIFY3S(dmu_tx_assign(tx, DMU_TX_NOWAIT), ==, ENOSPC);
+	dmu_tx_abort(tx);
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_space(tx, 4096);
+	dmu_tx_mark_netfree(tx);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	dmu_tx_commit(tx);
+	pr19262_engine_retired_limit(64ULL << 20);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	pr19262_engine_check(spa, "blocked-floor-admission-netfree");
+	pr19262_tx_check(spa);
+	(void) printf("PR19262_RUNTIME_PASS normal-writable-SPA "
+	    "automatic-data-MOS-ditto snapshot-clone "
+	    "final-free-floor-blocked\n");
+	kmem_free(bp, blocks * sizeof (*bp));
+	kmem_free(data, size);
+	kmem_free(readback, size);
+}
 
 static int
 pr19262_tx_driver(const char *directory)
@@ -11953,6 +12167,13 @@ pr19262_tx_driver(const char *directory)
 	VERIFY0(spa_create("pr19262_tx", root, props, NULL, NULL, NULL));
 	spa_t *spa;
 	VERIFY0(spa_open("pr19262_tx", &spa, FTAG));
+	if (getenv("PR19262_RUNTIME_ENGINE") != NULL) {
+		pr19262_engine_start(spa);
+		pr19262_runtime_test(spa);
+		(void) fflush(NULL);
+		/* No old importer can read this RAM-only translated image. */
+		_exit(0);
+	}
 	pr19262_tx_probe(spa);
 	spa_close(spa, FTAG);
 	VERIFY0(spa_export("pr19262_tx", NULL, B_FALSE, B_FALSE));
@@ -11987,6 +12208,8 @@ main(int argc, char **argv)
 
 	dprintf_setup(&argc, argv);
 	const char *physical_probe = getenv("PR19262_TX_PROBE");
+	if (physical_probe == NULL)
+		physical_probe = getenv("PR19262_RUNTIME_ENGINE");
 	if (physical_probe != NULL)
 		return (pr19262_tx_driver(physical_probe));
 	zfs_deadman_synctime_ms = 300000;

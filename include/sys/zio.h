@@ -505,6 +505,10 @@ struct zio {
 #ifndef _KERNEL
 	void		*io_pr19262_hold;
 	boolean_t	io_pr19262_physical;
+	void		*io_pr19262_owner_hold;
+	blkptr_t	io_pr19262_owner_bp;
+	uint64_t	io_pr19262_owner_v;
+	boolean_t	io_pr19262_owner_mapped;
 #endif
 	zio_transform_t *io_transform_stack;
 

@@ -21,6 +21,7 @@ typedef struct probe_tx_budget {
 typedef struct probe_tx_credit {
 	uint64_t bytes;
 	uint64_t txg;
+	spa_t *spa;
 	probe_tx_budget_t *budget;
 } probe_tx_credit_t;
 
@@ -53,12 +54,26 @@ static struct {
 	boolean_t fail_second;
 } probe_tx;
 
+static boolean_t
+probe_tx_scope(spa_t *spa)
+{
+	return ((probe_tx.os != NULL && dmu_objset_spa(probe_tx.os) == spa) ||
+	    pr19262_engine_active(spa));
+}
+
+void
+pr19262_tx_fail_second(boolean_t fail)
+{
+	mutex_enter(&probe_tx.lock);
+	probe_tx.fail_second = fail;
+	mutex_exit(&probe_tx.lock);
+}
+
 boolean_t
 pr19262_tx_fail_dva(spa_t *spa, int d)
 {
 	mutex_enter(&probe_tx.lock);
-	boolean_t fail = probe_tx.os != NULL &&
-	    dmu_objset_spa(probe_tx.os) == spa &&
+	boolean_t fail = probe_tx_scope(spa) &&
 	    probe_tx.fail_second && d == 1;
 	mutex_exit(&probe_tx.lock);
 	return (fail);
@@ -93,7 +108,10 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 {
 	int error = 0;
 	mutex_enter(&probe_tx.lock);
-	if (tx->tx_objset != probe_tx.os || probe_tx.os == NULL || bytes == 0)
+	spa_t *spa = tx->tx_pool->dp_spa;
+	boolean_t runtime = pr19262_engine_active(spa);
+	if (bytes == 0 || (!runtime &&
+	    (tx->tx_objset != probe_tx.os || probe_tx.os == NULL)))
 		goto out;
 	VERIFY3P(tx->tx_pr19262_physical_credit, ==, NULL);
 	metaslab_class_t *mc = spa_normal_class(tx->tx_pool->dp_spa);
@@ -105,6 +123,8 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 	limit = limit > probe_tx.inflight ? limit - probe_tx.inflight : 0;
 	uint64_t protected = tx->tx_netfree ? 0 : probe_tx.emergency;
 	limit = limit > protected ? limit - protected : 0;
+	if (runtime)
+		limit = pr19262_engine_limit(spa, tx->tx_netfree);
 	if (probe_tx.reserved > limit || bytes > limit - probe_tx.reserved) {
 		probe_tx.rejected++;
 		error = ENOSPC;
@@ -119,6 +139,7 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 	probe_tx_credit_t *c = kmem_alloc(sizeof (*c), KM_SLEEP);
 	c->bytes = bytes;
 	c->txg = tx->tx_txg;
+	c->spa = spa;
 	c->budget = b;
 	b->open += bytes;
 	b->refs++;
@@ -154,7 +175,7 @@ pr19262_tx_allocated(spa_t *spa, metaslab_class_t *mc, vdev_t *vd,
     uint64_t offset, uint64_t size, uint64_t txg)
 {
 	mutex_enter(&probe_tx.lock);
-	if (probe_tx.os == NULL || dmu_objset_spa(probe_tx.os) != spa ||
+	if (!probe_tx_scope(spa) ||
 	    mc != spa_normal_class(spa))
 		goto out;
 	probe_tx_budget_t *b = probe_tx_budget_find(txg);
@@ -183,7 +204,7 @@ pr19262_tx_unallocated(spa_t *spa, vdev_t *vd, uint64_t offset,
     uint64_t size, uint64_t txg)
 {
 	mutex_enter(&probe_tx.lock);
-	if (probe_tx.os == NULL || dmu_objset_spa(probe_tx.os) != spa)
+	if (!probe_tx_scope(spa))
 		goto out;
 	for (probe_tx_allocation_t *a = list_head(&probe_tx.allocations);
 	    a != NULL; a = list_next(&probe_tx.allocations, a)) {
@@ -212,7 +233,7 @@ probe_tx_synced(void *arg, int error)
 {
 	probe_tx_credit_t *c = arg;
 	VERIFY0(error);
-	VERIFY3U(spa_last_synced_txg(dmu_objset_spa(probe_tx.os)), >=, c->txg);
+	VERIFY3U(spa_last_synced_txg(c->spa), >=, c->txg);
 	mutex_enter(&probe_tx.lock);
 	probe_tx_budget_t *b = c->budget;
 	/* Physical ownership now remains charged by native metaslab ALLOC. */
@@ -304,6 +325,22 @@ probe_tx_dsl_reserved(dsl_dir_t *dd)
 		result += dd->dd_tempreserved[i];
 	mutex_exit(&dd->dd_lock);
 	return (result);
+}
+
+void
+pr19262_tx_check(spa_t *spa)
+{
+	probe_tx_drain(spa->spa_dsl_pool, 0);
+	mutex_enter(&probe_tx.lock);
+	VERIFY0(probe_tx.reserved);
+	VERIFY0(probe_tx.inflight);
+	VERIFY(list_is_empty(&probe_tx.allocations));
+	(void) printf("PR19262_ENGINE_BUDGET grants=%llu consumed=%llu "
+	    "callbacks=%llu unallocations=%llu\n",
+	    (u_longlong_t)probe_tx.granted, (u_longlong_t)probe_tx.consumed,
+	    (u_longlong_t)probe_tx.callbacks,
+	    (u_longlong_t)probe_tx.unallocations);
+	mutex_exit(&probe_tx.lock);
 }
 
 void

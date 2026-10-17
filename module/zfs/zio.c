@@ -48,6 +48,7 @@
 
 #ifndef _KERNEL
 #include "vdev_reloc_probe.c"
+#include <sys/vdev_reloc_engine.h>
 #endif
 
 /*
@@ -192,6 +193,7 @@ zio_init(void)
 {
 #ifndef _KERNEL
 	pr19262_reloc_init();
+	pr19262_engine_init();
 #endif
 	size_t c;
 
@@ -296,6 +298,7 @@ zio_fini(void)
 {
 #ifndef _KERNEL
 	pr19262_reloc_fini();
+	pr19262_engine_fini();
 #endif
 	size_t n = SPA_MAXBLOCKSIZE >> SPA_MINBLOCKSHIFT;
 
@@ -1057,6 +1060,11 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 	}
 
 	taskq_init_ent(&zio->io_tqent);
+#ifndef _KERNEL
+	zio->io_pr19262_owner_hold = pr19262_engine_hold(spa, bp,
+	    pio != NULL ? pio->io_pr19262_owner_hold : NULL,
+	    type == ZIO_TYPE_READ, (flags & ZIO_FLAG_GANG_CHILD) != 0);
+#endif
 
 	return (zio);
 }
@@ -1066,6 +1074,7 @@ zio_destroy(zio_t *zio)
 {
 #ifndef _KERNEL
 	pr19262_reloc_rele(zio->io_pr19262_hold);
+	pr19262_engine_rele(zio->io_pr19262_owner_hold);
 #endif
 	ASSERT3P(zio->io_batch, ==, NULL);
 	ASSERT3P(zio->io_child_batch, ==, NULL);
@@ -1390,6 +1399,20 @@ zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 }
 
 #ifndef _KERNEL
+zio_t *
+pr19262_engine_read_bound(zio_t *pio, spa_t *spa, const blkptr_t *bp,
+    abd_t *data, uint64_t size, zio_done_func_t *done, void *private,
+    zio_priority_t priority, zio_flag_t flags, const zbookmark_phys_t *zb,
+    void **hold)
+{
+	zio_t *zio = zio_read(pio, spa, bp, data, size, done, private,
+	    priority, flags, zb);
+	pr19262_engine_rele(zio->io_pr19262_owner_hold);
+	zio->io_pr19262_owner_hold = *hold;
+	*hold = NULL;
+	return (zio);
+}
+
 zio_t *
 pr19262_reloc_read_bound(zio_t *pio, spa_t *spa, const blkptr_t *bp,
     abd_t *data, uint64_t size, zio_done_func_t *done, void *private,
@@ -5181,6 +5204,14 @@ zio_vdev_io_start(zio_t *zio)
 	ASSERT0(zio->io_child_error[ZIO_CHILD_VDEV]);
 
 	if (vd == NULL) {
+#ifndef _KERNEL
+		/* New/gang allocations gained DVAs after zio_create(). */
+		void *hold = pr19262_engine_hold(spa, zio->io_bp,
+		    zio->io_pr19262_owner_hold, zio->io_type == ZIO_TYPE_READ,
+		    (zio->io_flags & ZIO_FLAG_GANG_CHILD) != 0);
+		pr19262_engine_rele(zio->io_pr19262_owner_hold);
+		zio->io_pr19262_owner_hold = hold;
+#endif
 		if (!(zio->io_flags & ZIO_FLAG_CONFIG_WRITER)) {
 			/*
 			 * A deadlock workaround. The ddt_prune_unique_entries()
@@ -5213,6 +5244,16 @@ zio_vdev_io_start(zio_t *zio)
 	}
 
 	ASSERT3P(zio->io_logical, !=, zio);
+#ifndef _KERNEL
+	{
+		int error = pr19262_engine_dispatch(zio);
+		if (error != 0) {
+			zio->io_error = error;
+			zio_execute(zio);
+			return (NULL);
+		}
+	}
+#endif
 	if (zio->io_type == ZIO_TYPE_WRITE) {
 		ASSERT(spa->spa_trust_config);
 

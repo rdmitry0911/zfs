@@ -34,6 +34,7 @@
 #include <sys/trace_zfs.h>
 #ifndef _KERNEL
 #include <sys/vdev_reloc_probe.h>
+#include <sys/vdev_reloc_engine.h>
 #include "vdev_reloc_tx.c"
 #endif
 

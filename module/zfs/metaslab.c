@@ -25,6 +25,7 @@
 #include <sys/metaslab_impl.h>
 #ifndef _KERNEL
 #include <sys/vdev_reloc_probe.h>
+#include <sys/vdev_reloc_engine.h>
 #endif
 #include <sys/vdev_impl.h>
 #include <sys/vdev_draid.h>
@@ -5529,6 +5530,13 @@ top:
 			    ((flags & METASLAB_GANG_HEADER) ? 1 : 0));
 			DVA_SET_ASIZE(&dva[d], asize);
 #ifndef _KERNEL
+			int pair_error = pr19262_engine_pair(spa, vd, offset,
+			    asize, txg);
+			if (pair_error != 0) {
+				metaslab_unalloc_dva(spa, &dva[d], txg);
+				memset(&dva[d], 0, sizeof (dva_t));
+				return (pair_error);
+			}
 			pr19262_tx_allocated(spa, mc, vd, offset, asize, txg);
 #endif
 			return (0);
@@ -5583,6 +5591,10 @@ metaslab_free_concrete(vdev_t *vd, uint64_t offset, uint64_t asize,
 	ASSERT(vdev_is_concrete(vd));
 	ASSERT3U(spa_config_held(spa, SCL_ALL, RW_READER), !=, 0);
 	VERIFY3U(m, <, vd->vdev_ms_count);
+#ifndef _KERNEL
+	if (pr19262_engine_retire(vd, offset, asize, checkpoint))
+		return;
+#endif
 
 	msp = vd->vdev_ms[m];
 
@@ -5864,6 +5876,7 @@ metaslab_unalloc_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
 	mutex_exit(&msp->ms_lock);
 #ifndef _KERNEL
 	pr19262_tx_unallocated(spa, vd, offset, size, txg);
+	pr19262_engine_abort(spa, vd, offset, size);
 #endif
 }
 
@@ -6594,4 +6607,5 @@ ZFS_MODULE_PARAM(zfs_metaslab, metaslab_, trace_max_entries, U64, ZMOD_RW,
 
 #ifndef _KERNEL
 #include "vdev_reloc_space.c"
+#include "vdev_reloc_engine.c"
 #endif
