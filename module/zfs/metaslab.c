@@ -23,6 +23,9 @@
 #include <sys/dmu_tx.h>
 #include <sys/space_map.h>
 #include <sys/metaslab_impl.h>
+#ifndef _KERNEL
+#include <sys/vdev_reloc_probe.h>
+#endif
 #include <sys/vdev_impl.h>
 #include <sys/vdev_draid.h>
 #include <sys/zio.h>
@@ -5423,6 +5426,10 @@ metaslab_alloc_dva_range(spa_t *spa, metaslab_class_t *mc, uint64_t psize,
 	boolean_t unhealthy = B_FALSE;
 
 	ASSERT(!DVA_IS_VALID(&dva[d]));
+#ifndef _KERNEL
+	if (pr19262_tx_fail_dva(spa, d))
+		return (SET_ERROR(ENOSPC));
+#endif
 
 	/*
 	 * For testing, make some blocks above a certain size be gang blocks.
@@ -5521,6 +5528,9 @@ top:
 			DVA_SET_GANG(&dva[d],
 			    ((flags & METASLAB_GANG_HEADER) ? 1 : 0));
 			DVA_SET_ASIZE(&dva[d], asize);
+#ifndef _KERNEL
+			pr19262_tx_allocated(spa, mc, vd, offset, asize, txg);
+#endif
 			return (0);
 		}
 next:
@@ -5852,6 +5862,9 @@ metaslab_unalloc_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
 	VERIFY0(P2PHASE(size, 1ULL << vd->vdev_ashift));
 	zfs_range_tree_add(msp->ms_allocatable, offset, size);
 	mutex_exit(&msp->ms_lock);
+#ifndef _KERNEL
+	pr19262_tx_unallocated(spa, vd, offset, size, txg);
+#endif
 }
 
 /*

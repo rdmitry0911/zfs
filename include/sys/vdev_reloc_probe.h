@@ -13,6 +13,11 @@ typedef struct pr19262_backing_desc {
 void pr19262_reloc_init(void);
 void pr19262_reloc_fini(void);
 void pr19262_tx_probe(spa_t *);
+void pr19262_tx_allocated(spa_t *, metaslab_class_t *, vdev_t *,
+    uint64_t, uint64_t, uint64_t);
+void pr19262_tx_unallocated(spa_t *, vdev_t *, uint64_t, uint64_t,
+    uint64_t);
+boolean_t pr19262_tx_fail_dva(spa_t *, int);
 void *pr19262_reloc_hold(spa_t *, const blkptr_t *);
 void pr19262_reloc_rele(void *);
 int pr19262_reloc_resolve(zio_t *, pr19262_backing_desc_t *);

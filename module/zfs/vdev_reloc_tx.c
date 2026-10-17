@@ -1,39 +1,91 @@
 /* SPDX-License-Identifier: CDDL-1.0 */
 /*
  * Private userspace admission experiment, included by dmu_tx.c.
- * Exercise normal DMU assignment/rollback and native TXG callbacks.
- * A fixture capacity cap is NOT a persistent physical allocator/catalog.
+ * Native identity P allocations consume per-TXG committed credits.
+ * No persistent dual allocator/catalog is implemented by this fixture.
  */
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
 #include <sys/spa_impl.h>
 
+typedef struct probe_tx_budget {
+	list_node_t link;
+	uint64_t txg;
+	uint64_t open;
+	uint64_t committed;
+	uint64_t inflight;
+	uint64_t refs;
+	uint64_t pending_refs;
+} probe_tx_budget_t;
+
 typedef struct probe_tx_credit {
 	uint64_t bytes;
 	uint64_t txg;
+	probe_tx_budget_t *budget;
 } probe_tx_credit_t;
+
+typedef struct probe_tx_allocation {
+	list_node_t link;
+	vdev_t *vd;
+	uint64_t offset;
+	uint64_t size;
+	uint64_t spent;
+	probe_tx_budget_t *budget;
+} probe_tx_allocation_t;
 
 static struct {
 	kmutex_t lock;
 	kcondvar_t done;
+	list_t budgets;
+	list_t allocations;
 	objset_t *os;
 	uint64_t cap;
 	uint64_t emergency;
 	uint64_t reserved;
 	uint64_t pending;
+	uint64_t inflight;
+	uint64_t consumed;
+	uint64_t unallocations;
 	uint64_t rejected;
 	uint64_t granted;
 	uint64_t rolled_back;
 	uint64_t callbacks;
+	boolean_t fail_second;
 } probe_tx;
 
-static void
-probe_tx_credit_free(probe_tx_credit_t *c)
+boolean_t
+pr19262_tx_fail_dva(spa_t *spa, int d)
+{
+	mutex_enter(&probe_tx.lock);
+	boolean_t fail = probe_tx.os != NULL &&
+	    dmu_objset_spa(probe_tx.os) == spa &&
+	    probe_tx.fail_second && d == 1;
+	mutex_exit(&probe_tx.lock);
+	return (fail);
+}
+
+static probe_tx_budget_t *
+probe_tx_budget_find(uint64_t txg)
 {
 	ASSERT(MUTEX_HELD(&probe_tx.lock));
-	VERIFY3U(probe_tx.reserved, >=, c->bytes);
-	probe_tx.reserved -= c->bytes;
-	kmem_free(c, sizeof (*c));
+	for (probe_tx_budget_t *b = list_head(&probe_tx.budgets); b != NULL;
+	    b = list_next(&probe_tx.budgets, b))
+		if (b->txg == txg)
+			return (b);
+	return (NULL);
+}
+
+static void
+probe_tx_budget_drop(probe_tx_budget_t *b)
+{
+	if (b->refs != 0)
+		return;
+	VERIFY0(b->open);
+	VERIFY0(b->committed);
+	VERIFY0(b->inflight);
+	VERIFY0(b->pending_refs);
+	list_remove(&probe_tx.budgets, b);
+	kmem_free(b, sizeof (*b));
 }
 
 static int
@@ -48,7 +100,9 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 	uint64_t total = metaslab_class_get_space(mc);
 	uint64_t allocated = metaslab_class_get_alloc(mc);
 	uint64_t available = total > allocated ? total - allocated : 0;
+	/* Native committed ALLOC does not yet include these allocations. */
 	uint64_t limit = MIN(probe_tx.cap, available);
+	limit = limit > probe_tx.inflight ? limit - probe_tx.inflight : 0;
 	uint64_t protected = tx->tx_netfree ? 0 : probe_tx.emergency;
 	limit = limit > protected ? limit - protected : 0;
 	if (probe_tx.reserved > limit || bytes > limit - probe_tx.reserved) {
@@ -56,9 +110,18 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 		error = ENOSPC;
 		goto out;
 	}
+	probe_tx_budget_t *b = probe_tx_budget_find(tx->tx_txg);
+	if (b == NULL) {
+		b = kmem_zalloc(sizeof (*b), KM_SLEEP);
+		b->txg = tx->tx_txg;
+		list_insert_tail(&probe_tx.budgets, b);
+	}
 	probe_tx_credit_t *c = kmem_alloc(sizeof (*c), KM_SLEEP);
 	c->bytes = bytes;
 	c->txg = tx->tx_txg;
+	c->budget = b;
+	b->open += bytes;
+	b->refs++;
 	tx->tx_pr19262_physical_credit = c;
 	probe_tx.reserved += bytes;
 	probe_tx.granted++;
@@ -74,9 +137,73 @@ probe_tx_unreserve(dmu_tx_t *tx)
 	if (c == NULL)
 		return;
 	mutex_enter(&probe_tx.lock);
-	probe_tx_credit_free(c);
+	probe_tx_budget_t *b = c->budget;
+	VERIFY3U(b->open, >=, c->bytes);
+	b->open -= c->bytes;
+	probe_tx.reserved -= c->bytes;
+	b->refs--;
+	probe_tx_budget_drop(b);
+	kmem_free(c, sizeof (*c));
 	probe_tx.rolled_back++;
 	tx->tx_pr19262_physical_credit = NULL;
+	mutex_exit(&probe_tx.lock);
+}
+
+void
+pr19262_tx_allocated(spa_t *spa, metaslab_class_t *mc, vdev_t *vd,
+    uint64_t offset, uint64_t size, uint64_t txg)
+{
+	mutex_enter(&probe_tx.lock);
+	if (probe_tx.os == NULL || dmu_objset_spa(probe_tx.os) != spa ||
+	    mc != spa_normal_class(spa))
+		goto out;
+	probe_tx_budget_t *b = probe_tx_budget_find(txg);
+	/* Open-context ZIL needs its own durable budget, not client credit. */
+	if (b == NULL || b->pending_refs == 0)
+		goto out;
+	probe_tx_allocation_t *a = kmem_zalloc(sizeof (*a), KM_SLEEP);
+	a->vd = vd;
+	a->offset = offset;
+	a->size = size;
+	a->budget = b;
+	a->spent = MIN(size, b->committed);
+	b->committed -= a->spent;
+	probe_tx.reserved -= a->spent;
+	probe_tx.pending -= a->spent;
+	b->inflight += size;
+	probe_tx.inflight += size;
+	probe_tx.consumed += a->spent;
+	list_insert_tail(&probe_tx.allocations, a);
+out:
+	mutex_exit(&probe_tx.lock);
+}
+
+void
+pr19262_tx_unallocated(spa_t *spa, vdev_t *vd, uint64_t offset,
+    uint64_t size, uint64_t txg)
+{
+	mutex_enter(&probe_tx.lock);
+	if (probe_tx.os == NULL || dmu_objset_spa(probe_tx.os) != spa)
+		goto out;
+	for (probe_tx_allocation_t *a = list_head(&probe_tx.allocations);
+	    a != NULL; a = list_next(&probe_tx.allocations, a)) {
+		if (a->vd != vd || a->offset != offset || a->size != size ||
+		    a->budget->txg != txg)
+			continue;
+		probe_tx_budget_t *b = a->budget;
+		b->committed += a->spent;
+		probe_tx.reserved += a->spent;
+		probe_tx.pending += a->spent;
+		VERIFY3U(b->inflight, >=, size);
+		VERIFY3U(probe_tx.inflight, >=, size);
+		b->inflight -= size;
+		probe_tx.inflight -= size;
+		probe_tx.unallocations++;
+		list_remove(&probe_tx.allocations, a);
+		kmem_free(a, sizeof (*a));
+		break;
+	}
+out:
 	mutex_exit(&probe_tx.lock);
 }
 
@@ -87,10 +214,33 @@ probe_tx_synced(void *arg, int error)
 	VERIFY0(error);
 	VERIFY3U(spa_last_synced_txg(dmu_objset_spa(probe_tx.os)), >=, c->txg);
 	mutex_enter(&probe_tx.lock);
-	VERIFY3U(probe_tx.pending, >=, c->bytes);
-	probe_tx.pending -= c->bytes;
+	probe_tx_budget_t *b = c->budget;
+	/* Physical ownership now remains charged by native metaslab ALLOC. */
+	VERIFY3U(probe_tx.inflight, >=, b->inflight);
+	probe_tx.inflight -= b->inflight;
+	b->inflight = 0;
+	probe_tx_allocation_t *a = list_head(&probe_tx.allocations);
+	while (a != NULL) {
+		probe_tx_allocation_t *next =
+		    list_next(&probe_tx.allocations, a);
+		if (a->budget == b) {
+			list_remove(&probe_tx.allocations, a);
+			kmem_free(a, sizeof (*a));
+		}
+		a = next;
+	}
+	VERIFY3U(b->pending_refs, >, 0);
+	b->pending_refs--;
+	b->refs--;
+	if (b->pending_refs == 0) {
+		VERIFY0(b->open);
+		probe_tx.pending -= b->committed;
+		probe_tx.reserved -= b->committed;
+		b->committed = 0;
+	}
+	probe_tx_budget_drop(b);
 	probe_tx.callbacks++;
-	probe_tx_credit_free(c);
+	kmem_free(c, sizeof (*c));
 	cv_broadcast(&probe_tx.done);
 	mutex_exit(&probe_tx.lock);
 }
@@ -102,6 +252,11 @@ probe_tx_commit(dmu_tx_t *tx)
 	if (c == NULL)
 		return;
 	mutex_enter(&probe_tx.lock);
+	probe_tx_budget_t *b = c->budget;
+	VERIFY3U(b->open, >=, c->bytes);
+	b->open -= c->bytes;
+	b->committed += c->bytes;
+	b->pending_refs++;
 	probe_tx.pending += c->bytes;
 	tx->tx_pr19262_physical_credit = NULL;
 	mutex_exit(&probe_tx.lock);
@@ -131,11 +286,12 @@ probe_tx_drain(dsl_pool_t *dp, uint64_t txg)
 {
 	txg_wait_synced(dp, txg);
 	mutex_enter(&probe_tx.lock);
-	while (probe_tx.pending != 0) {
+	while (!list_is_empty(&probe_tx.budgets)) {
 		VERIFY3S(cv_timedwait(&probe_tx.done, &probe_tx.lock,
 		    ddi_get_lbolt() + SEC_TO_TICK(30)), !=, -1);
 	}
 	VERIFY0(probe_tx.reserved);
+	VERIFY0(probe_tx.inflight);
 	mutex_exit(&probe_tx.lock);
 }
 
@@ -223,6 +379,38 @@ pr19262_tx_probe(spa_t *spa)
 	uint64_t retry_txg = dmu_tx_get_txg(retry);
 	dmu_tx_commit(retry);
 	VERIFY3U(probe_tx_reserved(), >, held);
+	/* Native two-DVA allocation consumes budget; unalloc refunds it. */
+	uint64_t before_alloc = probe_tx_reserved();
+	blkptr_t rollback = { 0 };
+	BP_SET_LSIZE(&rollback, 4096);
+	BP_SET_PSIZE(&rollback, 4096);
+	BP_SET_TYPE(&rollback, DMU_OT_UINT64_OTHER);
+	zio_alloc_list_t trace;
+	metaslab_trace_init(&trace);
+	mutex_enter(&probe_tx.lock);
+	probe_tx.fail_second = B_TRUE;
+	mutex_exit(&probe_tx.lock);
+	VERIFY3S(metaslab_alloc(spa, spa_normal_class(spa), 4096, &rollback,
+	    2, retry_txg, NULL, 0, &trace, 0, FTAG), ==, ENOSPC);
+	mutex_enter(&probe_tx.lock);
+	probe_tx.fail_second = B_FALSE;
+	mutex_exit(&probe_tx.lock);
+	VERIFY0(BP_GET_NDVAS(&rollback));
+	VERIFY0(BP_GET_PHYSICAL_BIRTH(&rollback));
+	VERIFY3U(probe_tx_reserved(), ==, before_alloc);
+	VERIFY0(probe_tx.inflight);
+	VERIFY3U(probe_tx.unallocations, ==, 1);
+	VERIFY0(metaslab_alloc(spa, spa_normal_class(spa), 4096, &rollback,
+	    2, retry_txg, NULL, 0, &trace, 0, FTAG));
+	uint64_t physical = DVA_GET_ASIZE(&rollback.blk_dva[0]) +
+	    DVA_GET_ASIZE(&rollback.blk_dva[1]);
+	VERIFY3U(probe_tx_reserved(), ==, before_alloc - physical);
+	VERIFY3U(probe_tx.inflight, ==, physical);
+	metaslab_free(spa, &rollback, retry_txg, B_TRUE);
+	metaslab_trace_fini(&trace);
+	VERIFY3U(probe_tx_reserved(), ==, before_alloc);
+	VERIFY0(probe_tx.inflight);
+	VERIFY3U(probe_tx.unallocations, ==, 3);
 	dmu_tx_commit(fence);
 	probe_tx_drain(dp, MAX(txg, retry_txg));
 	VERIFY0(dmu_read(os, object, 0, 131072, readback,
@@ -248,11 +436,15 @@ pr19262_tx_probe(spa_t *spa)
 	VERIFY3U(probe_tx.callbacks, ==, 3);
 	VERIFY3U(probe_tx.rejected, ==, 3);
 	VERIFY3U(probe_tx.granted, ==, 4);
+	VERIFY3U(probe_tx.consumed, >, physical);
 	(void) printf("PR19262_TX_PASS held=%llu rollback=%llu "
-	    "callbacks=%llu rejected=%llu granted=%llu\n",
+	    "callbacks=%llu rejected=%llu granted=%llu "
+	    "consumed=%llu unallocations=%llu\n",
 	    (u_longlong_t)held, (u_longlong_t)probe_tx.rolled_back,
 	    (u_longlong_t)probe_tx.callbacks,
-	    (u_longlong_t)probe_tx.rejected, (u_longlong_t)probe_tx.granted);
+	    (u_longlong_t)probe_tx.rejected, (u_longlong_t)probe_tx.granted,
+	    (u_longlong_t)probe_tx.consumed,
+	    (u_longlong_t)probe_tx.unallocations);
 	mutex_enter(&probe_tx.lock);
 	probe_tx.os = NULL;
 	mutex_exit(&probe_tx.lock);
