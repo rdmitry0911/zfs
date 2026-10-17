@@ -54,6 +54,9 @@ struct dmu_tx {
 	uint64_t tx_sync_reserve;
 
 	void *tx_tempreserve_cookie;
+#ifndef _KERNEL
+	void *tx_pr19262_physical_credit;
+#endif
 	struct dmu_tx_hold *tx_needassign_txh;
 
 	/* list of dmu_tx_callback_t on this dmu_tx */

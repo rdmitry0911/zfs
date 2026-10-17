@@ -11923,6 +11923,48 @@ ztest_run_init(void)
 	}
 }
 
+#include <sys/vdev_reloc_probe.h>
+
+static int
+pr19262_tx_driver(const char *directory)
+{
+	kernel_init(SPA_MODE_READ | SPA_MODE_WRITE);
+	nvlist_t *leaves[6];
+	for (int i = 0; i < 6; i++) {
+		char *path = kmem_asprintf("%s/v%d", directory, i);
+		leaves[i] = fnvlist_alloc();
+		fnvlist_add_string(leaves[i], ZPOOL_CONFIG_TYPE,
+		    VDEV_TYPE_FILE);
+		fnvlist_add_string(leaves[i], ZPOOL_CONFIG_PATH, path);
+		kmem_strfree(path);
+	}
+	nvlist_t *top = fnvlist_alloc();
+	fnvlist_add_string(top, ZPOOL_CONFIG_TYPE, VDEV_TYPE_RAIDZ);
+	fnvlist_add_uint64(top, ZPOOL_CONFIG_NPARITY, 1);
+	fnvlist_add_uint64(top, ZPOOL_CONFIG_ASHIFT, 12);
+	VERIFY0(nvlist_add_nvlist_array(top, ZPOOL_CONFIG_CHILDREN,
+	    (const nvlist_t * const *)leaves, 6));
+	nvlist_t *root = fnvlist_alloc();
+	fnvlist_add_string(root, ZPOOL_CONFIG_TYPE, VDEV_TYPE_ROOT);
+	VERIFY0(nvlist_add_nvlist_array(root, ZPOOL_CONFIG_CHILDREN,
+	    (const nvlist_t * const *)&top, 1));
+	nvlist_t *props = fnvlist_alloc();
+	fnvlist_add_string(props, "cachefile", "none");
+	VERIFY0(spa_create("pr19262_tx", root, props, NULL, NULL, NULL));
+	spa_t *spa;
+	VERIFY0(spa_open("pr19262_tx", &spa, FTAG));
+	pr19262_tx_probe(spa);
+	spa_close(spa, FTAG);
+	VERIFY0(spa_export("pr19262_tx", NULL, B_FALSE, B_FALSE));
+	fnvlist_free(props);
+	fnvlist_free(root);
+	fnvlist_free(top);
+	for (int i = 0; i < 6; i++)
+		fnvlist_free(leaves[i]);
+	kernel_fini();
+	return (0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -11944,6 +11986,9 @@ main(int argc, char **argv)
 	(void) setvbuf(stdout, NULL, _IOLBF, 0);
 
 	dprintf_setup(&argc, argv);
+	const char *physical_probe = getenv("PR19262_TX_PROBE");
+	if (physical_probe != NULL)
+		return (pr19262_tx_driver(physical_probe));
 	zfs_deadman_synctime_ms = 300000;
 	zfs_deadman_checktime_ms = 30000;
 	/*

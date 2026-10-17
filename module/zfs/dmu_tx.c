@@ -32,6 +32,10 @@
 #include <sys/sa_impl.h>
 #include <sys/zfs_context.h>
 #include <sys/trace_zfs.h>
+#ifndef _KERNEL
+#include <sys/vdev_reloc_probe.h>
+#include "vdev_reloc_tx.c"
+#endif
 
 typedef void (*dmu_tx_hold_func_t)(dmu_tx_t *tx, struct dnode *dn,
     uint64_t arg1, uint64_t arg2);
@@ -1143,6 +1147,11 @@ dmu_tx_try_assign(dmu_tx_t *tx)
 	/* calculate memory footprint estimate */
 	uint64_t memory = towrite + tohold;
 
+#ifndef _KERNEL
+	int physical_error = probe_tx_admit(tx, asize);
+	if (physical_error != 0)
+		return (physical_error);
+#endif
 	if (tx->tx_dir != NULL && asize != 0) {
 		int err = dsl_dir_tempreserve_space(tx->tx_dir, memory,
 		    asize, tx->tx_netfree, &tx->tx_tempreserve_cookie, tx);
@@ -1160,6 +1169,9 @@ dmu_tx_try_assign(dmu_tx_t *tx)
 static void
 dmu_tx_unassign(dmu_tx_t *tx)
 {
+#ifndef _KERNEL
+	probe_tx_unreserve(tx);
+#endif
 	if (tx->tx_txg == 0)
 		return;
 
@@ -1431,6 +1443,9 @@ static void
 dmu_tx_destroy(dmu_tx_t *tx)
 {
 	dmu_tx_hold_t *txh;
+#ifndef _KERNEL
+	VERIFY3P(tx->tx_pr19262_physical_credit, ==, NULL);
+#endif
 
 	while ((txh = list_head(&tx->tx_holds)) != NULL) {
 		dnode_t *dn = txh->txh_dnode;
@@ -1480,6 +1495,9 @@ dmu_tx_commit(dmu_tx_t *tx)
 	if (tx->tx_tempreserve_cookie)
 		dsl_dir_tempreserve_clear(tx->tx_tempreserve_cookie, tx);
 
+#ifndef _KERNEL
+	probe_tx_commit(tx);
+#endif
 	if (!list_is_empty(&tx->tx_callbacks))
 		txg_register_callbacks(&tx->tx_txgh, &tx->tx_callbacks);
 
@@ -1687,6 +1705,10 @@ dmu_tx_hold_sa(dmu_tx_t *tx, sa_handle_t *hdl, boolean_t may_grow)
 void
 dmu_tx_init(void)
 {
+#ifndef _KERNEL
+	mutex_init(&probe_tx.lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&probe_tx.done, NULL, CV_DEFAULT, NULL);
+#endif
 	dmu_tx_ksp = kstat_create("zfs", 0, "dmu_tx", "misc",
 	    KSTAT_TYPE_NAMED, sizeof (dmu_tx_stats) / sizeof (kstat_named_t),
 	    KSTAT_FLAG_VIRTUAL);
@@ -1700,6 +1722,12 @@ dmu_tx_init(void)
 void
 dmu_tx_fini(void)
 {
+#ifndef _KERNEL
+	VERIFY0(probe_tx.reserved);
+	VERIFY3P(probe_tx.os, ==, NULL);
+	cv_destroy(&probe_tx.done);
+	mutex_destroy(&probe_tx.lock);
+#endif
 	if (dmu_tx_ksp != NULL) {
 		kstat_delete(dmu_tx_ksp);
 		dmu_tx_ksp = NULL;
