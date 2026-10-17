@@ -2468,6 +2468,14 @@ zil_lwb_commit(zilog_t *zilog, lwb_t *lwb, itx_t *itx)
 	lrb = (lr_t *)lr_buf;		/* Like lr, but inside lwb. */
 	lrwb = (lr_write_t *)lrb;	/* Like lrw, but inside lwb. */
 
+#ifndef _KERNEL
+	if (lr->lrc_txtype == TX_CLONE_RANGE &&
+	    pr19262_engine_persistent(zilog->zl_spa)) {
+		const lr_clone_range_t *clone = (const lr_clone_range_t *)lrb;
+		for (uint64_t i = 0; i < clone->lr_nbps; i++)
+			zil_lwb_add_block(lwb, &clone->lr_bps[i]);
+	}
+#endif
 	ZIL_STAT_BUMP(zilog, zil_itx_count);
 
 	/*

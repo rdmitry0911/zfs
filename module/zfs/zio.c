@@ -3569,6 +3569,44 @@ zio_gang_assemble(zio_t *zio)
 	return (zio);
 }
 
+#ifndef _KERNEL
+static int
+pr19262_zio_visit_gang(zio_t *zio, zio_gang_node_t *gn, const blkptr_t *bp)
+{
+	int error = zio->io_pr19262_gang_visit(zio->io_spa, bp,
+	    zio->io_pr19262_gang_visit_arg);
+	if (gn == NULL)
+		return (error);
+	for (int g = 0; error == 0 && g < gbh_nblkptrs(gn->gn_gangblocksize);
+	    g++) {
+		const blkptr_t *child = gbh_bp(gn->gn_gbh, g);
+		if (!BP_IS_HOLE(child))
+			error = pr19262_zio_visit_gang(zio,
+			    gn->gn_child[g], child);
+	}
+	return (error);
+}
+
+int
+pr19262_zio_walk_gang(spa_t *spa, const blkptr_t *bp, void *hold,
+    int (*visit)(spa_t *, const blkptr_t *, void *), void *arg)
+{
+	VERIFY(BP_IS_GANG(bp));
+	zio_t *zio = zio_create(NULL, spa, BP_GET_PHYSICAL_BIRTH(bp), bp,
+	    NULL, BP_GET_PSIZE(bp), BP_GET_PSIZE(bp), NULL, NULL,
+	    ZIO_TYPE_READ, ZIO_PRIORITY_SYNC_READ,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE | ZIO_FLAG_RAW,
+	    NULL, 0, NULL, ZIO_STAGE_OPEN,
+	    ZIO_GANG_STAGES | ZIO_INTERLOCK_PIPELINE);
+	pr19262_engine_rele(zio->io_pr19262_owner_hold);
+	zio->io_pr19262_owner_hold = pr19262_engine_hold(spa, bp,
+	    hold, B_TRUE, B_FALSE);
+	zio->io_pr19262_gang_visit = visit;
+	zio->io_pr19262_gang_visit_arg = arg;
+	return (zio_wait(zio));
+}
+#endif
+
 static zio_t *
 zio_gang_issue(zio_t *zio)
 {
@@ -3581,6 +3619,15 @@ zio_gang_issue(zio_t *zio)
 	ASSERT(BP_IS_GANG(bp) && zio->io_gang_leader == zio);
 	ASSERT(zio->io_child_type > ZIO_CHILD_GANG);
 
+#ifndef _KERNEL
+	if (zio->io_pr19262_gang_visit != NULL) {
+		if (zio->io_child_error[ZIO_CHILD_GANG] == 0)
+			zio->io_error = pr19262_zio_visit_gang(zio,
+			    zio->io_gang_tree, bp);
+		zio->io_pipeline = ZIO_INTERLOCK_PIPELINE;
+		return (zio);
+	}
+#endif
 	if (zio->io_child_error[ZIO_CHILD_GANG] == 0)
 		zio_gang_tree_issue(zio, zio->io_gang_tree, bp, zio->io_abd,
 		    0);

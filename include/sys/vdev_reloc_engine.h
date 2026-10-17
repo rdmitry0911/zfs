@@ -17,6 +17,8 @@ int pr19262_engine_metadata_flush(vdev_t *);
 void pr19262_engine_store_crash(uint64_t);
 int pr19262_engine_journal_bind(spa_t *, const blkptr_t *);
 void pr19262_engine_journal_gate(zio_t *, spa_t *, const blkptr_t *);
+int pr19262_zio_walk_gang(spa_t *, const blkptr_t *, void *,
+    int (*)(spa_t *, const blkptr_t *, void *), void *);
 int pr19262_engine_journal_claim(spa_t *, uint64_t);
 boolean_t pr19262_engine_journal_claimed(spa_t *, vdev_t *, uint64_t,
     uint64_t, uint64_t);

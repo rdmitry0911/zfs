@@ -515,6 +515,9 @@ struct zio {
 	uint64_t	io_pr19262_backing_width;
 	uint64_t	io_pr19262_backing_parity;
 	void		*io_pr19262_metadata_authority;
+	int		(*io_pr19262_gang_visit)(spa_t *,
+	    const blkptr_t *, void *);
+	void		*io_pr19262_gang_visit_arg;
 #endif
 	zio_transform_t *io_transform_stack;
 

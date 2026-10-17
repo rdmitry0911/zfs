@@ -13,8 +13,8 @@ void
 pr19262_engine_journal_fault(uint_t stage)
 {
 	mutex_enter(&engine.journal_lock);
-	engine_journal_fault_stage = stage;
-	engine_journal_fault_seq = engine.journal_seq + 1;
+	engine_journal_fault_stage = stage % 10;
+	engine_journal_fault_seq = engine.journal_seq + (stage >= 10 ? 2 : 1);
 	mutex_exit(&engine.journal_lock);
 }
 
@@ -410,17 +410,72 @@ pr19262_engine_journal_bind(spa_t *spa, const blkptr_t *bp)
 	return (error);
 }
 
+typedef struct engine_j_dep {
+	struct engine_j_dep *next;
+	engine_hold_t *hold;
+} engine_j_dep_t;
+
 typedef struct engine_j_job {
 	spa_t *spa;
 	engine_hold_t *hold;
 	zio_t *gate;
+	blkptr_t bp;
+	engine_j_dep_t *deps;
 } engine_j_job_t;
+
+static int
+engine_journal_collect(spa_t *spa, const blkptr_t *bp, void *arg)
+{
+	engine_j_job_t *job = arg;
+	if (BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp))
+		return (0);
+	engine_hold_t *h = pr19262_engine_hold(spa, bp, job->hold,
+	    B_TRUE, B_TRUE);
+	if (h == NULL)
+		return (ENOENT);
+	if (h->error != 0) {
+		int error = h->error;
+		pr19262_engine_rele(h);
+		return (error);
+	}
+	mutex_enter(&engine.lock);
+	h->write = B_TRUE;
+	for (uint_t i = 0; i < h->count; i++) {
+		h->owner[i]->queued_writers++;
+		h->owner[i]->journal_touched = B_TRUE;
+	}
+	mutex_exit(&engine.lock);
+	engine_j_dep_t *dep = kmem_alloc(sizeof (*dep), KM_SLEEP);
+	dep->hold = h;
+	dep->next = job->deps;
+	job->deps = dep;
+	return (0);
+}
 
 static void
 engine_journal_worker(void *arg)
 {
 	engine_j_job_t *job = arg;
-	job->gate->io_error = engine_journal_bind_hold(job->spa, job->hold);
+	int error = 0;
+	if (BP_IS_GANG(&job->bp))
+		error = pr19262_zio_walk_gang(job->spa, &job->bp, job->hold,
+		    engine_journal_collect, job);
+	if (error == 0)
+		error = engine_journal_bind_hold(job->spa, job->hold);
+	uint64_t dependencies = 0;
+	while (job->deps != NULL) {
+		engine_j_dep_t *dep = job->deps;
+		job->deps = dep->next;
+		if (error == 0)
+			error = engine_journal_bind_hold(job->spa, dep->hold);
+		pr19262_engine_rele(dep->hold);
+		kmem_free(dep, sizeof (*dep));
+		dependencies++;
+	}
+	if (BP_IS_GANG(&job->bp))
+		(void) printf("PR19262_J_GANG dependencies=%llu error=%d\n",
+		    (u_longlong_t)dependencies, error);
+	job->gate->io_error = error;
 	pr19262_engine_rele(job->hold);
 	zio_nowait(job->gate);
 	kmem_free(job, sizeof (*job));
@@ -433,6 +488,7 @@ pr19262_engine_journal_gate(zio_t *parent, spa_t *spa, const blkptr_t *bp)
 		return;
 	engine_j_job_t *job = kmem_zalloc(sizeof (*job), KM_SLEEP);
 	job->spa = spa;
+	job->bp = *bp;
 	job->hold = pr19262_engine_hold(spa, bp, NULL, B_FALSE, B_FALSE);
 	mutex_enter(&engine.lock);
 	if (job->hold != NULL)
