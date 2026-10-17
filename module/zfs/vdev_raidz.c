@@ -2566,6 +2566,10 @@ vdev_raidz_io_exceeds_dva(zio_t *zio, vdev_raidz_layout_t layout,
 		uint64_t asize = DVA_GET_GANG(dva) ?
 		    vdev_gang_header_asize(tvd, BP_GET_PHYSICAL_BIRTH(bp)) :
 		    DVA_GET_ASIZE(dva);
+#ifndef _KERNEL
+		if (zio->io_pr19262_owner_mapped)
+			asize = DVA_GET_ASIZE(dva);
+#endif
 		/*
 		 * A second DVA at the same top vdev and offset can only
 		 * occur in an already-malformed BP; keep the smallest owned
@@ -2775,6 +2779,13 @@ vdev_raidz_io_verify(zio_t *zio, raidz_map_t *rm, raidz_row_t *rr, int col)
 	logical_rs.rs_end = logical_rs.rs_start +
 	    vdev_raidz_psize_to_asize(zio->io_vd, rr->rr_size,
 	    pr19262_probe_actual_birth(zio));
+#ifndef _KERNEL
+	if (zio->io_pr19262_owner_mapped)
+		logical_rs.rs_end = logical_rs.rs_start +
+		    vdev_raidz_psize_to_asize_width(zio->io_vd, rr->rr_size,
+		    zio->io_pr19262_backing_width,
+		    zio->io_pr19262_backing_parity);
+#endif
 
 	raidz_col_t *rc = &rr->rr_col[col];
 	vdev_t *cvd = zio->io_vd->vdev_child[rc->rc_devidx];
@@ -3088,6 +3099,12 @@ vdev_raidz_io_start(zio_t *zio)
 	}
 #endif
 	vdev_raidz_layout_t layout = vdev_raidz_layout_for_bp(vdrz, layout_bp);
+#ifndef _KERNEL
+	if (zio->io_pr19262_owner_mapped) {
+		layout.vrl_width = zio->io_pr19262_backing_width;
+		layout.vrl_nparity = zio->io_pr19262_backing_parity;
+	}
+#endif
 	if (zfs_flags & ZFS_DEBUG_RAIDZ_RECONSTRUCT)
 		zfs_dbgmsg("io_start: vrl_width=%llu phys=%d "
 		    "off=%llu type=%d", (u_longlong_t)layout.vrl_width,

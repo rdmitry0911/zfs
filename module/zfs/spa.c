@@ -63,6 +63,9 @@
 #include <sys/metaslab_impl.h>
 #include <sys/mmp.h>
 #include <sys/uberblock_impl.h>
+#ifndef _KERNEL
+#include <sys/vdev_reloc_engine.h>
+#endif
 #include <sys/txg.h>
 #include <sys/avl.h>
 #include <sys/bpobj.h>
@@ -2469,6 +2472,9 @@ spa_unload(spa_t *spa)
 
 	spa->spa_raidz_expand = NULL;
 	spa->spa_checkpoint_txg = 0;
+#ifndef _KERNEL
+	pr19262_engine_store_unload(spa);
+#endif
 
 	spa_config_exit(spa, SCL_ALL, spa);
 }
@@ -5009,6 +5015,12 @@ spa_ld_select_uberblock(spa_t *spa, spa_import_type_t type)
 		for (nvpair_t *nvp = nvlist_next_nvpair(spa->spa_label_features,
 		    NULL); nvp != NULL;
 		    nvp = nvlist_next_nvpair(spa->spa_label_features, nvp)) {
+#ifndef _KERNEL
+			if (pr19262_engine_store_ub(ub) &&
+			    strcmp(nvpair_name(nvp),
+			    PR19262_ENGINE_LABEL_FEATURE) == 0)
+				continue;
+#endif
 			if (!zfeature_is_supported(nvpair_name(nvp))) {
 				fnvlist_add_string(unsup_feat,
 				    nvpair_name(nvp), "");
@@ -5215,6 +5227,9 @@ spa_ld_trusted_config(spa_t *spa, spa_import_type_t type,
 	vdev_free(rvd);
 	spa->spa_root_vdev = mrvd;
 	rvd = mrvd;
+#ifndef _KERNEL
+	pr19262_engine_store_rebind(spa);
+#endif
 	spa_config_exit(spa, SCL_ALL, FTAG);
 
 	/*
@@ -6078,6 +6093,11 @@ spa_ld_mos_init(spa_t *spa, spa_import_type_t type,
 	 * blkptr. This blkptr points to the latest version of the MOS and will
 	 * allow us to read its contents.
 	 */
+#ifndef _KERNEL
+	error = pr19262_engine_store_load(spa, &spa->spa_uberblock);
+	if (error != 0)
+		return (error);
+#endif
 	error = spa_ld_open_rootbp(spa);
 	if (error != 0)
 		return (error);

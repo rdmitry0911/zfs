@@ -1402,6 +1402,16 @@ zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 }
 
 #ifndef _KERNEL
+int
+pr19262_engine_metadata_flush(vdev_t *vd)
+{
+	zio_t *zio = zio_create(NULL, vd->vdev_spa, 0, NULL, NULL, 0, 0,
+	    NULL, NULL, ZIO_TYPE_FLUSH, ZIO_PRIORITY_NOW,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY, vd, 0, NULL,
+	    ZIO_STAGE_OPEN, ZIO_FLUSH_PIPELINE);
+	return (zio_wait(zio));
+}
+
 zio_t *
 pr19262_engine_physical_io(spa_t *spa, blkptr_t *bp, vdev_t *vd,
     uint64_t v, abd_t *data, uint64_t size, zio_type_t type,

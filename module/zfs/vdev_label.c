@@ -138,6 +138,9 @@
 #include <sys/vdev_raidz.h>
 #include <sys/vdev_draid.h>
 #include <sys/uberblock_impl.h>
+#ifndef _KERNEL
+#include <sys/vdev_reloc_engine.h>
+#endif
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
 #include <sys/zio.h>
@@ -2230,8 +2233,12 @@ retry:
 		boolean_t changed = uberblock_update(ub, spa->spa_root_vdev,
 		    txg, spa->spa_mmp.mmp_delay);
 
+		boolean_t mapped = B_FALSE;
+#ifndef _KERNEL
+		mapped = pr19262_engine_store_dirty(spa);
+#endif
 		if (!changed && list_is_empty(&spa->spa_config_dirty_list) &&
-		    !spa_multihost(spa))
+		    !spa_multihost(spa) && !mapped)
 			return (0);
 	}
 
@@ -2288,6 +2295,10 @@ retry:
 	 *	been successfully committed) will be valid with respect
 	 *	to the new uberblocks.
 	 */
+#ifndef _KERNEL
+	if ((error = pr19262_engine_store_sync(spa, ub)) != 0)
+		goto retry;
+#endif
 	if ((error = vdev_uberblock_sync_list(spa, svd, svdcount, ub,
 	    flags)) != 0) {
 		if ((flags & ZIO_FLAG_IO_RETRY) != 0) {

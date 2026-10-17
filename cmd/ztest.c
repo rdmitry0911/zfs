@@ -12321,8 +12321,106 @@ pr19262_runtime_test(spa_t *spa)
 }
 
 static int
+pr19262_engine_cold_import(const char *directory, boolean_t write,
+    boolean_t crash)
+{
+	char *cache;
+	VERIFY3S(asprintf(&cache, "%s/private-cache", directory), >, 0);
+	spa_config_path = cache;
+	kernel_init(write ? SPA_MODE_READ | SPA_MODE_WRITE : SPA_MODE_READ);
+	char *paths[] = { (char *)directory };
+	importargs_t args = { .paths = 1, .path = paths,
+	    .can_be_active = B_TRUE };
+	libpc_handle_t handle = { .lpc_ops = &libzpool_config_ops,
+	    .lpc_printerr = B_TRUE };
+	char pool[] = "pr19262_tx";
+	nvlist_t *props = fnvlist_alloc();
+	fnvlist_add_string(props, "cachefile", "none");
+	nvlist_t *config = NULL;
+	int error = zpool_find_config(&handle, pool, &config, &args);
+	if (error == 0)
+		error = spa_import(pool, config, props,
+		    ZFS_IMPORT_MISSING_LOG | ZFS_IMPORT_SKIP_MMP);
+	fnvlist_free(config);
+	fnvlist_free(props);
+	if (error != 0) {
+		(void) printf("PR19262_STORE_IMPORT_ERROR %d\n", error);
+		kernel_fini();
+		return (1);
+	}
+	spa_t *spa;
+	VERIFY0(spa_open("pr19262_tx", &spa, FTAG));
+	VERIFY(pr19262_engine_persistent(spa));
+	void *data = kmem_alloc(131072, KM_SLEEP);
+	void *readback = kmem_alloc(131072, KM_SLEEP);
+	for (uint64_t i = 0; i < 131072 / sizeof (uint64_t); i++)
+		((uint64_t *)data)[i] = i * 0x9e3779b97f4a7c15ULL;
+	uint_t new_objects = 0;
+	int read_flags = DMU_READ_NO_PREFETCH;
+	for (uint_t root = 0; root < 2; root++) {
+		objset_t *os;
+		VERIFY0(dmu_objset_own(root == 0 ?
+		    "pr19262_tx/engine@retained" : "pr19262_tx/clone",
+		    DMU_OST_OTHER, root == 0 || !write, B_TRUE, FTAG, &os));
+		uint64_t object = 0;
+		uint_t found = 0;
+		while (dmu_object_next(os, &object, B_FALSE, 0) == 0) {
+			dmu_object_info_t info;
+			VERIFY0(dmu_object_info(os, object, &info));
+			if (info.doi_type != DMU_OT_UINT64_OTHER)
+				continue;
+			if (info.doi_data_block_size == 131072) {
+				for (uint64_t i = 0; i < 8; i++) {
+					VERIFY0(dmu_read(os, object, i * 131072,
+					    131072, readback, read_flags));
+					VERIFY0(memcmp(readback, data, 131072));
+				}
+				found++;
+			} else if (info.doi_data_block_size == 16384) {
+				VERIFY0(dmu_read(os, object, 0, 16384,
+				    readback, DMU_READ_NO_PREFETCH));
+				for (uint64_t i = 0; i < 16384; i++)
+					VERIFY3U(((uint8_t *)readback)[i],
+					    ==, 0x7c);
+				new_objects++;
+			}
+		}
+		VERIFY3U(found, ==, 1);
+		if (root == 1 && write) {
+			dmu_tx_t *tx = dmu_tx_create(os);
+			dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+			dmu_tx_hold_write(tx, DMU_NEW_OBJECT, 0, 16384);
+			VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+			uint64_t id = dmu_object_alloc(os,
+			    DMU_OT_UINT64_OTHER, 16384, DMU_OT_NONE, 0, tx);
+			memset(readback, 0x7c, 16384);
+			dmu_write(os, id, 0, 16384, readback, tx, 0);
+			if (crash)
+				pr19262_engine_store_crash(dmu_tx_get_txg(tx));
+			dmu_tx_commit(tx);
+			txg_wait_synced(spa->spa_dsl_pool, 0);
+			VERIFY0(dmu_read(os, id, 0, 16384, readback,
+			    DMU_READ_NO_PREFETCH));
+		}
+		dmu_objset_disown(os, B_TRUE, FTAG);
+	}
+	pr19262_engine_check(spa, "cold-import");
+	(void) printf("PR19262_STORE_COLD_PASS write=%u new_objects=%u "
+	    "txg=%llu\n", write, new_objects,
+	    (u_longlong_t)spa_last_synced_txg(spa));
+	kmem_free(data, 131072);
+	kmem_free(readback, 131072);
+	spa_close(spa, FTAG);
+	kernel_fini();
+	return (0);
+}
+
+static int
 pr19262_tx_driver(const char *directory)
 {
+	char *cache;
+	VERIFY3S(asprintf(&cache, "%s/private-cache", directory), >, 0);
+	spa_config_path = cache;
 	kernel_init(SPA_MODE_READ | SPA_MODE_WRITE);
 	nvlist_t *leaves[6];
 	for (int i = 0; i < 6; i++) {
@@ -12352,9 +12450,11 @@ pr19262_tx_driver(const char *directory)
 	VERIFY0(spa_open("pr19262_tx", &spa, FTAG));
 	if (getenv("PR19262_RUNTIME_ENGINE") != NULL) {
 		pr19262_engine_start(spa);
+		if (getenv("PR19262_ENGINE_DURABLE") != NULL)
+			pr19262_engine_store_enable(spa);
 		pr19262_runtime_test(spa);
 		(void) fflush(NULL);
-		/* No old importer can read this RAM-only translated image. */
+		/* Persistent images need the private importer. */
 		_exit(0);
 	}
 	pr19262_tx_probe(spa);
@@ -12372,6 +12472,11 @@ pr19262_tx_driver(const char *directory)
 int
 main(int argc, char **argv)
 {
+	const char *cold = getenv("PR19262_ENGINE_COLD");
+	if (cold != NULL)
+		return (pr19262_engine_cold_import(cold,
+		    getenv("PR19262_ENGINE_COLD_WRITE") != NULL,
+		    getenv("PR19262_ENGINE_COLD_CRASH") != NULL));
 	int kills = 0;
 	int iters = 0;
 	int older = 0;

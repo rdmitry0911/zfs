@@ -3,9 +3,12 @@
  * Private normal writable-SPA V/P ownership engine, included by metaslab.c.
  * All new allocations, including MOS/ditto, are bound automatically. Native
  * V metadata remains allocated on final free; no supplied floor permits reuse.
- * State is RAM only. This is NOT an importable on-disk feature/converter.
+ * The default backend is RAM-only. The optional private store pairs catalog
+ * checkpoints with native uberblocks; it is not a supported disk feature.
  */
 #include <sys/vdev_reloc_engine.h>
+#include <sys/vdev_raidz.h>
+#include <sys/zio_checksum.h>
 
 typedef struct engine_owner engine_owner_t;
 
@@ -15,6 +18,8 @@ typedef struct engine_version {
 	uint64_t p;
 	uint64_t size;
 	uint64_t birth;
+	uint64_t width;
+	uint64_t parity;
 	uint64_t leases;
 	uint64_t writers;
 	boolean_t ready;
@@ -85,6 +90,12 @@ static struct {
 	uint64_t deferred;
 	engine_pending_t *parked;
 	boolean_t park_next;
+	boolean_t persistent;
+	uint64_t arena;
+	uint64_t arena_bytes;
+	uint8_t *bitmap;
+	uint64_t revision;
+	uint64_t stored_revision;
 } engine;
 
 static engine_version_t *
@@ -96,9 +107,11 @@ engine_version_new(engine_owner_t *e, uint64_t p, uint64_t size,
 	b->p = p;
 	b->size = size;
 	b->birth = birth;
+	vdev_raidz_layout_for_birth(engine.vd, birth, &b->width, &b->parity);
 	b->ready = ready;
 	b->next = e->versions;
 	e->versions = b;
+	engine.revision++;
 	return (b);
 }
 
@@ -375,6 +388,7 @@ pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size)
 			VERIFY3U(e->size, ==, size);
 			VERIFY(!e->retired);
 			e->aborted = B_TRUE;
+			engine.revision++;
 			engine.aborts++;
 			engine_abort_done(e);
 		}
@@ -405,6 +419,7 @@ pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
 	VERIFY3U(e->size, ==, size);
 	VERIFY(!e->retired && !e->aborted);
 	e->retired = B_TRUE;
+	engine.revision++;
 	e->retired_at = ++engine.sequence;
 	engine.retired += e->current->size;
 	/* No fake floor: neither authoritative V nor P becomes free. */
@@ -555,13 +570,22 @@ pr19262_engine_dispatch(zio_t *zio)
 		return (ENOTSUP);
 	}
 	if (zio->io_flags & ZIO_FLAG_PHYSICAL) {
+		uint64_t low = VDEV_LABEL_START_SIZE +
+		    engine.arena / engine.vd->vdev_children;
+		boolean_t metadata = engine.persistent &&
+		    zio->io_pr19262_metadata_authority == &engine &&
+		    zio->io_vd->vdev_parent == engine.vd &&
+		    zio->io_offset >= low &&
+		    zio->io_offset - low <= engine.arena_bytes &&
+		    zio->io_size <= engine.arena_bytes -
+		    (zio->io_offset - low);
 		/* Labels/probes are outside the data area. */
 		boolean_t unsafe = zio->io_type == ZIO_TYPE_WRITE &&
 		    zio->io_vd->vdev_ops->vdev_op_leaf &&
 		    zio->io_offset >= VDEV_LABEL_START_SIZE &&
 		    zio->io_offset < zio->io_vd->vdev_psize -
 		    VDEV_LABEL_END_SIZE &&
-		    zio->io_pr19262_owner_hold == NULL;
+		    zio->io_pr19262_owner_hold == NULL && !metadata;
 		mutex_exit(&engine.lock);
 		return (unsafe ? ENOTSUP : 0);
 	}
@@ -619,8 +643,11 @@ pr19262_engine_dispatch(zio_t *zio)
 		zio->io_pr19262_owner_version = b;
 	}
 	VERIFY3P(b->owner, ==, e);
-	uint64_t required = vdev_psize_to_asize_txg(engine.vd,
-	    zio->io_size, b->birth);
+	uint64_t sectors = howmany(zio->io_size,
+	    1ULL << engine.vd->vdev_ashift);
+	uint64_t required = roundup(sectors + b->parity *
+	    howmany(sectors, b->width - b->parity), b->parity + 1) <<
+	    engine.vd->vdev_ashift;
 	VERIFY3U(required, <=, b->size);
 	/* Keep the original V-BP for checksum/crypto/gang verification. */
 	blkptr_t *physical = &zio->io_pr19262_owner_bp;
@@ -647,6 +674,8 @@ pr19262_engine_dispatch(zio_t *zio)
 	zio->io_pr19262_owner_v = v;
 	zio->io_offset = b->p;
 	zio->io_pr19262_backing_birth = b->birth;
+	zio->io_pr19262_backing_width = b->width;
+	zio->io_pr19262_backing_parity = b->parity;
 	/* Operation TXG is never replaced by an encoding/backing birth. */
 	engine.translated++;
 	engine.legacy_reads += e->v == b->p;
@@ -788,12 +817,14 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 		c->source->retired = B_TRUE;
 		engine.retired += c->source->size;
 		engine.copied++;
+		engine.revision++;
 	} else {
 		VERIFY3P(e->versions, ==, c->stage);
 		e->versions = c->stage->next;
 		zfs_range_tree_add(engine.free, c->stage->p, c->stage->size);
 		kmem_free(c->stage, sizeof (*c->stage));
 		engine.copy_aborts++;
+		engine.revision++;
 	}
 	VERIFY3U(c->source->leases, >, 0);
 	c->source->leases--;
@@ -838,7 +869,11 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 		different += e->v != e->current->p;
 	}
 	VERIFY3U(owned + zfs_range_tree_space(engine.free) +
-	    zfs_range_tree_space(engine.legacy), ==, engine.total);
+	    zfs_range_tree_space(engine.legacy) + engine.arena_bytes *
+	    engine.vd->vdev_children, ==, engine.total);
+	if (engine.arena_bytes != 0)
+		zfs_range_tree_add(seen, engine.arena,
+		    engine.arena_bytes * engine.vd->vdev_children);
 	zfs_range_tree_walk(engine.free, zfs_range_tree_add, seen);
 	zfs_range_tree_walk(engine.legacy, zfs_range_tree_add, seen);
 	VERIFY3U(zfs_range_tree_space(seen), ==, engine.total);
@@ -860,9 +895,24 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 	mutex_exit(&engine.lock);
 	/* Independent native V allocation checks, outside the catalog lock. */
 	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
-	for (uint64_t i = 0; i < n; i++)
-		VERIFY3S(metaslab_claim_impl(engine.vd, virtual[i].rs_start,
-		    virtual[i].rs_end - virtual[i].rs_start, 0), ==, ENOENT);
+	for (uint64_t i = 0; i < n; i++) {
+		int claim = metaslab_claim_impl(engine.vd, virtual[i].rs_start,
+		    virtual[i].rs_end - virtual[i].rs_start, 0);
+		if (claim != ENOENT) {
+			mutex_enter(&engine.lock);
+			engine_owner_t *e = engine_find(virtual[i].rs_start);
+			(void) fprintf(stderr, "PR19262_V_CLAIM v=%llu "
+			    "size=%llu allocation=%llu retired=%u result=%d "
+			    "ub=%llu\n", (u_longlong_t)e->v,
+			    (u_longlong_t)e->size,
+			    (u_longlong_t)e->allocation_txg, e->retired, claim,
+			    (u_longlong_t)spa_last_synced_txg(spa));
+			mutex_exit(&engine.lock);
+		}
+		VERIFY3S(claim, ==, ENOENT);
+	}
 	spa_config_exit(spa, SCL_ALL, FTAG);
 	kmem_free(virtual, count * sizeof (*virtual));
 }
+
+#include "vdev_reloc_store.c"

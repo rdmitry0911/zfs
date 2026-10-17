@@ -2,7 +2,19 @@
 #ifndef _VDEV_RELOC_ENGINE_H
 #define	_VDEV_RELOC_ENGINE_H
 #ifndef _KERNEL
-/* Private normal-path runtime engine. No persistent representation. */
+#include <sys/uberblock.h>
+/* Private userspace experiment; no supported persistent/public ABI. */
+#define	PR19262_ENGINE_LABEL_FEATURE "org.openzfs:pr19262_private_vp"
+boolean_t pr19262_engine_persistent(spa_t *);
+boolean_t pr19262_engine_store_dirty(spa_t *);
+void pr19262_engine_store_enable(spa_t *);
+int pr19262_engine_store_sync(spa_t *, uberblock_t *);
+int pr19262_engine_store_load(spa_t *, const uberblock_t *);
+void pr19262_engine_store_rebind(spa_t *);
+void pr19262_engine_store_unload(spa_t *);
+boolean_t pr19262_engine_store_ub(const uberblock_t *);
+int pr19262_engine_metadata_flush(vdev_t *);
+void pr19262_engine_store_crash(uint64_t);
 void pr19262_engine_init(void);
 void pr19262_engine_fini(void);
 void pr19262_engine_start(spa_t *);
