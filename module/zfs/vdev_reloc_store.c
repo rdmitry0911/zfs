@@ -155,6 +155,9 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 	uint64_t journal[] = { engine.journal_arena, engine.journal_bytes,
 	    engine.journal_epoch[0], engine.journal_epoch[1] };
 	fnvlist_add_uint64_array(nv, "journal", journal, 4);
+	fnvlist_add_uint64_array(nv, "checkpoint",
+	    (uint64_t *)&engine.checkpoint,
+	    sizeof (engine.checkpoint) / sizeof (uint64_t));
 	uint64_t state[] = { engine.sequence, engine.next_incarnation,
 	    engine.retired_limit };
 	fnvlist_add_uint64_array(nv, "state", state, 3);
@@ -169,7 +172,8 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 			continue;
 		nvlist_t *row = rows[n++] = fnvlist_alloc();
 		uint64_t identity[] = { e->v, e->size, e->allocation_txg,
-		    e->incarnation, e->created, e->retired_at, e->retired,
+		    e->incarnation, e->created, e->retired_at,
+		    e->retired ? 1 : (e->checkpoint_only ? 2 : 0),
 		    e->catalog_txg };
 		fnvlist_add_uint64_array(row, "V", identity, 8);
 		uint_t count = 1;
@@ -263,7 +267,7 @@ pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
 	uint64_t desc[16] = { ENGINE_STORE_MAGIC, engine.vd->vdev_guid,
 	    engine.arena, engine.arena_bytes, first, pages, ub->ub_txg,
 	    size, 0, 0, 0, 0, engine.vd->vdev_ashift,
-	    engine.vd->vdev_children, engine.total, 2 };
+	    engine.vd->vdev_children, engine.total, 3 };
 	zio_cksum_t hash;
 	abd_checksum_sha256(abd, pages * ENGINE_STORE_PAGE, NULL, &hash);
 	memcpy(&desc[8], &hash, sizeof (hash));
@@ -337,6 +341,7 @@ engine_store_clear(void)
 	engine.journal_error = 0;
 	engine.journal_ready = engine.journal_formatted = B_FALSE;
 	engine.journal_repair = B_FALSE;
+	memset(&engine.checkpoint, 0, sizeof (engine.checkpoint));
 }
 
 void
@@ -394,7 +399,8 @@ static int
 engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 {
 	uint64_t txg, pool, top, *mos, *g, *state, *legacy, *journal;
-	uint_t nm, ng, ns, nl, nr, nb, nj;
+	uint64_t *checkpoint;
+	uint_t nm, ng, ns, nl, nr, nb, nj, nc;
 	uchar_t *bitmap;
 	nvlist_t **rows;
 	if (nvlist_lookup_uint64(nv, "txg", &txg) != 0 ||
@@ -414,7 +420,17 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	    engine.total - journal[0] ||
 	    journal[0] % (engine.vd->vdev_children * ENGINE_STORE_PAGE) != 0)
 		return (EINVAL);
-	if (txg != ub->ub_txg || pool != spa_guid(spa) ||
+	if (nvlist_lookup_uint64_array(nv, "checkpoint", &checkpoint,
+	    &nc) != 0 ||
+	    nc != sizeof (engine.checkpoint) / sizeof (uint64_t))
+		return (EINVAL);
+	memcpy(&engine.checkpoint, checkpoint, sizeof (engine.checkpoint));
+	if (engine.checkpoint.ub_txg != 0 &&
+	    (engine.checkpoint.ub_checkpoint_txg != engine.checkpoint.ub_txg ||
+	    engine.checkpoint.ub_txg > ub->ub_txg ||
+	    !pr19262_engine_store_ub(&engine.checkpoint)))
+		return (EINVAL);
+	if (txg != ub->ub_pr19262[6] || pool != spa_guid(spa) ||
 	    top != engine.vd->vdev_guid || nm != 16 || ng != 6 || ns != 3 ||
 	    memcmp(mos, &ub->ub_rootbp, sizeof (blkptr_t)) != 0 ||
 	    g[0] != engine.total || g[1] != engine.vd->vdev_ms_shift ||
@@ -456,7 +472,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		uint_t nv, np;
 		if (nvlist_lookup_uint64_array(rows[i], "V", &v, &nv) != 0 ||
 		    nvlist_lookup_uint64_array(rows[i], "P", &p, &np) != 0 ||
-		    nv != 8 || np == 0 || np % 8 != 0 || v[6] > 1 ||
+		    nv != 8 || np == 0 || np % 8 != 0 || v[6] > 2 ||
 		    v[0] >= engine.total || v[1] == 0 ||
 		    v[1] > engine.total - v[0] || engine_find(v[0]) != NULL ||
 		    v[7] > txg || v[3] > engine.next_incarnation)
@@ -465,7 +481,8 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		e->v = v[0]; e->size = v[1]; e->allocation_txg = v[2];
 		e->incarnation = v[3]; e->created = v[4];
 		e->catalog_txg = v[7];
-		e->retired_at = v[5]; e->retired = v[6];
+		e->retired_at = v[5]; e->retired = v[6] == 1;
+		e->checkpoint_only = v[6] == 2;
 		avl_add(&engine.owners, e);
 		for (uint_t j = 0; j < np; j += 8) {
 			if (!engine_store_extent(p[j], p[j + 1]) ||
@@ -506,7 +523,10 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	if (vd->vdev_ops != &vdev_raidz_ops || d[1] != vd->vdev_guid ||
 	    d[3] != ENGINE_STORE_BYTES || d[12] != 12 ||
 	    d[13] != vd->vdev_children || d[14] != vd->vdev_asize ||
-	    d[6] != ub->ub_txg || d[15] != 2 || d[5] == 0 ||
+	    d[6] > ub->ub_txg ||
+	    (d[6] != ub->ub_txg && (ub->ub_checkpoint_txg == 0 ||
+	    d[6] > ub->ub_checkpoint_txg)) ||
+	    d[15] != 3 || d[5] == 0 ||
 	    d[4] >= ENGINE_STORE_PAGES || d[5] > ENGINE_STORE_PAGES - d[4] ||
 	    d[7] == 0 || d[7] > d[5] * ENGINE_STORE_PAGE ||
 	    d[2] >= vd->vdev_asize ||

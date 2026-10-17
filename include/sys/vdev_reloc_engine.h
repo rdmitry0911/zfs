@@ -12,6 +12,10 @@ int pr19262_engine_store_sync(spa_t *, uberblock_t *);
 int pr19262_engine_store_load(spa_t *, const uberblock_t *);
 void pr19262_engine_store_rebind(spa_t *);
 void pr19262_engine_store_unload(spa_t *);
+void pr19262_engine_checkpoint(spa_t *, const uberblock_t *);
+int pr19262_engine_checkpoint_validate(spa_t *, const uberblock_t *);
+int pr19262_engine_checkpoint_discard(vdev_t *, uint64_t, uint64_t,
+    boolean_t *);
 boolean_t pr19262_engine_store_ub(const uberblock_t *);
 int pr19262_engine_metadata_flush(vdev_t *);
 void pr19262_engine_store_crash(uint64_t);

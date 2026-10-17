@@ -6008,12 +6008,20 @@ spa_ld_read_checkpoint_txg(spa_t *spa)
 	    DMU_POOL_ZPOOL_CHECKPOINT, sizeof (uint64_t),
 	    sizeof (uberblock_t) / sizeof (uint64_t), &checkpoint);
 
-	if (error == ENOENT)
+	if (error == ENOENT) {
+#ifndef _KERNEL
+		return (pr19262_engine_checkpoint_validate(spa, NULL));
+#else
 		return (0);
-
+#endif
+	}
 	if (error != 0)
 		return (error);
-
+#ifndef _KERNEL
+	error = pr19262_engine_checkpoint_validate(spa, &checkpoint);
+	if (error != 0)
+		return (error);
+#endif
 	ASSERT3U(checkpoint.ub_txg, !=, 0);
 	ASSERT3U(checkpoint.ub_checkpoint_txg, !=, 0);
 	ASSERT3U(checkpoint.ub_timestamp, !=, 0);
@@ -6139,6 +6147,12 @@ spa_ld_checkpoint_rewind(spa_t *spa)
 
 	ASSERT3U(checkpoint.ub_txg, <, spa->spa_uberblock.ub_txg);
 	ASSERT3U(checkpoint.ub_txg, ==, checkpoint.ub_checkpoint_txg);
+
+#ifndef _KERNEL
+	/* A new timeline/catalog pair needs its durable fence first. */
+	if (pr19262_engine_store_ub(&checkpoint) && spa_writeable(spa))
+		return (SET_ERROR(ENOTSUP));
+#endif
 
 	/*
 	 * We need to update the txg and timestamp of the checkpointed

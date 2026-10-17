@@ -44,6 +44,7 @@ typedef struct engine_owner {
 	uint64_t queued_writers;
 	boolean_t journal_pending;
 	boolean_t journal_touched;
+	boolean_t checkpoint_only;
 	engine_version_t *versions;
 	engine_version_t *current;
 	engine_pending_t *pending;
@@ -115,6 +116,7 @@ static struct {
 	boolean_t journal_ready;
 	boolean_t journal_repair;
 	int journal_error;
+	uberblock_t checkpoint;
 } engine;
 
 static engine_version_t *
@@ -427,7 +429,7 @@ pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
 {
 	boolean_t handled = B_FALSE;
 	mutex_enter(&engine.lock);
-	if (engine.spa != vd->vdev_spa || engine.spa == NULL || checkpoint)
+	if (engine.spa != vd->vdev_spa || engine.spa == NULL)
 		goto out;
 	VERIFY3P(vd, ==, engine.vd);
 	engine_owner_t *e = engine_find(v);
@@ -443,6 +445,12 @@ pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
 	}
 	VERIFY3U(e->size, ==, size);
 	VERIFY(!e->retired && !e->aborted);
+	if (checkpoint) {
+		e->checkpoint_only = B_TRUE;
+		engine.revision++;
+		/* Keep native checkpoint space-map accounting. */
+		goto out;
+	}
 	e->retired = B_TRUE;
 	engine.revision++;
 	e->retired_at = ++engine.sequence;
@@ -452,6 +460,88 @@ pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
 out:
 	mutex_exit(&engine.lock);
 	return (handled);
+}
+
+void
+pr19262_engine_checkpoint(spa_t *spa, const uberblock_t *checkpoint)
+{
+	mutex_enter(&engine.lock);
+	if (engine.spa == spa && engine.persistent) {
+		if (checkpoint != NULL)
+			engine.checkpoint = *checkpoint;
+		else
+			memset(&engine.checkpoint, 0,
+			    sizeof (engine.checkpoint));
+		engine.revision++;
+	}
+	mutex_exit(&engine.lock);
+}
+
+static engine_owner_t *
+engine_checkpoint_owner(uint64_t v)
+{
+	engine_owner_t key = { .v = v };
+	avl_index_t where;
+	engine_owner_t *e = avl_find(&engine.owners, &key, &where);
+	if (e == NULL)
+		e = avl_nearest(&engine.owners, where, AVL_BEFORE);
+	if (e == NULL || v < e->v || v - e->v >= e->size)
+		return (NULL);
+	return (e);
+}
+
+int
+pr19262_engine_checkpoint_validate(spa_t *spa, const uberblock_t *checkpoint)
+{
+	uberblock_t absent = { 0 };
+	const uberblock_t *expected = checkpoint != NULL ? checkpoint : &absent;
+	mutex_enter(&engine.lock);
+	int error = 0;
+	if (engine.spa == spa && engine.persistent &&
+	    memcmp(&engine.checkpoint, expected,
+	    sizeof (engine.checkpoint)) != 0)
+		error = EINVAL;
+	mutex_exit(&engine.lock);
+	return (error);
+}
+
+int
+pr19262_engine_checkpoint_discard(vdev_t *vd, uint64_t v, uint64_t size,
+    boolean_t *handled)
+{
+	*handled = B_FALSE;
+	mutex_enter(&engine.lock);
+	if (engine.spa == NULL || engine.spa != vd->vdev_spa)
+		goto out;
+	if (vd != engine.vd || v >= engine.total ||
+	    size == 0 || size > engine.total - v) {
+		mutex_exit(&engine.lock);
+		return (EINVAL);
+	}
+	/* SM runs can merge allocations or split one allocation into runs. */
+	for (uint64_t cursor = v; cursor < v + size; ) {
+		engine_owner_t *e = engine_checkpoint_owner(cursor);
+		if (e == NULL || (!e->checkpoint_only && !e->retired)) {
+			mutex_exit(&engine.lock);
+			return (EINVAL);
+		}
+		cursor = MIN(v + size, e->v + e->size);
+	}
+	for (uint64_t cursor = v; cursor < v + size; ) {
+		engine_owner_t *e = engine_checkpoint_owner(cursor);
+		if (!e->retired) {
+			e->checkpoint_only = B_FALSE;
+			e->retired = B_TRUE;
+			e->retired_at = ++engine.sequence;
+			engine.retired += e->current->size;
+			engine.revision++;
+		}
+		cursor = MIN(v + size, e->v + e->size);
+	}
+	*handled = B_TRUE;
+out:
+	mutex_exit(&engine.lock);
+	return (0);
 }
 
 void *
@@ -887,7 +977,7 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 	mutex_enter(&engine.lock);
 	VERIFY3P(spa, ==, engine.spa);
 	uint64_t owned = 0, holds = 0, different = 0, leases = 0;
-	uint64_t versions = 0;
+	uint64_t versions = 0, checkpoint_only = 0;
 	uint64_t count = avl_numnodes(&engine.owners);
 	zfs_range_seg64_t *virtual = kmem_alloc(count * sizeof (*virtual),
 	    KM_SLEEP);
@@ -910,6 +1000,7 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 		pending[n] = e->journal_pending;
 		virtual[n++] = (zfs_range_seg64_t) { e->v, e->v + e->size };
 		holds += e->holds;
+		checkpoint_only += e->checkpoint_only;
 		different += e->v != e->current->p;
 	}
 	VERIFY3U(owned + zfs_range_tree_space(engine.free) +
@@ -930,7 +1021,8 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 	(void) printf("PR19262_ENGINE %s owners=%llu different=%llu "
 	    "owned=%llu free=%llu retired=%llu holds=%llu pairs=%llu "
 	    "aborts=%llu io=%llu metadata=%llu legacy=%llu versions=%llu "
-	    "leases=%llu copied=%llu copy_aborts=%llu deferred=%llu\n", phase,
+	    "leases=%llu copied=%llu copy_aborts=%llu deferred=%llu "
+	    "checkpoint=%llu cp_catalog=%llu checkpoint_only=%llu\n", phase,
 	    (u_longlong_t)avl_numnodes(&engine.owners),
 	    (u_longlong_t)different, (u_longlong_t)owned,
 	    (u_longlong_t)zfs_range_tree_space(engine.free),
@@ -939,7 +1031,10 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 	    (u_longlong_t)engine.translated, (u_longlong_t)engine.metadata,
 	    (u_longlong_t)engine.legacy_reads, (u_longlong_t)versions,
 	    (u_longlong_t)leases, (u_longlong_t)engine.copied,
-	    (u_longlong_t)engine.copy_aborts, (u_longlong_t)engine.deferred);
+	    (u_longlong_t)engine.copy_aborts, (u_longlong_t)engine.deferred,
+	    (u_longlong_t)engine.checkpoint.ub_txg,
+	    (u_longlong_t)engine.checkpoint.ub_pr19262[6],
+	    (u_longlong_t)checkpoint_only);
 	mutex_exit(&engine.lock);
 	/* Independent native V allocation checks, outside the catalog lock. */
 	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);

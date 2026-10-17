@@ -117,6 +117,7 @@
 #include <sys/dsl_userhold.h>
 #include <sys/abd.h>
 #include <sys/brt.h>
+#include <sys/spa_checkpoint.h>
 #include <sys/blake3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12819,7 +12820,9 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 	int error = zpool_find_config(&handle, pool, &config, &args);
 	if (error == 0)
 		error = spa_import(pool, config, props,
-		    ZFS_IMPORT_MISSING_LOG | ZFS_IMPORT_SKIP_MMP);
+		    ZFS_IMPORT_MISSING_LOG | ZFS_IMPORT_SKIP_MMP |
+		    (getenv("PR19262_ENGINE_CHECKPOINT_PREVIEW") != NULL ?
+		    ZFS_IMPORT_CHECKPOINT : 0));
 	fnvlist_free(config);
 	fnvlist_free(props);
 	if (error != 0) {
@@ -12865,7 +12868,8 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 			}
 		}
 		VERIFY3U(found, ==, 1);
-		if (root == 1 && write) {
+		if (root == 1 && write &&
+		    getenv("PR19262_ENGINE_CHECKPOINT_DISCARD") == NULL) {
 			dmu_tx_t *tx = dmu_tx_create(os);
 			dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
 			dmu_tx_hold_write(tx, DMU_NEW_OBJECT, 0, 16384);
@@ -12884,6 +12888,29 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 		dmu_objset_disown(os, B_TRUE, FTAG);
 	}
 	pr19262_engine_check(spa, "cold-import");
+	if (getenv("PR19262_ENGINE_CHECKPOINT_DISCARD") != NULL) {
+		VERIFY(write);
+		pool_checkpoint_stat_t stats;
+		VERIFY0(spa_checkpoint_get_stats(spa, &stats));
+		VERIFY3U(stats.pcs_space, >, 0);
+		(void) printf("PR19262_CP_DISCARD_BEFORE bytes=%llu\n",
+		    (u_longlong_t)stats.pcs_space);
+		VERIFY0(spa_checkpoint_discard("pr19262_tx"));
+		hrtime_t deadline = gethrtime() + SEC2NSEC(30);
+		while (spa_feature_is_active(spa,
+		    SPA_FEATURE_POOL_CHECKPOINT) &&
+		    gethrtime() < deadline) {
+			txg_wait_synced(spa->spa_dsl_pool, 0);
+			usleep(1000);
+		}
+		VERIFY(!spa_feature_is_active(spa,
+		    SPA_FEATURE_POOL_CHECKPOINT));
+		VERIFY0(spa->spa_checkpoint_info.sci_dspace);
+		txg_wait_synced(spa->spa_dsl_pool,
+		    spa_last_synced_txg(spa) + TXG_CONCURRENT_STATES);
+		pr19262_engine_check(spa, "checkpoint-discard-retains-V-P");
+		(void) printf("PR19262_CP_DISCARD_PASS\n");
+	}
 	(void) printf("PR19262_STORE_COLD_PASS write=%u new_objects=%u "
 	    "txg=%llu\n", write, new_objects,
 	    (u_longlong_t)spa_last_synced_txg(spa));
@@ -12926,6 +12953,8 @@ pr19262_tx_driver(const char *directory)
 		fnvlist_add_uint64(props, "feature@raidz_parity_epochs", 0);
 	if (getenv("PR19262_JOURNAL_CLONE") != NULL)
 		fnvlist_add_uint64(props, "feature@block_cloning", 0);
+	if (getenv("PR19262_ENGINE_CHECKPOINT") != NULL)
+		fnvlist_add_uint64(props, "feature@zpool_checkpoint", 0);
 	VERIFY0(spa_create("pr19262_tx", root, props, NULL, NULL, NULL));
 	spa_t *spa;
 	VERIFY0(spa_open("pr19262_tx", &spa, FTAG));
@@ -12938,6 +12967,37 @@ pr19262_tx_driver(const char *directory)
 		if (getenv("PR19262_JOURNAL_TEST") != NULL)
 			pr19262_journal_test(spa);
 		pr19262_runtime_test(spa);
+		if (getenv("PR19262_ENGINE_CHECKPOINT") != NULL) {
+			VERIFY0(spa_checkpoint("pr19262_tx"));
+			uberblock_t checkpoint;
+			VERIFY0(zap_lookup(spa->spa_meta_objset,
+			    DMU_POOL_DIRECTORY_OBJECT,
+			    DMU_POOL_ZPOOL_CHECKPOINT,
+			    sizeof (uint64_t), sizeof (checkpoint) /
+			    sizeof (uint64_t), &checkpoint));
+			(void) printf("PR19262_CP_CREATED ub=%llu "
+			    "catalog=%llu\n",
+			    (u_longlong_t)checkpoint.ub_txg,
+			    (u_longlong_t)checkpoint.ub_pr19262[6]);
+			objset_t *os;
+			VERIFY0(dmu_objset_own("pr19262_tx/clone",
+			    DMU_OST_OTHER,
+			    B_FALSE, B_TRUE, FTAG, &os));
+			dmu_tx_t *tx = dmu_tx_create(os);
+			dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+			dmu_tx_hold_write(tx, DMU_NEW_OBJECT, 0, 16384);
+			VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+			uint64_t object = dmu_object_alloc(os,
+			    DMU_OT_UINT64_OTHER, 16384, DMU_OT_NONE, 0, tx);
+			void *data = kmem_alloc(16384, KM_SLEEP);
+			memset(data, 0x7c, 16384);
+			dmu_write(os, object, 0, 16384, data, tx, 0);
+			dmu_tx_commit(tx);
+			txg_wait_synced(spa->spa_dsl_pool, 0);
+			dmu_objset_disown(os, B_TRUE, FTAG);
+			kmem_free(data, 16384);
+			pr19262_engine_check(spa, "checkpoint-and-new-head");
+		}
 		(void) fflush(NULL);
 		/* Persistent images need the private importer. */
 		_exit(0);
