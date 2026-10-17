@@ -71,6 +71,7 @@
 #include <sys/ddt_impl.h>
 #include <sys/zfeature.h>
 #include <sys/abd.h>
+#include <sys/vdev_reloc_probe.h>
 #include <sys/blkptr.h>
 #include <sys/dsl_crypt.h>
 #include <sys/dsl_scan.h>
@@ -5892,6 +5893,8 @@ dump_backup(const char *pool, uint64_t objset_id, const char *flagstr)
 static int
 zdb_copy_object(objset_t *os, uint64_t srcobj, char *destfile)
 {
+	if (getenv("PR19262_LIFETIME_TEST") != NULL)
+		return (pr19262_reloc_test(dmu_objset_spa(os), destfile));
 	int err = 0;
 	uint64_t size, readsize, oursize, offset;
 	ssize_t writesize;

@@ -502,6 +502,9 @@ struct zio {
 	list_t		io_parent_list;
 	list_t		io_child_list;
 	zio_t		*io_logical;
+#ifndef _KERNEL
+	void		*io_pr19262_hold;
+#endif
 	zio_transform_t *io_transform_stack;
 
 	/* Callback info */

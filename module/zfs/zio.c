@@ -46,6 +46,10 @@
 #include <sys/dsl_crypt.h>
 #include <cityhash.h>
 
+#ifndef _KERNEL
+#include "vdev_reloc_probe.c"
+#endif
+
 /*
  * ==========================================================================
  * I/O type descriptions
@@ -186,6 +190,9 @@ zio_kstats_update(kstat_t *ksp, int rw)
 void
 zio_init(void)
 {
+#ifndef _KERNEL
+	pr19262_reloc_init();
+#endif
 	size_t c;
 
 	zio_cache = kmem_cache_create("zio_cache",
@@ -287,6 +294,9 @@ zio_init(void)
 void
 zio_fini(void)
 {
+#ifndef _KERNEL
+	pr19262_reloc_fini();
+#endif
 	size_t n = SPA_MAXBLOCKSIZE >> SPA_MINBLOCKSHIFT;
 
 #if defined(ZFS_DEBUG) && !defined(_KERNEL)
@@ -1054,6 +1064,9 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 void
 zio_destroy(zio_t *zio)
 {
+#ifndef _KERNEL
+	pr19262_reloc_rele(zio->io_pr19262_hold);
+#endif
 	ASSERT3P(zio->io_batch, ==, NULL);
 	ASSERT3P(zio->io_child_batch, ==, NULL);
 	ASSERT3P(zio->io_exec_next, ==, NULL);
@@ -1353,6 +1366,11 @@ zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 	    ZIO_TYPE_READ, priority, flags, NULL, 0, zb,
 	    ZIO_STAGE_OPEN, (flags & ZIO_FLAG_DDT_CHILD) ?
 	    ZIO_DDT_CHILD_READ_PIPELINE : ZIO_READ_PIPELINE);
+
+#ifndef _KERNEL
+	if (zio->io_logical == zio)
+		zio->io_pr19262_hold = pr19262_reloc_hold(spa, bp);
+#endif
 
 	return (zio);
 }

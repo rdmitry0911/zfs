@@ -2644,6 +2644,93 @@ vdev_raidz_shadow_child_done(zio_t *zio)
 	rc->rc_shadow_error = zio->io_error;
 }
 
+
+#ifndef _KERNEL
+#include <sys/vdev_reloc_probe.h>
+/* Private userspace read-only feasibility probe; no persistent format. */
+typedef struct pr19262_probe_move {
+	uint64_t src;
+	uint64_t src_birth;
+	uint64_t dst;
+	uint64_t dst_birth;
+	uint64_t src_asize;
+	uint64_t dst_asize;
+	int error;
+} pr19262_probe_move_t;
+
+static boolean_t
+pr19262_probe_lookup(zio_t *zio, pr19262_probe_move_t *move)
+{
+	const char *p = getenv("PR19262_PROBE_MAP");
+	const blkptr_t *bp = zio->io_bp;
+
+	if (p == NULL || bp == NULL || BP_IS_EMBEDDED(bp))
+		return (B_FALSE);
+	while (*p != '\0') {
+		u_longlong_t src;
+		u_longlong_t birth;
+		u_longlong_t dst;
+		u_longlong_t newbirth;
+		u_longlong_t oldsize;
+		u_longlong_t newsize;
+		int consumed = 0;
+		int n = sscanf(p, "%llx,%llu,%llx,%llu,%llx,%llx%n",
+		    &src, &birth, &dst, &newbirth, &oldsize, &newsize,
+		    &consumed);
+
+		VERIFY3S(n, ==, 6);
+		VERIFY3S(consumed, >, 0);
+		if (DVA_GET_VDEV(&bp->blk_dva[0]) == zio->io_vd->vdev_id &&
+		    DVA_GET_OFFSET(&bp->blk_dva[0]) == src &&
+		    BP_GET_PHYSICAL_BIRTH(bp) == birth) {
+			move->src = src;
+			move->src_birth = birth;
+			move->dst = dst;
+			move->dst_birth = newbirth;
+			move->src_asize = oldsize;
+			move->dst_asize = newsize;
+			move->error = 0;
+			if (getenv("PR19262_LIFETIME") != NULL) {
+				pr19262_backing_desc_t desc;
+				move->error = pr19262_reloc_resolve(zio, &desc);
+				if (move->error == 0) {
+					move->dst = desc.offset;
+					move->dst_birth = desc.birth;
+					move->dst_asize = desc.asize;
+				}
+			}
+			return (B_TRUE);
+		}
+		p += consumed;
+		if (*p == ';')
+			p++;
+		else
+			VERIFY0(*p);
+	}
+	return (B_FALSE);
+}
+
+static boolean_t
+pr19262_probe_translate(void)
+{
+	const char *mode = getenv("PR19262_PROBE_MODE");
+	return (mode != NULL && strcmp(mode, "translate") == 0);
+}
+#endif
+
+#ifdef ZFS_DEBUG
+static uint64_t
+pr19262_probe_actual_birth(zio_t *zio)
+{
+#ifndef _KERNEL
+	pr19262_probe_move_t move;
+	if (pr19262_probe_translate() && pr19262_probe_lookup(zio, &move))
+		return (move.dst_birth);
+#endif
+	return (BP_GET_PHYSICAL_BIRTH(zio->io_bp));
+}
+#endif
+
 static void
 vdev_raidz_io_verify(zio_t *zio, raidz_map_t *rm, raidz_row_t *rr, int col)
 {
@@ -2653,7 +2740,7 @@ vdev_raidz_io_verify(zio_t *zio, raidz_map_t *rm, raidz_row_t *rr, int col)
 	logical_rs.rs_start = rr->rr_offset;
 	logical_rs.rs_end = logical_rs.rs_start +
 	    vdev_raidz_psize_to_asize(zio->io_vd, rr->rr_size,
-	    BP_GET_PHYSICAL_BIRTH(zio->io_bp));
+	    pr19262_probe_actual_birth(zio));
 
 	raidz_col_t *rc = &rr->rr_col[col];
 	vdev_t *cvd = zio->io_vd->vdev_child[rc->rc_devidx];
@@ -2915,7 +3002,49 @@ vdev_raidz_io_start(zio_t *zio)
 	vdev_raidz_t *vdrz = vd->vdev_tsd;
 	raidz_map_t *rm;
 
-	vdev_raidz_layout_t layout = vdev_raidz_layout_for_bp(vdrz, zio->io_bp);
+	const blkptr_t *layout_bp = zio->io_bp;
+#ifndef _KERNEL
+	blkptr_t physical_bp;
+	pr19262_probe_move_t probe_move;
+	boolean_t probe_hit = pr19262_probe_lookup(zio, &probe_move);
+
+	if (probe_hit && pr19262_probe_translate()) {
+		if (probe_move.error != 0) {
+			zio->io_error = probe_move.error;
+			zio_execute(zio);
+			return;
+		}
+		if (zio->io_type != ZIO_TYPE_READ ||
+		    BP_GET_DEDUP(zio->io_bp) || BP_IS_GANG(zio->io_bp) ||
+		    BP_GET_NDVAS(zio->io_bp) != 1 ||
+		    zio->io_size != 128 * 1024 ||
+		    DVA_GET_ASIZE(&zio->io_bp->blk_dva[0]) !=
+		    probe_move.src_asize ||
+		    (zio->io_offset != probe_move.src &&
+		    zio->io_offset != probe_move.dst) ||
+		    probe_move.dst_asize != vdev_raidz_psize_to_asize(vd,
+		    zio->io_size, probe_move.dst_birth) ||
+		    probe_move.dst > vd->vdev_asize ||
+		    probe_move.dst_asize > vd->vdev_asize - probe_move.dst) {
+			zio->io_error = SET_ERROR(EINVAL);
+			zio_execute(zio);
+			return;
+		}
+		physical_bp = *zio->io_bp;
+		DVA_SET_OFFSET(&physical_bp.blk_dva[0], probe_move.dst);
+		DVA_SET_ASIZE(&physical_bp.blk_dva[0], probe_move.dst_asize);
+		BP_SET_PHYSICAL_BIRTH(&physical_bp, probe_move.dst_birth);
+		layout_bp = &physical_bp;
+		zio->io_offset = probe_move.dst;
+		zio->io_txg = probe_move.dst_birth;
+		(void) fprintf(stderr, "PR19262_PROBE_TRANSLATE %llx %llx "
+		    "%llu %llu\n", (u_longlong_t)probe_move.src,
+		    (u_longlong_t)probe_move.dst,
+		    (u_longlong_t)probe_move.src_asize,
+		    (u_longlong_t)probe_move.dst_asize);
+	}
+#endif
+	vdev_raidz_layout_t layout = vdev_raidz_layout_for_bp(vdrz, layout_bp);
 	if (zfs_flags & ZFS_DEBUG_RAIDZ_RECONSTRUCT)
 		zfs_dbgmsg("io_start: vrl_width=%llu phys=%d "
 		    "off=%llu type=%d", (u_longlong_t)layout.vrl_width,
@@ -3006,6 +3135,27 @@ vdev_raidz_io_start(zio_t *zio)
 		    layout.vrl_nparity);
 	}
 	rm->rm_original_width = vdrz->vd_original_width;
+#ifndef _KERNEL
+	if (probe_hit && getenv("PR19262_PROBE_TRACE") != NULL) {
+		for (int r = 0; r < rm->rm_nrows; r++) {
+			raidz_row_t *row = rm->rm_row[r];
+			for (int c = 0; c < row->rr_cols; c++) {
+				raidz_col_t *col = &row->rr_col[c];
+				if (col->rc_size != 0)
+					(void) fprintf(stderr,
+					    "PR19262_PROBE_COL %llx %llx %d "
+					    "%llx %llx\n",
+					    (u_longlong_t)probe_move.src,
+					    (u_longlong_t)zio->io_offset,
+					    col->rc_devidx,
+					    (u_longlong_t)(col->rc_offset +
+					    VDEV_LABEL_START_SIZE),
+					    (u_longlong_t)col->rc_size);
+			}
+		}
+	}
+#endif
+
 
 	zio->io_vsd = rm;
 	zio->io_vsd_ops = &vdev_raidz_vsd_ops;
