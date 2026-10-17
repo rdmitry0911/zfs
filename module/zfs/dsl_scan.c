@@ -281,7 +281,15 @@ typedef enum {
  * carries three DVAs.
  * The two layouts share the same leading SCAN_IO_COMMON_FIELDS.
  */
+#ifndef _KERNEL
+#include <sys/vdev_reloc_probe.h>
+#define	SCAN_IO_PROBE_FIELDS	void *sio_pr19262_hold;
+#else
+#define	SCAN_IO_PROBE_FIELDS
+#endif
+
 #define	SCAN_IO_COMMON_FIELDS						\
+	SCAN_IO_PROBE_FIELDS						\
 	/* fields from blkptr_t */					\
 	uint64_t		sio_blk_prop;				\
 	uint64_t		sio_phys_birth;				\
@@ -396,7 +404,7 @@ typedef struct scan_prefetch_issue_ctx {
 } scan_prefetch_issue_ctx_t;
 
 static void scan_exec_io(dsl_pool_t *dp, const blkptr_t *bp, int zio_flags,
-    const zbookmark_phys_t *zb, dsl_scan_io_queue_t *queue);
+    const zbookmark_phys_t *zb, dsl_scan_io_queue_t *queue, scan_io_t *sio);
 static void scan_io_queue_insert_impl(dsl_scan_io_queue_t *queue,
     scan_io_t *sio);
 
@@ -410,6 +418,9 @@ static kmem_cache_t *sio_cache_ext[SPA_DVAS_PER_BP];
 static void
 sio_free(scan_io_t *sio)
 {
+#ifndef _KERNEL
+	pr19262_reloc_rele(sio->sio_pr19262_hold);
+#endif
 	kmem_cache_t **cache = sio->sio_ext ? sio_cache_ext :
 	    sio_cache_compact;
 
@@ -431,6 +442,9 @@ sio_alloc(unsigned short nr_dvas, boolean_t ext)
 	ASSERT(!ext || nr_dvas < SPA_DVAS_PER_BP);
 
 	sio = kmem_cache_alloc(cache[nr_dvas - 1], KM_SLEEP);
+#ifndef _KERNEL
+	sio->sio_pr19262_hold = NULL;
+#endif
 	sio->sio_ext = ext;
 	return (sio);
 }
@@ -3397,7 +3411,7 @@ scan_io_queue_issue(dsl_scan_io_queue_t *queue, list_t *io_list)
 
 		sio2bp(sio, &bp);
 		scan_exec_io(scn->scn_dp, &bp, sio->sio_flags,
-		    &sio->sio_zb, queue);
+		    &sio->sio_zb, queue, sio);
 		(void) list_remove_head(io_list);
 		scan_io_queues_update_zio_stats(queue, &bp);
 		sio_free(sio);
@@ -4191,7 +4205,7 @@ read_by_block_level(dsl_scan_t *scn, zbookmark_phys_t zb)
 		zio_flags |= ZIO_FLAG_SPECULATIVE;
 
 	ASSERT(!BP_IS_EMBEDDED(&bp));
-	scan_exec_io(dp, &bp, zio_flags, &zb, NULL);
+	scan_exec_io(dp, &bp, zio_flags, &zb, NULL, NULL);
 	rw_exit(&dn->dn_struct_rwlock);
 	dnode_rele(dn, FTAG);
 	dsl_dataset_rele(ds, FTAG);
@@ -4934,6 +4948,10 @@ scan_io_queue_insert(dsl_scan_io_queue_t *queue, const blkptr_t *bp, int dva_i,
 	ASSERT(MUTEX_HELD(&queue->q_vd->vdev_scan_io_queue_lock));
 
 	bp2sio(bp, sio, dva_i);
+#ifndef _KERNEL
+	sio->sio_pr19262_hold = pr19262_reloc_hold(
+	    queue->q_vd->vdev_spa, bp);
+#endif
 	sio->sio_flags = zio_flags;
 	sio->sio_zb = *zb;
 
@@ -4959,7 +4977,7 @@ dsl_scan_enqueue(dsl_pool_t *dp, const blkptr_t *bp, int zio_flags,
 	 * here immediately instead of queuing them.
 	 */
 	if (!dp->dp_scan->scn_is_sorted || BP_IS_GANG(bp)) {
-		scan_exec_io(dp, bp, zio_flags, zb, NULL);
+		scan_exec_io(dp, bp, zio_flags, zb, NULL, NULL);
 		return;
 	}
 
@@ -5110,8 +5128,9 @@ dsl_scan_scrub_done(zio_t *zio)
  */
 static void
 scan_exec_io(dsl_pool_t *dp, const blkptr_t *bp, int zio_flags,
-    const zbookmark_phys_t *zb, dsl_scan_io_queue_t *queue)
+    const zbookmark_phys_t *zb, dsl_scan_io_queue_t *queue, scan_io_t *sio)
 {
+	(void) sio;
 	spa_t *spa = dp->dp_spa;
 	dsl_scan_t *scn = dp->dp_scan;
 	/*
@@ -5144,6 +5163,14 @@ scan_exec_io(dsl_pool_t *dp, const blkptr_t *bp, int zio_flags,
 
 	ASSERT(pio != NULL);
 	count_block_issued(spa, bp, queue == NULL);
+#ifndef _KERNEL
+	if (sio != NULL && sio->sio_pr19262_hold != NULL) {
+		zio_nowait(pr19262_reloc_read_bound(pio, spa, bp, data,
+		    size, dsl_scan_scrub_done, queue, ZIO_PRIORITY_SCRUB,
+		    zio_flags, zb, &sio->sio_pr19262_hold));
+		return;
+	}
+#endif
 	zio_nowait(zio_read(pio, spa, bp, data, size, dsl_scan_scrub_done,
 	    queue, ZIO_PRIORITY_SCRUB, zio_flags, zb));
 }
@@ -5463,6 +5490,86 @@ dsl_scan_freed(spa_t *spa, const blkptr_t *bp)
 	for (int i = 0; i < BP_GET_NDVAS(bp); i++)
 		dsl_scan_freed_dva(spa, bp, i);
 }
+
+#ifndef _KERNEL
+/* Drive the actual sorted-queue implementation in a readonly userspace spa. */
+void
+pr19262_scan_probe_insert(void *arg, const blkptr_t *bp)
+{
+	dsl_scan_io_queue_t *q = arg;
+	zbookmark_phys_t zb = { 0 };
+	mutex_enter(&q->q_vd->vdev_scan_io_queue_lock);
+	scan_io_queue_insert(q, bp, 0, ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW |
+	    ZIO_FLAG_SCRUB | ZIO_FLAG_SPECULATIVE, &zb);
+	mutex_exit(&q->q_vd->vdev_scan_io_queue_lock);
+}
+
+void *
+pr19262_scan_probe_create(spa_t *spa, const blkptr_t *bp)
+{
+	VERIFY3U(BP_GET_NDVAS(bp), ==, 1);
+	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
+	vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(&bp->blk_dva[0]));
+	VERIFY3P(vd, !=, NULL);
+	mutex_enter(&vd->vdev_scan_io_queue_lock);
+	VERIFY3P(vd->vdev_scan_io_queue, ==, NULL);
+	dsl_scan_io_queue_t *q = scan_io_queue_create(vd);
+	vd->vdev_scan_io_queue = q;
+	mutex_exit(&vd->vdev_scan_io_queue_lock);
+	spa_config_exit(spa, SCL_ALL, FTAG);
+	pr19262_scan_probe_insert(q, bp);
+	return (q);
+}
+
+void
+pr19262_scan_probe_cancel(void *arg, const blkptr_t *bp)
+{
+	dsl_scan_io_queue_t *q = arg;
+	spa_t *spa = q->q_vd->vdev_spa;
+	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
+	dsl_scan_freed_dva(spa, bp, 0);
+	spa_config_exit(spa, SCL_ALL, FTAG);
+	VERIFY(avl_is_empty(&q->q_sios_by_addr));
+	VERIFY0(q->q_sio_memused);
+}
+
+void
+pr19262_scan_probe_destroy(void *arg)
+{
+	dsl_scan_io_queue_t *q = arg;
+	vdev_t *vd = q->q_vd;
+	mutex_enter(&vd->vdev_scan_io_queue_lock);
+	dsl_scan_io_queue_destroy(q);
+	vd->vdev_scan_io_queue = NULL;
+	mutex_exit(&vd->vdev_scan_io_queue_lock);
+}
+
+int
+pr19262_scan_probe_issue(void *arg)
+{
+	dsl_scan_io_queue_t *q = arg;
+	list_t pending;
+	list_create(&pending, sizeof (scan_io_t),
+	    offsetof(scan_io_t, sio_nodes.sio_list_node));
+	q->q_zio = zio_root(q->q_vd->vdev_spa, NULL, NULL, ZIO_FLAG_CANFAIL);
+	q->q_maxinflight_bytes = SPA_MAXBLOCKSIZE;
+	mutex_enter(&q->q_vd->vdev_scan_io_queue_lock);
+	zfs_range_seg_t *rs = zfs_range_tree_first(q->q_exts_by_addr);
+	VERIFY3P(rs, !=, NULL);
+	VERIFY(!scan_io_queue_gather(q, rs, &pending));
+	mutex_exit(&q->q_vd->vdev_scan_io_queue_lock);
+	uint64_t saved = q->q_scn->scn_sync_start_time;
+	q->q_scn->scn_sync_start_time = getlrtime();
+	VERIFY(!scan_io_queue_issue(q, &pending));
+	q->q_scn->scn_sync_start_time = saved;
+	int error = zio_wait(q->q_zio);
+	VERIFY0(q->q_inflight_bytes);
+	VERIFY(list_is_empty(&pending));
+	list_destroy(&pending);
+	pr19262_scan_probe_destroy(q);
+	return (error);
+}
+#endif
 
 /*
  * Check if a vdev needs resilvering (non-empty DTL), if so, and resilver has

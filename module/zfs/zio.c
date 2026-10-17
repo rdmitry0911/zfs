@@ -1354,11 +1354,13 @@ zfs_dva_valid(spa_t *spa, const dva_t *dva, const blkptr_t *bp)
 	return (B_TRUE);
 }
 
-zio_t *
-zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
+static zio_t *
+zio_read_impl(zio_t *pio, spa_t *spa, const blkptr_t *bp,
     abd_t *data, uint64_t size, zio_done_func_t *done, void *private,
-    zio_priority_t priority, zio_flag_t flags, const zbookmark_phys_t *zb)
+    zio_priority_t priority, zio_flag_t flags, const zbookmark_phys_t *zb,
+    void *bound_hold)
 {
+	(void) bound_hold;
 	zio_t *zio;
 
 	zio = zio_create(pio, spa, BP_GET_PHYSICAL_BIRTH(bp), bp,
@@ -1369,11 +1371,38 @@ zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 
 #ifndef _KERNEL
 	if (zio->io_logical == zio)
-		zio->io_pr19262_hold = pr19262_reloc_hold(spa, bp);
+		zio->io_pr19262_hold = bound_hold != NULL ?
+		    bound_hold : pr19262_reloc_hold(spa, bp);
 #endif
 
 	return (zio);
 }
+
+zio_t *
+zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
+    abd_t *data, uint64_t size, zio_done_func_t *done, void *private,
+    zio_priority_t priority, zio_flag_t flags, const zbookmark_phys_t *zb)
+{
+	return (zio_read_impl(pio, spa, bp, data, size, done, private,
+	    priority, flags, zb, NULL));
+}
+
+#ifndef _KERNEL
+zio_t *
+pr19262_reloc_read_bound(zio_t *pio, spa_t *spa, const blkptr_t *bp,
+    abd_t *data, uint64_t size, zio_done_func_t *done, void *private,
+    zio_priority_t priority, zio_flag_t flags, const zbookmark_phys_t *zb,
+    void **hold)
+{
+	/* Transfer ownership without looking up a synthesized BP again. */
+	void *binding = *hold;
+	*hold = NULL;
+	zio_t *zio = zio_read_impl(pio, spa, bp, data, size, done, private,
+	    priority, flags, zb, binding);
+	VERIFY3P(zio->io_logical, ==, zio);
+	return (zio);
+}
+#endif
 
 zio_t *
 zio_write(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp,

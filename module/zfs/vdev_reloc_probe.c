@@ -41,6 +41,7 @@ static kmutex_t probe_lock;
 static probe_entry_t probe_entries[PROBE_ENTRIES];
 static uint_t probe_count;
 static boolean_t probe_capture_done;
+static boolean_t probe_block_new_holds;
 
 void
 pr19262_reloc_init(void)
@@ -96,6 +97,10 @@ pr19262_reloc_hold(spa_t *spa, const blkptr_t *bp)
 		return (NULL);
 	probe_handle_t *h = NULL;
 	mutex_enter(&probe_lock);
+	if (probe_block_new_holds) {
+		mutex_exit(&probe_lock);
+		return (NULL);
+	}
 	for (uint_t i = 0; i < probe_count; i++) {
 		probe_entry_t *e = &probe_entries[i];
 		if (e->offset != DVA_GET_OFFSET(&bp->blk_dva[0]) ||
@@ -304,6 +309,22 @@ pr19262_reloc_test(spa_t *spa, const char *output)
 	probe_entry_t *e = h->entry;
 	VERIFY3U(e->handles, ==, 1);
 	VERIFY3P(h->leased, ==, NULL);
+	void *scan_queue = NULL;
+	boolean_t scan_test = getenv("PR19262_SCAN_LIFETIME_TEST") != NULL;
+	if (scan_test) {
+		scan_queue = pr19262_scan_probe_create(spa, &bp);
+		pr19262_scan_probe_insert(scan_queue, &bp);
+		VERIFY3U(e->handles, ==, 2);
+		pr19262_scan_probe_cancel(scan_queue, &bp);
+		VERIFY3U(e->handles, ==, 1);
+		pr19262_scan_probe_destroy(scan_queue);
+		scan_queue = pr19262_scan_probe_create(spa, &bp);
+		pr19262_scan_probe_destroy(scan_queue);
+		VERIFY3U(e->handles, ==, 1);
+		scan_queue = pr19262_scan_probe_create(spa, &bp);
+		VERIFY3U(e->handles, ==, 2);
+		VERIFY0(e->backing[0].readers);
+	}
 
 	/* Writer exclusion is tested at the API, not DDT/ZIL hooks. */
 	VERIFY0(probe_writer_enter(e));
@@ -318,6 +339,18 @@ pr19262_reloc_test(spa_t *spa, const char *output)
 	VERIFY3S(probe_reclaim(e, 0, B_FALSE), ==, EAGAIN);
 	VERIFY0(probe_reclaim(e, 0, B_TRUE));
 	probe_gate("old-backing-reclaim");
+	if (scan_test) {
+		/* Issuing must use the queued binding, without a new lookup. */
+		mutex_enter(&probe_lock);
+		probe_block_new_holds = B_TRUE;
+		mutex_exit(&probe_lock);
+		VERIFY0(pr19262_scan_probe_issue(scan_queue));
+		mutex_enter(&probe_lock);
+		probe_block_new_holds = B_FALSE;
+		mutex_exit(&probe_lock);
+		VERIFY3U(e->handles, ==, 1);
+		VERIFY0(e->backing[0].readers);
+	}
 	VERIFY0(zio_wait(queued));
 	VERIFY0(e->handles);
 	void *data = abd_borrow_buf_copy(abd, size);
@@ -349,11 +382,19 @@ pr19262_reloc_test(spa_t *spa, const char *output)
 
 	/* Final free cancels unissued reads; no fallback to reused storage. */
 	queued = probe_read(spa, &bp, abd);
+	if (scan_test)
+		scan_queue = pr19262_scan_probe_create(spa, &bp);
 	uint64_t incarnation = e->incarnation;
 	mutex_enter(&probe_lock);
 	e->live = B_FALSE;
 	mutex_exit(&probe_lock);
 	VERIFY3S(probe_reuse(e), ==, EBUSY);
+	if (scan_test) {
+		pr19262_scan_probe_cancel(scan_queue, &bp);
+		pr19262_scan_probe_destroy(scan_queue);
+		VERIFY3U(e->handles, ==, 1);
+		VERIFY3S(probe_reuse(e), ==, EBUSY);
+	}
 	VERIFY3S(zio_wait(queued), ==, ESTALE);
 	VERIFY0(e->handles);
 	VERIFY0(probe_reclaim(e, 2, B_TRUE));
@@ -362,6 +403,9 @@ pr19262_reloc_test(spa_t *spa, const char *output)
 	(void) fprintf(stderr, "PR19262_LIFETIME_PASS "
 	    "queued_no_P_pin leased_reclaim_blocked stale_cancelled "
 	    "incarnation_drained writer_exclusion floor_required\n");
+	if (scan_test)
+		(void) fprintf(stderr, "PR19262_SCAN_LIFETIME_PASS "
+		    "duplicate_cancel_destroy transfer_dispatch final_free\n");
 	abd_free(abd);
 	return (0);
 }
