@@ -25,6 +25,7 @@ typedef struct probe_entry {
 	uint64_t writers;
 	boolean_t live;
 	boolean_t copying;
+	boolean_t fresh;
 	uint_t current;
 	uint_t count;
 	probe_backing_t backing[PROBE_BACKINGS];
@@ -143,6 +144,34 @@ pr19262_reloc_rele(void *arg)
 	}
 	mutex_exit(&probe_lock);
 	kmem_free(h, sizeof (*h));
+}
+
+boolean_t
+pr19262_reloc_known(spa_t *spa, const blkptr_t *bp)
+{
+	if (bp == NULL || BP_IS_EMBEDDED(bp) || BP_GET_NDVAS(bp) != 1 ||
+	    DVA_GET_VDEV(&bp->blk_dva[0]) != 0)
+		return (B_FALSE);
+	boolean_t found = B_FALSE;
+	mutex_enter(&probe_lock);
+	for (uint_t i = 0; i < probe_count; i++) {
+		probe_entry_t *e = &probe_entries[i];
+		if (e->offset == DVA_GET_OFFSET(&bp->blk_dva[0]) &&
+		    e->birth == BP_GET_PHYSICAL_BIRTH(bp) &&
+		    (e->spa == NULL || e->spa == spa))
+			found = B_TRUE;
+	}
+	mutex_exit(&probe_lock);
+	return (found);
+}
+
+boolean_t
+pr19262_reloc_fresh_write(zio_t *zio)
+{
+	probe_handle_t *h = zio->io_logical != NULL ?
+	    zio->io_logical->io_pr19262_hold : NULL;
+	return (h != NULL && h->entry->fresh &&
+	    getenv("PR19262_SPACE_TEST") != NULL);
 }
 
 int
@@ -291,6 +320,165 @@ probe_read(spa_t *spa, const blkptr_t *bp, abd_t *abd)
 	    ZIO_FLAG_SPECULATIVE, NULL));
 }
 
+static void
+probe_save_abd(abd_t *abd, uint64_t size, const char *path)
+{
+	void *buf = abd_borrow_buf_copy(abd, size);
+	FILE *f = fopen(path, "wb");
+	VERIFY3P(f, !=, NULL);
+	VERIFY3U(fwrite(buf, size, 1, f), ==, 1);
+	VERIFY0(fclose(f));
+	abd_return_buf_copy(abd, buf, size);
+}
+
+static int
+probe_space_test(spa_t *spa, const char *output, const blkptr_t *bp)
+{
+	const char *guid = getenv("PR19262_SPACE_RW_GUID");
+	VERIFY3P(guid, !=, NULL);
+	VERIFY3U(strtoull(guid, NULL, 10), ==, spa_guid(spa));
+	VERIFY(!spa_writeable(spa));
+	blkptr_t original = *bp;
+	abd_t *old_data = abd_alloc_for_io(BP_GET_PSIZE(bp), B_FALSE);
+	zio_t *queued = probe_read(spa, bp, old_data);
+	probe_entry_t *e = ((probe_handle_t *)queued->io_pr19262_hold)->entry;
+	void *space = pr19262_space_create(spa);
+	uint64_t v0 = pr19262_space_available(space, B_FALSE);
+	uint64_t p0 = pr19262_space_available(space, B_TRUE);
+	VERIFY3U(v0, ==, p0);
+	txg_handle_t txh;
+	uint64_t fresh_birth = txg_hold_open(spa->spa_dsl_pool, &txh);
+	txg_rele_to_quiesce(&txh);
+	VERIFY3S(pr19262_space_reserve(space, p0 + 1), ==, ENOSPC);
+	VERIFY3U(pr19262_space_available(space, B_TRUE), ==, p0);
+	uint64_t size = 16 * 1024;
+	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
+	vdev_t *vd = vdev_lookup_top(spa, 0);
+	uint64_t asize = vdev_psize_to_asize_txg(vd, size,
+	    fresh_birth);
+	VERIFY3S(metaslab_claim_impl(vd, e->offset,
+	    e->backing[0].desc.asize, 0), ==, ENOENT);
+	spa_config_exit(spa, SCL_ALL, FTAG);
+	VERIFY0(pr19262_space_reserve(space, asize));
+	pr19262_space_pair_t pair;
+	VERIFY3S(pr19262_space_allocate(space, asize, fresh_birth,
+	    e->offset, &pair), ==, ENOSPC);
+	VERIFY3U(pr19262_space_available(space, B_FALSE), ==, v0);
+	pr19262_space_unreserve(space, asize);
+
+	/* Verify the already-native stronger copy before publishing it. */
+	blkptr_t target = *bp;
+	DVA_SET_OFFSET(&target.blk_dva[0], e->prepared.offset);
+	DVA_SET_ASIZE(&target.blk_dva[0], e->prepared.asize);
+	BP_SET_PHYSICAL_BIRTH(&target, e->prepared.birth);
+	abd_t *verify = abd_alloc_for_io(BP_GET_PSIZE(bp), B_FALSE);
+	VERIFY0(zio_wait(probe_read(spa, &target, verify)));
+	VERIFY0(probe_copy_begin(e));
+	VERIFY0(probe_publish(e, e->prepared, B_TRUE));
+	VERIFY0(probe_reclaim(e, 0, B_TRUE));
+	VERIFY3S(pr19262_space_reclaim(space, e->offset,
+	    e->backing[0].desc.asize, B_FALSE), ==, EAGAIN);
+	VERIFY0(pr19262_space_reclaim(space, e->offset,
+	    e->backing[0].desc.asize, B_TRUE));
+	VERIFY3S(pr19262_space_reclaim(space, e->offset,
+	    e->backing[0].desc.asize, B_TRUE), ==, EEXIST);
+	VERIFY0(pr19262_space_reserve(space, asize));
+	VERIFY0(pr19262_space_allocate(space, asize, fresh_birth,
+	    e->offset, &pair));
+	VERIFY3U(pair.virtual_offset, !=, e->offset);
+	VERIFY3U(pair.physical_offset, ==, e->offset);
+	VERIFY3U(pr19262_space_available(space, B_FALSE), ==, v0 - asize);
+	VERIFY3U(pr19262_space_available(space, B_TRUE), ==,
+	    p0 + e->backing[0].desc.asize - asize);
+	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
+	VERIFY3S(metaslab_claim_impl(vd, e->offset,
+	    e->backing[0].desc.asize, 0), ==, ENOENT);
+	VERIFY3S(metaslab_claim_impl(vd, pair.virtual_offset,
+	    asize, 0), ==, ENOENT);
+	spa_config_exit(spa, SCL_ALL, FTAG);
+
+	blkptr_t loan = *bp;
+	BP_ZERO_DVAS(&loan);
+	BP_SET_LSIZE(&loan, size);
+	BP_SET_PSIZE(&loan, size);
+	BP_SET_BIRTH(&loan, fresh_birth, 0);
+	BP_SET_REWRITE(&loan, 0);
+	DVA_SET_OFFSET(&loan.blk_dva[0], pair.virtual_offset);
+	DVA_SET_ASIZE(&loan.blk_dva[0], asize);
+	mutex_enter(&probe_lock);
+	VERIFY3U(probe_count, <, PROBE_ENTRIES);
+	probe_entry_t *n = &probe_entries[probe_count++];
+	n->spa = spa;
+	n->offset = pair.virtual_offset;
+	n->birth = BP_GET_PHYSICAL_BIRTH(&loan);
+	n->incarnation = 1;
+	n->live = n->fresh = B_TRUE;
+	n->count = 1;
+	n->backing[0].desc = (pr19262_backing_desc_t) {
+		pair.physical_offset, n->birth, asize };
+	mutex_exit(&probe_lock);
+	void *buf = kmem_alloc(size, KM_SLEEP);
+	FILE *f = fopen(getenv("PR19262_SPACE_INPUT"), "rb");
+	VERIFY3P(f, !=, NULL);
+	VERIFY3U(fread(buf, size, 1, f), ==, 1);
+	VERIFY0(fclose(f));
+	abd_t *new_data = abd_alloc_for_io(size, B_FALSE);
+	abd_copy_from_buf(new_data, buf, size);
+	/* Only this raw data ZIO is writable; no MOS TXG is started. */
+	spa_mode_t mode = spa->spa_mode;
+	boolean_t trusted = spa->spa_trust_config;
+	spa->spa_mode |= SPA_MODE_WRITE;
+	spa->spa_trust_config = B_TRUE;
+	/* Re-probe readonly-imported leaves before the data write. */
+	spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
+	for (uint64_t i = 0; i < vd->vdev_children; i++) {
+		VERIFY0(zio_wait(vdev_probe(vd->vdev_child[i], NULL)));
+		VERIFY(vdev_writeable(vd->vdev_child[i]));
+	}
+	spa_config_exit(spa, SCL_ALL, FTAG);
+	VERIFY0(zio_wait(zio_rewrite(NULL, spa, n->birth, &loan, new_data,
+	    size, NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL)));
+	spa->spa_mode = mode;
+	spa->spa_trust_config = trusted;
+	txg_rele_to_sync(&txh);
+	VERIFY0(n->handles);
+	abd_zero(new_data, size);
+	VERIFY0(zio_wait(probe_read(spa, &loan, new_data)));
+	VERIFY0(abd_cmp_buf(new_data, buf, size));
+	char path[1024];
+	(void) snprintf(path, sizeof (path), "%s.loan", output);
+	probe_save_abd(new_data, size, path);
+	VERIFY0(zio_wait(queued));
+	VERIFY0(abd_cmp(old_data, verify));
+	probe_save_abd(old_data, BP_GET_PSIZE(bp), output);
+	VERIFY0(memcmp(bp, &original, sizeof (*bp)));
+	mutex_enter(&probe_lock);
+	n->live = B_FALSE;
+	mutex_exit(&probe_lock);
+	VERIFY0(probe_reclaim(n, 0, B_TRUE));
+	pr19262_space_release(space, &pair);
+	VERIFY3U(pr19262_space_available(space, B_FALSE), ==, v0);
+	VERIFY3U(pr19262_space_available(space, B_TRUE), ==,
+	    p0 + e->backing[0].desc.asize);
+	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
+	VERIFY3S(metaslab_claim_impl(vd, e->offset,
+	    e->backing[0].desc.asize, 0), ==, ENOENT);
+	spa_config_exit(spa, SCL_ALL, FTAG);
+	(void) fprintf(stderr, "PR19262_SPACE_PASS %llu %llu %llu "
+	    "%llu %llu %llu\n", (u_longlong_t)v0, (u_longlong_t)p0,
+	    (u_longlong_t)pair.virtual_offset,
+	    (u_longlong_t)pair.physical_offset,
+	    (u_longlong_t)asize,
+	    (u_longlong_t)e->backing[0].desc.asize);
+	pr19262_space_destroy(space);
+	abd_free(new_data);
+	abd_free(verify);
+	abd_free(old_data);
+	kmem_free(buf, size);
+	return (0);
+}
+
 int
 pr19262_reloc_test(spa_t *spa, const char *output)
 {
@@ -301,6 +489,8 @@ pr19262_reloc_test(spa_t *spa, const char *output)
 	blkptr_t bp;
 	VERIFY3U(fread(&bp, sizeof (bp), 1, f), ==, 1);
 	VERIFY0(fclose(f));
+	if (getenv("PR19262_SPACE_TEST") != NULL)
+		return (probe_space_test(spa, output, &bp));
 	uint64_t size = BP_GET_PSIZE(&bp);
 	abd_t *abd = abd_alloc_for_io(size, B_FALSE);
 	zio_t *queued = probe_read(spa, &bp, abd);

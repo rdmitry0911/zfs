@@ -2664,6 +2664,21 @@ pr19262_probe_lookup(zio_t *zio, pr19262_probe_move_t *move)
 	const char *p = getenv("PR19262_PROBE_MAP");
 	const blkptr_t *bp = zio->io_bp;
 
+	if (getenv("PR19262_LIFETIME") != NULL &&
+	    pr19262_reloc_known(zio->io_spa, bp)) {
+		pr19262_backing_desc_t desc;
+		memset(move, 0, sizeof (*move));
+		move->src = DVA_GET_OFFSET(&bp->blk_dva[0]);
+		move->src_birth = BP_GET_PHYSICAL_BIRTH(bp);
+		move->src_asize = DVA_GET_ASIZE(&bp->blk_dva[0]);
+		move->error = pr19262_reloc_resolve(zio, &desc);
+		if (move->error == 0) {
+			move->dst = desc.offset;
+			move->dst_birth = desc.birth;
+			move->dst_asize = desc.asize;
+		}
+		return (B_TRUE);
+	}
 	if (p == NULL || bp == NULL || BP_IS_EMBEDDED(bp))
 		return (B_FALSE);
 	while (*p != '\0') {
@@ -3014,10 +3029,13 @@ vdev_raidz_io_start(zio_t *zio)
 			zio_execute(zio);
 			return;
 		}
-		if (zio->io_type != ZIO_TYPE_READ ||
+		if ((zio->io_type != ZIO_TYPE_READ &&
+		    !(zio->io_type == ZIO_TYPE_WRITE &&
+		    pr19262_reloc_fresh_write(zio))) ||
 		    BP_GET_DEDUP(zio->io_bp) || BP_IS_GANG(zio->io_bp) ||
 		    BP_GET_NDVAS(zio->io_bp) != 1 ||
-		    zio->io_size != 128 * 1024 ||
+		    (zio->io_size != 128 * 1024 &&
+		    getenv("PR19262_SPACE_TEST") == NULL) ||
 		    DVA_GET_ASIZE(&zio->io_bp->blk_dva[0]) !=
 		    probe_move.src_asize ||
 		    (zio->io_offset != probe_move.src &&

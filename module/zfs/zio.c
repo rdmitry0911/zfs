@@ -1452,6 +1452,10 @@ zio_rewrite(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp, abd_t *data,
 	    ZIO_TYPE_WRITE, priority, flags | ZIO_FLAG_IO_REWRITE, NULL, 0, zb,
 	    ZIO_STAGE_OPEN, ZIO_REWRITE_PIPELINE);
 
+#ifndef _KERNEL
+	if (getenv("PR19262_SPACE_TEST") != NULL && zio->io_logical == zio)
+		zio->io_pr19262_hold = pr19262_reloc_hold(spa, bp);
+#endif
 	return (zio);
 }
 

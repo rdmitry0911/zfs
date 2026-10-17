@@ -6578,3 +6578,7 @@ ZFS_MODULE_PARAM(zfs_metaslab, metaslab_, trace_enabled, INT, ZMOD_RW,
 ZFS_MODULE_PARAM(zfs_metaslab, metaslab_, trace_max_entries, U64, ZMOD_RW,
 	"Maximum entries for metaslab allocation tracing");
 #endif
+
+#ifndef _KERNEL
+#include "vdev_reloc_space.c"
+#endif

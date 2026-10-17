@@ -24,6 +24,23 @@ void pr19262_scan_probe_insert(void *, const blkptr_t *);
 void pr19262_scan_probe_cancel(void *, const blkptr_t *);
 void pr19262_scan_probe_destroy(void *);
 int pr19262_scan_probe_issue(void *);
+boolean_t pr19262_reloc_known(spa_t *, const blkptr_t *);
+boolean_t pr19262_reloc_fresh_write(zio_t *);
+typedef struct pr19262_space_pair {
+	uint64_t virtual_offset;
+	uint64_t virtual_size;
+	uint64_t physical_offset;
+	uint64_t physical_size;
+} pr19262_space_pair_t;
+void *pr19262_space_create(spa_t *);
+void pr19262_space_destroy(void *);
+uint64_t pr19262_space_available(void *, boolean_t);
+int pr19262_space_reserve(void *, uint64_t);
+void pr19262_space_unreserve(void *, uint64_t);
+int pr19262_space_allocate(void *, uint64_t, uint64_t, uint64_t,
+    pr19262_space_pair_t *);
+void pr19262_space_release(void *, const pr19262_space_pair_t *);
+int pr19262_space_reclaim(void *, uint64_t, uint64_t, boolean_t);
 
 #endif
 #endif
