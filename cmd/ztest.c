@@ -12412,6 +12412,10 @@ pr19262_journal_failed_commit(void *arg)
 static void
 pr19262_journal_test(spa_t *spa)
 {
+	char *many = getenv("PR19262_JOURNAL_MANY");
+	uint_t records = many == NULL ? 2 : atoi(many);
+	VERIFY3U(records, >=, 2);
+	VERIFY3U(records, <=, 512);
 	char name[] = "pr19262_tx/journal";
 	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
 	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COPIES, 2, B_FALSE));
@@ -12426,12 +12430,13 @@ pr19262_journal_test(spa_t *spa)
 	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
 	    131072, DMU_OT_NONE, 0, tx);
 	dmu_tx_commit(tx);
-	void *data = kmem_alloc(262144, KM_SLEEP);
-	memset(data, 0x11, 262144);
+	uint64_t bytes = records * 131072ULL;
+	void *data = kmem_alloc(bytes, KM_SLEEP);
+	memset(data, 0x11, bytes);
 	tx = dmu_tx_create(os);
-	dmu_tx_hold_write(tx, object, 0, 262144);
+	dmu_tx_hold_write(tx, object, 0, bytes);
 	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
-	dmu_write(os, object, 0, 262144, data, tx, 0);
+	dmu_write(os, object, 0, bytes, data, tx, 0);
 	dmu_tx_commit(tx);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
 	zilog_t *zilog = zil_open(os, pr19262_journal_get_data, NULL);
@@ -12454,7 +12459,7 @@ pr19262_journal_test(spa_t *spa)
 		    "nested") == 0 ? 16 * 1024 : 64 * 1024;
 		metaslab_force_ganging_pct = 100;
 	}
-	for (uint_t i = 0; i < 2; i++) {
+	for (uint_t i = 0; i < records; i++) {
 		if (i == 1 && (stage % 10 == 1 || stage % 10 == 2)) {
 			pr19262_j_job_t j = { .os = os, .zilog = zilog,
 			    .object = object };
@@ -12487,7 +12492,7 @@ pr19262_journal_test(spa_t *spa)
 			_exit(0);
 		}
 		pr19262_journal_write(os, zilog, object, i * 131072,
-		    i == 0 ? 0x51 : 0xa7, B_TRUE);
+		    i % 2 == 0 ? 0x51 : 0xa7, B_TRUE);
 		VERIFY3U(spa_last_synced_txg(spa), ==, ub);
 		uberblock_t after;
 		vdev_uberblock_load(spa->spa_root_vdev, &after, &label);
@@ -12549,6 +12554,8 @@ pr19262_journal_clone_test(spa_t *spa)
 {
 	boolean_t checkpoint_first =
 	    getenv("PR19262_CHECKPOINT_BEFORE_MOVES") != NULL;
+	boolean_t rollover = getenv("PR19262_JOURNAL_ROLLOVER") != NULL;
+	char *roll_fault = getenv("PR19262_JOURNAL_ROLL_FAULT");
 	char name[] = "pr19262_tx/journal";
 	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
 	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COPIES, 2, B_FALSE));
@@ -12609,6 +12616,27 @@ pr19262_journal_clone_test(spa_t *spa)
 	for (uint_t b = 0; b < 2; b++) {
 		VERIFY3U(BP_GET_NDVAS(&bps[b]), ==, 2);
 		for (int d = 0; d < 2; d++) {
+			if (rollover) {
+				if (roll_fault != NULL)
+					pr19262_engine_journal_roll_fault(
+					    atoi(roll_fault));
+				int error =
+				    pr19262_engine_journal_roll(spa);
+				if (roll_fault != NULL) {
+					VERIFY3S(error, ==, EIO);
+					int retry =
+					    pr19262_engine_journal_roll(spa);
+					VERIFY3S(retry, ==, EIO);
+					dmu_tx_commit(fence);
+					txg_wait_synced(spa->spa_dsl_pool, 0);
+					pr19262_engine_check(spa,
+					    "rollover-error-quarantine");
+					(void) printf("PR19262_J_ROLL_ERROR\n");
+					(void) fflush(NULL);
+					_exit(0);
+				}
+				VERIFY0(error);
+			}
 			pr19262_engine_info_t before, after;
 			pr19262_engine_inspect(spa, &bps[b], d, &before);
 			void *copy;
@@ -12621,6 +12649,10 @@ pr19262_journal_clone_test(spa_t *spa)
 				VERIFY3U(before.p, ==, after.p);
 				VERIFY3U(after.versions, ==,
 				    before.versions + 1);
+				void *retry = NULL;
+				VERIFY3S(pr19262_engine_copy_begin(spa, &bps[b],
+				    d, birth, &retry), ==, EIO);
+				VERIFY3P(retry, ==, NULL);
 				dmu_tx_commit(fence);
 				txg_wait_synced(spa->spa_dsl_pool, 0);
 				pr19262_engine_check(spa,
@@ -12740,6 +12772,10 @@ pr19262_journal_cold(const char *directory)
 	VERIFY3U(info.doi_type, ==, DMU_OT_UINT64_OTHER);
 	VERIFY3U(info.doi_data_block_size, ==, 131072);
 	boolean_t clone = getenv("PR19262_JOURNAL_CLONE") != NULL;
+	boolean_t forward_write =
+	    getenv("PR19262_JOURNAL_FORWARD_WRITE") != NULL;
+	boolean_t forward_replayed =
+	    getenv("PR19262_JOURNAL_FORWARD_REPLAYED") != NULL;
 	boolean_t removed = getenv("PR19262_JOURNAL_SOURCE_REMOVED") != NULL;
 	uint64_t source_object = object;
 	if (clone)
@@ -12779,15 +12815,51 @@ pr19262_journal_cold(const char *directory)
 		(void) zil_replay(os, &r, vector);
 		(void) printf("PR19262_J_REPLAY count=%llu error=%d\n",
 		    (u_longlong_t)r.count, dmu_objset_zil(os)->zl_parse_error);
+		if (forward_write) {
+			zilog_t *zilog = zil_open(os,
+			    pr19262_journal_get_data, NULL);
+			pr19262_journal_write(os, zilog, object, 0,
+			    0x11, B_FALSE);
+			txg_wait_synced(spa->spa_dsl_pool, 0);
+			dmu_tx_t *fence = dmu_tx_create(os);
+			VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
+			txg_wait_synced(spa->spa_dsl_pool,
+			    dmu_tx_get_txg(fence) - 1);
+			uberblock_t durable, after;
+			nvlist_t *label;
+			vdev_uberblock_load(spa->spa_root_vdev,
+			    &durable, &label);
+			fnvlist_free(label);
+			pr19262_journal_write(os, zilog, object, 0,
+			    0x51, B_TRUE);
+			pr19262_journal_write(os, zilog, object, 131072,
+			    0xa7, B_TRUE);
+			vdev_uberblock_load(spa->spa_root_vdev,
+			    &after, &label);
+			fnvlist_free(label);
+			VERIFY0(memcmp(&durable, &after, sizeof (durable)));
+			(void) printf("PR19262_J_AFTER_FORWARD_ACKS "
+			    "ub=%llu fence=%llu\n",
+			    (u_longlong_t)durable.ub_txg,
+			    (u_longlong_t)dmu_tx_get_txg(fence));
+			if (getenv("PR19262_JOURNAL_FORWARD_CRASH") != NULL) {
+				(void) fflush(NULL);
+				_exit(0);
+			}
+			dmu_tx_commit(fence);
+			zil_close(zilog);
+		}
 	}
-	boolean_t replayed = write ||
+	boolean_t replayed = write || forward_write || forward_replayed ||
 	    getenv("PR19262_JOURNAL_REPLAYED") != NULL;
 	boolean_t prefix = getenv("PR19262_JOURNAL_PREFIX_ONLY") != NULL;
 	void *data = kmem_alloc(131072, KM_SLEEP);
-	for (uint_t b = 0; b < 2; b++) {
+	uint64_t records = clone ? 2 : info.doi_max_offset / 131072;
+	VERIFY3U(records, >=, 2);
+	for (uint_t b = 0; b < records; b++) {
 		VERIFY0(dmu_read(os, object, b * 131072, 131072,
 		    data, DMU_READ_NO_PREFETCH));
-		uint8_t expected = replayed ? (b == 0 ? 0x51 : 0xa7) : 0x11;
+		uint8_t expected = replayed ? (b % 2 == 0 ? 0x51 : 0xa7) : 0x11;
 		if (prefix && b == 1)
 			expected = 0x11;
 		for (uint_t i = 0; i < 131072; i++)
@@ -12805,7 +12877,8 @@ pr19262_journal_cold(const char *directory)
 				    removed ? 0 : (b == 0 ? 0x51 : 0xa7));
 		}
 	}
-	if (clone && replayed && !removed) {
+	if (clone && replayed && !removed &&
+	    !forward_write && !forward_replayed) {
 		blkptr_t source[2], dest[2];
 		size_t ns = 2, nd = 2;
 		VERIFY0(dmu_read_l0_bps(os, source_object, 0, 262144,

@@ -75,6 +75,14 @@ typedef struct engine_copy {
 	uint64_t psize;
 } engine_copy_t;
 
+typedef struct engine_j_segment {
+	struct engine_j_segment *next;
+	uint64_t arena;
+	uint64_t epoch[2];
+	uint64_t seq;
+	zio_cksum_t hash;
+} engine_j_segment_t;
+
 static int engine_journal_bind_copy(engine_copy_t *);
 
 static struct {
@@ -112,6 +120,11 @@ static struct {
 	uint64_t journal_arena;
 	uint64_t journal_bytes;
 	uint64_t journal_epoch[2];
+	uint64_t journal_root;
+	uint64_t journal_root_epoch[2];
+	zfs_range_tree_t *journal_extents;
+	engine_j_segment_t *journal_segments;
+	engine_j_segment_t *journal_tail;
 	uint64_t journal_seq;
 	zio_cksum_t journal_hash;
 	boolean_t journal_formatted;
@@ -702,15 +715,19 @@ pr19262_engine_dispatch(zio_t *zio)
 		    zio->io_offset - low <= engine.arena_bytes &&
 		    zio->io_size <= engine.arena_bytes -
 		    (zio->io_offset - low);
-		low = VDEV_LABEL_START_SIZE +
-		    engine.journal_arena / engine.vd->vdev_children;
+		low = VDEV_LABEL_START_SIZE;
 		metadata |= engine.persistent &&
 		    zio->io_pr19262_metadata_authority == &engine &&
 		    zio->io_vd->vdev_parent == engine.vd &&
 		    zio->io_offset >= low &&
-		    zio->io_offset - low <= engine.journal_bytes &&
-		    zio->io_size <= engine.journal_bytes -
-		    (zio->io_offset - low);
+		    zio->io_offset - low <=
+		    engine.total / engine.vd->vdev_children &&
+		    zio->io_size <= engine.total / engine.vd->vdev_children -
+		    (zio->io_offset - low) &&
+		    engine.journal_extents != NULL &&
+		    zfs_range_tree_contains(engine.journal_extents,
+		    (zio->io_offset - low) * engine.vd->vdev_children,
+		    zio->io_size * engine.vd->vdev_children);
 		/* Labels/probes are outside the data area. */
 		boolean_t unsafe = zio->io_type == ZIO_TYPE_WRITE &&
 		    zio->io_vd->vdev_ops->vdev_op_leaf &&
@@ -840,6 +857,11 @@ pr19262_engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d,
 	    DVA_GET_VDEV(dva) != engine.vd->vdev_id) {
 		mutex_exit(&engine.lock);
 		return (ENOTSUP);
+	}
+	if (engine.persistent && engine.journal_error != 0) {
+		int error = engine.journal_error;
+		mutex_exit(&engine.lock);
+		return (error);
 	}
 	if (DVA_GET_GANG(dva))
 		psize = vdev_gang_header_psize(engine.vd);
@@ -1033,14 +1055,15 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 	}
 	VERIFY3U(owned + zfs_range_tree_space(engine.free) +
 	    zfs_range_tree_space(engine.legacy) +
-	    (engine.arena_bytes + engine.journal_bytes) *
-	    engine.vd->vdev_children, ==, engine.total);
+	    engine.arena_bytes * engine.vd->vdev_children +
+	    (engine.journal_extents == NULL ? 0 :
+	    zfs_range_tree_space(engine.journal_extents)), ==, engine.total);
 	if (engine.arena_bytes != 0)
 		zfs_range_tree_add(seen, engine.arena,
 		    engine.arena_bytes * engine.vd->vdev_children);
-	if (engine.journal_bytes != 0)
-		zfs_range_tree_add(seen, engine.journal_arena,
-		    engine.journal_bytes * engine.vd->vdev_children);
+	if (engine.journal_extents != NULL)
+		zfs_range_tree_walk(engine.journal_extents,
+		    zfs_range_tree_add, seen);
 	zfs_range_tree_walk(engine.free, zfs_range_tree_add, seen);
 	zfs_range_tree_walk(engine.legacy, zfs_range_tree_add, seen);
 	VERIFY3U(zfs_range_tree_space(seen), ==, engine.total);
