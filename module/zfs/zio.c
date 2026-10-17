@@ -1061,6 +1061,8 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 
 	taskq_init_ent(&zio->io_tqent);
 #ifndef _KERNEL
+	if (pio != NULL)
+		zio->io_pr19262_backing_birth = pio->io_pr19262_backing_birth;
 	zio->io_pr19262_owner_hold = pr19262_engine_hold(spa, bp,
 	    pio != NULL ? pio->io_pr19262_owner_hold : NULL,
 	    type == ZIO_TYPE_READ, (flags & ZIO_FLAG_GANG_CHILD) != 0);
@@ -1073,6 +1075,7 @@ void
 zio_destroy(zio_t *zio)
 {
 #ifndef _KERNEL
+	pr19262_engine_io_rele(zio);
 	pr19262_reloc_rele(zio->io_pr19262_hold);
 	pr19262_engine_rele(zio->io_pr19262_owner_hold);
 #endif
@@ -1399,6 +1402,39 @@ zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 }
 
 #ifndef _KERNEL
+zio_t *
+pr19262_engine_physical_io(spa_t *spa, blkptr_t *bp, vdev_t *vd,
+    uint64_t v, abd_t *data, uint64_t size, zio_type_t type,
+    uint64_t txg, void *version)
+{
+	VERIFY(type == ZIO_TYPE_READ || type == ZIO_TYPE_WRITE);
+	zio_flag_t flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY |
+	    ZIO_FLAG_RAW | ZIO_FLAG_IO_REWRITE;
+	zio_priority_t priority = type == ZIO_TYPE_READ ?
+	    ZIO_PRIORITY_SYNC_READ : ZIO_PRIORITY_SYNC_WRITE;
+	/* Keep a logical owner for checksum reports and error propagation. */
+	zio_t *parent = zio_create(NULL, spa, txg, bp, data, size, size,
+	    NULL, NULL, type, priority, flags, NULL, 0, NULL,
+	    ZIO_STAGE_OPEN, ZIO_ROOT_PIPELINE);
+	/* Only this concrete extent is copied; do not traverse gang members. */
+	parent->io_pipeline = parent->io_orig_pipeline = ZIO_ROOT_PIPELINE;
+	parent->io_bp_copy = *bp;
+	parent->io_bp = &parent->io_bp_copy;
+	enum zio_stage pipeline = ZIO_VDEV_CHILD_PIPELINE;
+	if (type == ZIO_TYPE_READ)
+		pipeline |= ZIO_STAGE_CHECKSUM_VERIFY;
+	zio_t *zio = zio_create(parent, spa, txg, bp, data, size, size,
+	    NULL, NULL, type, priority, flags, vd, v, NULL,
+	    ZIO_STAGE_OPEN, pipeline);
+	/* Original BP seeds the embedded gang verifier; no synthetic P-BP. */
+	zio->io_bp_copy = *bp;
+	zio->io_bp = &zio->io_bp_copy;
+	zio->io_pr19262_owner_version = version;
+	zio->io_pr19262_owner_copy = B_TRUE;
+	zio_nowait(zio);
+	return (parent);
+}
+
 zio_t *
 pr19262_engine_read_bound(zio_t *pio, spa_t *spa, const blkptr_t *bp,
     abd_t *data, uint64_t size, zio_done_func_t *done, void *private,
@@ -5247,6 +5283,8 @@ zio_vdev_io_start(zio_t *zio)
 #ifndef _KERNEL
 	{
 		int error = pr19262_engine_dispatch(zio);
+		if (error == EINPROGRESS)
+			return (NULL);
 		if (error != 0) {
 			zio->io_error = error;
 			zio_execute(zio);
@@ -5341,12 +5379,17 @@ zio_vdev_io_start(zio_t *zio)
 	 * spurious ones. At this point, just avoid all bypassing for dRAID
 	 * for correctness.
 	 */
+	uint64_t repair_birth = zio->io_txg;
+#ifndef _KERNEL
+	if (zio->io_pr19262_backing_birth != 0)
+		repair_birth = zio->io_pr19262_backing_birth;
+#endif
 	if ((zio->io_flags & ZIO_FLAG_IO_REPAIR) &&
 	    !(zio->io_flags & ZIO_FLAG_SELF_HEAL) &&
-	    zio->io_txg != 0 &&	/* not a delegated i/o */
+	    repair_birth != 0 &&	/* not a delegated i/o */
 	    vd->vdev_ops != &vdev_indirect_ops &&
 	    vd->vdev_top->vdev_ops != &vdev_draid_ops &&
-	    !vdev_dtl_contains(vd, DTL_PARTIAL, zio->io_txg, 1)) {
+	    !vdev_dtl_contains(vd, DTL_PARTIAL, repair_birth, 1)) {
 		ASSERT(zio->io_type == ZIO_TYPE_WRITE);
 		zio_vdev_io_bypass(zio);
 		return (zio);

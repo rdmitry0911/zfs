@@ -509,6 +509,9 @@ struct zio {
 	blkptr_t	io_pr19262_owner_bp;
 	uint64_t	io_pr19262_owner_v;
 	boolean_t	io_pr19262_owner_mapped;
+	void		*io_pr19262_owner_version;
+	boolean_t	io_pr19262_owner_copy;
+	uint64_t	io_pr19262_backing_birth;
 #endif
 	zio_transform_t *io_transform_stack;
 

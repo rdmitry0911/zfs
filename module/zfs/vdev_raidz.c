@@ -2755,6 +2755,16 @@ pr19262_probe_actual_birth(zio_t *zio)
 }
 #endif
 
+static uint64_t
+vdev_raidz_read_birth(zio_t *zio)
+{
+#ifndef _KERNEL
+	if (zio->io_pr19262_backing_birth != 0)
+		return (zio->io_pr19262_backing_birth);
+#endif
+	return (zio->io_txg);
+}
+
 static void
 vdev_raidz_io_verify(zio_t *zio, raidz_map_t *rm, raidz_row_t *rr, int col)
 {
@@ -2891,7 +2901,8 @@ vdev_raidz_io_start_read_row(zio_t *zio, raidz_row_t *rr, boolean_t forceparity)
 			rc->rc_skipped = 1;
 			continue;
 		}
-		if (vdev_dtl_contains(cvd, DTL_MISSING, zio->io_txg, 1)) {
+		if (vdev_dtl_contains(cvd, DTL_MISSING,
+		    vdev_raidz_read_birth(zio), 1)) {
 			if (c >= rr->rr_firstdatacol)
 				rr->rr_missingdata++;
 			else
@@ -2969,7 +2980,8 @@ vdev_raidz_io_start_read_phys_cols(zio_t *zio, raidz_map_t *rm)
 			prc->rc_skipped = 1;
 			continue;
 		}
-		if (vdev_dtl_contains(cvd, DTL_MISSING, zio->io_txg, 1)) {
+		if (vdev_dtl_contains(cvd, DTL_MISSING,
+		    vdev_raidz_read_birth(zio), 1)) {
 			prc->rc_error = SET_ERROR(ESTALE);
 			prc->rc_skipped = 1;
 			continue;

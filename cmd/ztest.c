@@ -11926,12 +11926,156 @@ ztest_run_init(void)
 #include <sys/vdev_reloc_probe.h>
 #include <sys/vdev_reloc_engine.h>
 
+typedef struct pr19262_runtime_io {
+	zio_t *zio;
+	int error;
+} pr19262_runtime_io_t;
+
+static void
+pr19262_runtime_wait(void *arg)
+{
+	pr19262_runtime_io_t *io = arg;
+	io->error = zio_wait(io->zio);
+	thread_exit();
+}
+
+static void
+pr19262_runtime_wait_park(boolean_t writers)
+{
+	for (int i = 0; i < 10000 &&
+	    pr19262_engine_waiting(writers) == 0; i++)
+		(void) poll(NULL, 0, 1);
+	VERIFY3U(pr19262_engine_waiting(writers), >, 0);
+}
+
+static void
+pr19262_runtime_move(spa_t *spa, blkptr_t *bp, uint64_t birth,
+    void *data, uint64_t size, boolean_t races)
+{
+	blkptr_t original = *bp;
+	pr19262_engine_info_t before, after;
+	void *copy;
+	pr19262_engine_inspect(spa, bp, 0, &before);
+	uint64_t free = pr19262_engine_limit(spa, B_TRUE);
+	VERIFY0(pr19262_engine_copy_begin(spa, bp, 0, birth, &copy));
+	void *duplicate;
+	VERIFY3S(pr19262_engine_copy_begin(spa, bp, 0, birth,
+	    &duplicate), ==, EBUSY);
+	/* A corrupt staging copy returns P without changing the binding. */
+	VERIFY3S(pr19262_engine_copy_run(copy, B_TRUE), ==, ECKSUM);
+	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==, free);
+	pr19262_engine_inspect(spa, bp, 0, &after);
+	VERIFY0(memcmp(&before, &after, sizeof (before)));
+	pr19262_engine_check(spa, races ? "data-copy-rollback" :
+	    "metadata-copy-rollback");
+
+	abd_t *pending_data = NULL, *old_data = NULL, *write_data = NULL;
+	zio_t *pending = NULL;
+	void *scan = NULL;
+	kthread_t *reader = NULL, *writer = NULL;
+	pr19262_runtime_io_t read_io = { 0 }, write_io = { 0 };
+	blkptr_t one = *bp;
+	if (races) {
+		VERIFY(!BP_IS_GANG(bp));
+		BP_ZERO_DVAS(&one);
+		one.blk_dva[0] = bp->blk_dva[0];
+		pending_data = abd_alloc_for_io(size, B_FALSE);
+		old_data = abd_alloc_for_io(size, B_FALSE);
+		write_data = abd_alloc_for_io(size, B_FALSE);
+		abd_copy_from_buf(write_data, data, size);
+		pending = zio_read(NULL, spa, &one, pending_data, size,
+		    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
+		    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL);
+		scan = pr19262_scan_probe_create(spa, bp);
+		pr19262_engine_park_next();
+		read_io.zio = zio_read(NULL, spa, &one, old_data, size,
+		    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
+		    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL);
+		reader = _thread_create(NULL, 0, pr19262_runtime_wait,
+		    &read_io, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
+		pr19262_runtime_wait_park(B_FALSE);
+	}
+	VERIFY0(pr19262_engine_copy_begin(spa, bp, 0, birth, &copy));
+	if (races) {
+		write_io.zio = zio_rewrite(NULL, spa,
+		    spa_last_synced_txg(spa) + 1, &one, write_data, size,
+		    NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
+		    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW | ZIO_FLAG_DONT_RETRY,
+		    NULL);
+		writer = _thread_create(NULL, 0, pr19262_runtime_wait,
+		    &write_io, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
+		pr19262_runtime_wait_park(B_TRUE);
+	}
+	VERIFY0(pr19262_engine_copy_run(copy, B_FALSE));
+	if (races) {
+		VERIFY0(thread_join(writer));
+		VERIFY0(write_io.error);
+	}
+	pr19262_engine_inspect(spa, bp, 0, &after);
+	VERIFY3U(after.p, !=, before.p);
+	VERIFY3U(after.vsize, ==, before.vsize);
+	VERIFY3U(after.birth, ==, birth);
+	VERIFY3U(after.versions, ==, before.versions + 1);
+	if (races) {
+		VERIFY3U(before.psize, ==, 160 * 1024);
+		VERIFY3U(after.psize, ==, 192 * 1024);
+		VERIFY3U(after.old_leases, ==, 1);
+		pr19262_engine_check(spa, "old-issued-read-new-copy");
+		VERIFY0(zio_wait(pending));
+		VERIFY0(abd_cmp_buf(pending_data, data, size));
+		pr19262_engine_block_new(B_TRUE);
+		VERIFY0(pr19262_scan_probe_issue(scan));
+		pr19262_engine_block_new(B_FALSE);
+		pr19262_engine_unpark();
+		VERIFY0(thread_join(reader));
+		VERIFY0(read_io.error);
+		VERIFY0(abd_cmp_buf(old_data, data, size));
+		abd_free(old_data);
+		abd_free(pending_data);
+		abd_free(write_data);
+		pr19262_engine_inspect(spa, bp, 0, &after);
+		VERIFY0(after.old_leases);
+	}
+	/* Convert each ditto descriptor, retaining original BP.P. */
+	for (int d = 1; d < BP_GET_NDVAS(bp); d++) {
+		VERIFY0(pr19262_engine_copy_begin(spa, bp, d, birth, &copy));
+		VERIFY0(pr19262_engine_copy_run(copy, B_FALSE));
+	}
+	VERIFY0(memcmp(bp, &original, sizeof (*bp)));
+	/* Ordinary dispatch must read each moved data/MOS/gang BP. */
+	uint64_t bytes = BP_GET_PSIZE(bp);
+	abd_t *ordinary = abd_alloc_for_io(bytes, B_FALSE);
+	VERIFY0(zio_wait(zio_read(NULL, spa, bp, ordinary, bytes,
+	    NULL, NULL, ZIO_PRIORITY_SCRUB,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW | ZIO_FLAG_SCRUB, NULL)));
+	if (data != NULL)
+		VERIFY0(abd_cmp_buf(ordinary, data, bytes));
+	abd_free(ordinary);
+	(void) printf("PR19262_ENGINE_MOVE gang=%u level=%llu copies=%u "
+	    "V=%llu Pold=%llu Pnew=%llu oldbirth=%llu newbirth=%llu "
+	    "races=%u unchanged_BP=1\n", (uint_t)BP_IS_GANG(bp),
+	    (u_longlong_t)BP_GET_LEVEL(bp), BP_GET_NDVAS(bp),
+	    (u_longlong_t)after.vsize, (u_longlong_t)before.psize,
+	    (u_longlong_t)after.psize,
+	    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(bp),
+	    (u_longlong_t)after.birth, races);
+}
+
 static void
 pr19262_runtime_raw(spa_t *spa, const blkptr_t *bp, void *expected,
     uint64_t size)
 {
-	VERIFY3U(BP_GET_NDVAS(bp), ==, 2);
+	VERIFY3U(BP_GET_NDVAS(bp), >, 0);
 	abd_t *abd = abd_alloc_for_io(size, B_FALSE);
+	if (BP_IS_GANG(bp)) {
+		/* Keep the gang verifier identity when checking replicas. */
+		VERIFY0(zio_wait(zio_read(NULL, spa, bp, abd, size,
+		    NULL, NULL, ZIO_PRIORITY_SCRUB,
+		    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW | ZIO_FLAG_SCRUB, NULL)));
+		VERIFY0(abd_cmp_buf(abd, expected, size));
+		abd_free(abd);
+		return;
+	}
 	for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
 		blkptr_t one = *bp;
 		BP_ZERO_DVAS(&one);
@@ -11997,6 +12141,12 @@ pr19262_runtime_test(spa_t *spa)
 	pr19262_tx_fail_second(B_FALSE);
 	VERIFY0(BP_GET_NDVAS(&failed));
 	VERIFY0(BP_GET_PHYSICAL_BIRTH(&failed));
+	VERIFY0(metaslab_alloc(spa, spa_normal_class(spa), 4096, &failed,
+	    2, fault_txg, NULL, 0, &trace, 0, FTAG));
+	void *premature;
+	VERIFY3S(pr19262_engine_copy_begin(spa, &failed, 0, fault_txg,
+	    &premature), ==, EBUSY);
+	metaslab_free(spa, &failed, fault_txg, B_TRUE);
 	metaslab_trace_fini(&trace);
 	dmu_tx_commit(fence);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
@@ -12018,6 +12168,15 @@ pr19262_runtime_test(spa_t *spa)
 	    NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
 	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY, NULL)), ==, EIO);
 	pr19262_engine_fail_writes(B_FALSE);
+	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==, free_before_error);
+	blkptr_t unpublished = { 0 };
+	VERIFY0(zio_wait(zio_write(NULL, spa, dmu_tx_get_txg(fence),
+	    &unpublished, fault_data, 16384, 16384, &prop, NULL, NULL,
+	    NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY, NULL)));
+	VERIFY3S(pr19262_engine_copy_begin(spa, &unpublished, 0,
+	    dmu_tx_get_txg(fence), &premature), ==, EBUSY);
+	metaslab_free(spa, &unpublished, dmu_tx_get_txg(fence), B_TRUE);
 	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==, free_before_error);
 	abd_free(fault_data);
 	dmu_tx_commit(fence);
@@ -12074,6 +12233,28 @@ pr19262_runtime_test(spa_t *spa)
 	blkptr_t headbp = *((dmu_buf_impl_t *)headbuf)->db_blkptr;
 	VERIFY(BP_IS_GANG(&headbp));
 	dmu_buf_rele(headbuf, FTAG);
+	/* Change epoch in this same SPA, with no supplied physical mappings. */
+	ztest_pe_append_t append = { .pa_vdev = 0, .pa_width = 6,
+	    .pa_parity = 2, .pa_lead = TXG_CONCURRENT_STATES };
+	VERIFY0(dsl_sync_task(spa_name(spa), ztest_pe_append_check,
+	    ztest_pe_append_sync, &append, 5, ZFS_SPACE_CHECK_NORMAL));
+	uint64_t birth = append.pa_table[3 * (append.pa_nent - 1)];
+	ztest_pe_wait_epoch(spa, birth);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	fence = dmu_tx_create(os);
+	VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
+	pr19262_runtime_move(spa, &bp[0], birth, data, size, B_TRUE);
+	for (uint64_t i = 0; i < blocks; i++)
+		pr19262_runtime_raw(spa, &bp[i], data, size);
+	pr19262_engine_check(spa, "live-shared-data-changed-asize");
+	blkptr_t moving_mos = spa->spa_uberblock.ub_rootbp;
+	pr19262_runtime_move(spa, &moving_mos, birth, NULL,
+	    BP_GET_PSIZE(&moving_mos), B_FALSE);
+	pr19262_engine_check(spa, "live-MOS-copy");
+	pr19262_runtime_move(spa, &headbp, birth, NULL, size, B_FALSE);
+	pr19262_runtime_raw(spa, &headbp, readback, size);
+	pr19262_engine_check(spa, "live-gang-header-copy");
+	dmu_tx_commit(fence);
 	abd_t *queued_data = abd_alloc_for_io(size, B_FALSE);
 	zio_t *queued = zio_read(NULL, spa, &headbp, queued_data, size,
 	    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
@@ -12164,6 +12345,8 @@ pr19262_tx_driver(const char *directory)
 	    (const nvlist_t * const *)&top, 1));
 	nvlist_t *props = fnvlist_alloc();
 	fnvlist_add_string(props, "cachefile", "none");
+	if (getenv("PR19262_RUNTIME_ENGINE") != NULL)
+		fnvlist_add_uint64(props, "feature@raidz_parity_epochs", 0);
 	VERIFY0(spa_create("pr19262_tx", root, props, NULL, NULL, NULL));
 	spa_t *spa;
 	VERIFY0(spa_open("pr19262_tx", &spa, FTAG));
