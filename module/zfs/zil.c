@@ -37,6 +37,9 @@
 #include <sys/abd.h>
 #include <sys/brt.h>
 #include <sys/wmsum.h>
+#ifndef _KERNEL
+#include <sys/vdev_reloc_engine.h>
+#endif
 
 /*
  * The ZFS Intent Log (ZIL) saves "transaction records" (itxs) of system
@@ -638,6 +641,14 @@ zil_claim_write(zilog_t *zilog, const lr_t *lrc, void *tx, uint64_t first_txg)
 	 */
 	if (BP_GET_BIRTH(&lr->lr_blkptr) >= first_txg) {
 		error = zil_read_log_data(zilog, lr, NULL);
+#ifndef _KERNEL
+		if (pr19262_engine_persistent(zilog->zl_spa))
+			(void) printf("PR19262_J_DATA_READ error=%d birth=%llu "
+			    "v=%llu\n", error,
+			    (u_longlong_t)BP_GET_BIRTH(&lr->lr_blkptr),
+			    (u_longlong_t)DVA_GET_OFFSET(
+			    &lr->lr_blkptr.blk_dva[0]));
+#endif
 		if (error != 0)
 			return (error);
 	}
@@ -1252,6 +1263,15 @@ zil_claim(dsl_pool_t *dp, dsl_dataset_t *ds, void *txarg)
 	if (zh->zh_claim_txg == 0) {
 		(void) zil_parse(zilog, zil_claim_log_block,
 		    zil_claim_log_record, tx, first_txg, B_FALSE);
+#ifndef _KERNEL
+		if (pr19262_engine_persistent(zilog->zl_spa))
+			(void) printf("PR19262_J_ZIL_CLAIM error=%d "
+			    "blocks=%llu records=%llu first=%llu\n",
+			    zilog->zl_parse_error,
+			    (u_longlong_t)zilog->zl_parse_blk_count,
+			    (u_longlong_t)zilog->zl_parse_lr_count,
+			    (u_longlong_t)first_txg);
+#endif
 		zh->zh_claim_txg = first_txg;
 		zh->zh_claim_blk_seq = zilog->zl_parse_blk_seq;
 		zh->zh_claim_lr_seq = zilog->zl_parse_lr_seq;
@@ -1414,6 +1434,16 @@ zil_lwb_add_block(lwb_t *lwb, const blkptr_t *bp)
 	ASSERT3S(lwb->lwb_state, !=, LWB_STATE_WRITE_DONE);
 	ASSERT3S(lwb->lwb_state, !=, LWB_STATE_FLUSH_DONE);
 
+#ifndef _KERNEL
+	if (pr19262_engine_persistent(lwb->lwb_zilog->zl_spa)) {
+		if (lwb->lwb_child_zio == NULL)
+			lwb->lwb_child_zio = zio_null(NULL,
+			    lwb->lwb_zilog->zl_spa, NULL, NULL, NULL,
+			    ZIO_FLAG_CANFAIL);
+		pr19262_engine_journal_gate(lwb->lwb_child_zio,
+		    lwb->lwb_zilog->zl_spa, bp);
+	}
+#endif
 	if (zil_nocacheflush)
 		return;
 

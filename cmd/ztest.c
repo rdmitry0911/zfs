@@ -12320,6 +12320,285 @@ pr19262_runtime_test(spa_t *spa)
 	kmem_free(readback, size);
 }
 
+static void
+pr19262_journal_data_done(zgd_t *zgd, int error)
+{
+	(void) error;
+	if (zgd->zgd_db != NULL)
+		dmu_buf_rele(zgd->zgd_db, zgd);
+	kmem_free(zgd, sizeof (*zgd));
+}
+
+static int
+pr19262_journal_get_data(void *arg, uint64_t arg2, lr_write_t *lr,
+    char *buf, struct lwb *lwb, zio_t *pio)
+{
+	(void) arg2;
+	objset_t *os = arg;
+	if (buf != NULL)
+		return (dmu_read(os, lr->lr_foid, lr->lr_offset,
+		    lr->lr_length, buf, DMU_READ_NO_PREFETCH));
+	zgd_t *zgd = kmem_zalloc(sizeof (*zgd), KM_SLEEP);
+	zgd->zgd_lwb = lwb;
+	zgd->zgd_bp = &lr->lr_blkptr;
+	int error = dmu_buf_hold_noread(os, lr->lr_foid,
+	    P2ALIGN_TYPED(lr->lr_offset, 131072, uint64_t),
+	    zgd, &zgd->zgd_db);
+	if (error == 0)
+		error = dmu_sync(pio, lr->lr_common.lrc_txg,
+		    pr19262_journal_data_done, zgd);
+	if (error != 0)
+		pr19262_journal_data_done(zgd, error);
+	return (error);
+}
+
+static void
+pr19262_journal_write(objset_t *os, zilog_t *zilog, uint64_t object,
+    uint64_t offset, uint8_t value, boolean_t indirect)
+{
+	uint64_t size = indirect ? 131072 : 8192;
+	void *data = kmem_alloc(size, KM_SLEEP);
+	memset(data, value, size);
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_write(tx, object, offset, size);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	dmu_write(os, object, offset, size, data, tx, 0);
+	itx_t *itx = zil_itx_create(TX_WRITE, sizeof (lr_write_t) +
+	    (indirect ? 0 : size));
+	itx->itx_private = os;
+	itx->itx_wr_state = indirect ? WR_INDIRECT : WR_COPIED;
+	itx->itx_sync = B_TRUE;
+	lr_write_t *lr = (lr_write_t *)&itx->itx_lr;
+	lr->lr_foid = object;
+	lr->lr_offset = offset;
+	lr->lr_length = size;
+	if (!indirect)
+		memcpy(lr + 1, data, size);
+	zil_itx_assign(zilog, itx, tx);
+	dmu_tx_commit(tx);
+	kmem_free(data, size);
+	VERIFY0(zil_commit(zilog, object));
+}
+
+typedef struct pr19262_j_job {
+	objset_t *os;
+	zilog_t *zilog;
+	uint64_t object;
+	kmutex_t lock;
+	kcondvar_t changed;
+	boolean_t done;
+} pr19262_j_job_t;
+
+static void
+pr19262_journal_failed_commit(void *arg)
+{
+	pr19262_j_job_t *j = arg;
+	pr19262_journal_write(j->os, j->zilog, j->object,
+	    131072, 0xa7, B_TRUE);
+	mutex_enter(&j->lock);
+	j->done = B_TRUE;
+	cv_broadcast(&j->changed);
+	mutex_exit(&j->lock);
+	thread_exit();
+}
+
+static void
+pr19262_journal_test(spa_t *spa)
+{
+	char name[] = "pr19262_tx/journal";
+	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COPIES, 2, B_FALSE));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+	    ZIO_COMPRESS_OFF, B_FALSE));
+	objset_t *os;
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE,
+	    FTAG, &os));
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
+	    131072, DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	void *data = kmem_alloc(262144, KM_SLEEP);
+	memset(data, 0x11, 262144);
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_write(tx, object, 0, 262144);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	dmu_write(os, object, 0, 262144, data, tx, 0);
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	zilog_t *zilog = zil_open(os, pr19262_journal_get_data, NULL);
+	/* Commit the native ZIL head into MOS before holding the TXG fence. */
+	pr19262_journal_write(os, zilog, object, 0, 0x11, B_FALSE);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	dmu_tx_t *fence = dmu_tx_create(os);
+	VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
+	txg_wait_synced(spa->spa_dsl_pool, dmu_tx_get_txg(fence) - 1);
+	uint64_t ub = spa_last_synced_txg(spa);
+	uberblock_t durable;
+	nvlist_t *label;
+	vdev_uberblock_load(spa->spa_root_vdev, &durable, &label);
+	fnvlist_free(label);
+	VERIFY3U(durable.ub_txg, >, 0);
+	const char *fault = getenv("PR19262_JOURNAL_FAULT");
+	uint_t stage = fault == NULL ? 0 : atoi(fault);
+	for (uint_t i = 0; i < 2; i++) {
+		if (i == 1 && (stage == 1 || stage == 2)) {
+			pr19262_j_job_t j = { .os = os, .zilog = zilog,
+			    .object = object };
+			mutex_init(&j.lock, NULL, MUTEX_DEFAULT, NULL);
+			cv_init(&j.changed, NULL, CV_DEFAULT, NULL);
+			kthread_t *thread = _thread_create(NULL, 0,
+			    pr19262_journal_failed_commit, &j, 0, NULL,
+			    TS_RUN | TS_JOINABLE, defclsyspri);
+			VERIFY3S(pr19262_engine_journal_wait_error(), ==, EIO);
+			mutex_enter(&j.lock);
+			hrtime_t deadline = gethrtime() + MSEC2NSEC(100);
+			while (!j.done && gethrtime() < deadline)
+				(void) cv_timedwait_hires(&j.changed, &j.lock,
+				    deadline, USEC2NSEC(1),
+				    CALLOUT_FLAG_ABSOLUTE);
+			VERIFY(!j.done);
+			mutex_exit(&j.lock);
+			VERIFY3U(spa_last_synced_txg(spa), ==, ub);
+			(void) printf("PR19262_J_ERROR_NO_ACK stage=%u\n",
+			    stage);
+			dmu_tx_commit(fence);
+			VERIFY0(thread_join(thread));
+			txg_wait_synced(spa->spa_dsl_pool, 0);
+			VERIFY3U(spa_last_synced_txg(spa), >, ub);
+			pr19262_engine_check(spa,
+			    "J-error-native-TXG-fallback");
+			(void) printf("PR19262_J_FALLBACK_PASS stage=%u\n",
+			    stage);
+			(void) fflush(NULL);
+			_exit(0);
+		}
+		pr19262_journal_write(os, zilog, object, i * 131072,
+		    i == 0 ? 0x51 : 0xa7, B_TRUE);
+		VERIFY3U(spa_last_synced_txg(spa), ==, ub);
+		uberblock_t after;
+		vdev_uberblock_load(spa->spa_root_vdev, &after, &label);
+		fnvlist_free(label);
+		VERIFY0(memcmp(&durable, &after, sizeof (durable)));
+		(void) printf("PR19262_J_ACK index=%u ub=%llu fence=%llu "
+		    "synced=%llu\n", i, (u_longlong_t)durable.ub_txg,
+		    (u_longlong_t)dmu_tx_get_txg(fence), (u_longlong_t)ub);
+		(void) fflush(NULL);
+		if (i == 0 && stage != 0)
+			pr19262_engine_journal_fault(stage);
+	}
+	pr19262_engine_check(spa, "native-J-ACK-before-UB");
+	(void) fflush(NULL);
+	/* The fence and dirty DMU writes intentionally die without a sync. */
+	_exit(0);
+}
+
+typedef struct pr19262_j_replay {
+	objset_t *os;
+	uint64_t count;
+} pr19262_j_replay_t;
+
+static int
+pr19262_journal_replay_write(void *arg, void *record, boolean_t byteswap)
+{
+	pr19262_j_replay_t *r = arg;
+	lr_write_t *lr = record;
+	if (byteswap)
+		byteswap_uint64_array(lr, sizeof (*lr));
+	VERIFY3U(lr->lr_length, ==, 131072);
+	dmu_tx_t *tx = dmu_tx_create(r->os);
+	dmu_tx_hold_write(tx, lr->lr_foid, lr->lr_offset, lr->lr_length);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	dmu_write(r->os, lr->lr_foid, lr->lr_offset, lr->lr_length,
+	    lr + 1, tx, 0);
+	VERIFY(zil_replaying(dmu_objset_zil(r->os), tx));
+	dmu_tx_commit(tx);
+	r->count++;
+	return (0);
+}
+
+static int
+pr19262_journal_cold(const char *directory)
+{
+	boolean_t write = getenv("PR19262_JOURNAL_REPLAY") != NULL;
+	char *cache;
+	VERIFY3S(asprintf(&cache, "%s/private-cache", directory), >, 0);
+	spa_config_path = cache;
+	kernel_init(write ? SPA_MODE_READ | SPA_MODE_WRITE : SPA_MODE_READ);
+	char *paths[] = { (char *)directory };
+	importargs_t args = { .paths = 1, .path = paths,
+	    .can_be_active = B_TRUE };
+	libpc_handle_t handle = { .lpc_ops = &libzpool_config_ops,
+	    .lpc_printerr = B_TRUE };
+	nvlist_t *config = NULL;
+	char pool[] = "pr19262_tx";
+	nvlist_t *props = fnvlist_alloc();
+	fnvlist_add_string(props, "cachefile", "none");
+	int error = zpool_find_config(&handle, pool, &config, &args);
+	if (error == 0)
+		error = spa_import(pool, config, props,
+		    ZFS_IMPORT_MISSING_LOG | ZFS_IMPORT_SKIP_MMP);
+	fnvlist_free(config);
+	fnvlist_free(props);
+	if (error != 0) {
+		(void) printf("PR19262_J_IMPORT_ERROR %d\n", error);
+		kernel_fini();
+		return (1);
+	}
+	spa_t *spa;
+	VERIFY0(spa_open(pool, &spa, FTAG));
+	VERIFY(pr19262_engine_persistent(spa));
+	objset_t *os;
+	VERIFY0(dmu_objset_own("pr19262_tx/journal", DMU_OST_OTHER,
+	    !write, B_TRUE, FTAG, &os));
+	uint64_t object = 0;
+	VERIFY0(dmu_object_next(os, &object, B_FALSE, 0));
+	dmu_object_info_t info;
+	VERIFY0(dmu_object_info(os, object, &info));
+	VERIFY3U(info.doi_type, ==, DMU_OT_UINT64_OTHER);
+	VERIFY3U(info.doi_data_block_size, ==, 131072);
+	pr19262_j_replay_t r = { .os = os };
+	const zil_header_t *zh = dmu_objset_zil(os)->zl_header;
+	(void) printf("PR19262_J_HEADER claim=%llu blocks=%llu "
+	    "records=%llu flags=%llu birth=%llu v=%llu\n",
+	    (u_longlong_t)zh->zh_claim_txg,
+	    (u_longlong_t)zh->zh_claim_blk_seq,
+	    (u_longlong_t)zh->zh_claim_lr_seq, (u_longlong_t)zh->zh_flags,
+	    (u_longlong_t)BP_GET_BIRTH(&zh->zh_log),
+	    (u_longlong_t)DVA_GET_OFFSET(&zh->zh_log.blk_dva[0]));
+	if (write) {
+		zil_replay_func_t *vector[TX_MAX_TYPE] = {
+			[TX_WRITE] = pr19262_journal_replay_write
+		};
+		(void) zil_replay(os, &r, vector);
+		(void) printf("PR19262_J_REPLAY count=%llu error=%d\n",
+		    (u_longlong_t)r.count, dmu_objset_zil(os)->zl_parse_error);
+	}
+	boolean_t replayed = write ||
+	    getenv("PR19262_JOURNAL_REPLAYED") != NULL;
+	boolean_t prefix = getenv("PR19262_JOURNAL_PREFIX_ONLY") != NULL;
+	void *data = kmem_alloc(131072, KM_SLEEP);
+	for (uint_t b = 0; b < 2; b++) {
+		VERIFY0(dmu_read(os, object, b * 131072, 131072,
+		    data, DMU_READ_NO_PREFETCH));
+		uint8_t expected = replayed ? (b == 0 ? 0x51 : 0xa7) : 0x11;
+		if (prefix && b == 1)
+			expected = 0x11;
+		for (uint_t i = 0; i < 131072; i++)
+			VERIFY3U(((uint8_t *)data)[i], ==, expected);
+	}
+	pr19262_engine_check(spa, "cold-J-claim-replay");
+	(void) printf("PR19262_J_COLD_PASS write=%u replayed=%llu ub=%llu\n",
+	    write, (u_longlong_t)r.count,
+	    (u_longlong_t)spa_last_synced_txg(spa));
+	kmem_free(data, 131072);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	spa_close(spa, FTAG);
+	kernel_fini();
+	return (0);
+}
+
 static int
 pr19262_engine_cold_import(const char *directory, boolean_t write,
     boolean_t crash)
@@ -12452,6 +12731,8 @@ pr19262_tx_driver(const char *directory)
 		pr19262_engine_start(spa);
 		if (getenv("PR19262_ENGINE_DURABLE") != NULL)
 			pr19262_engine_store_enable(spa);
+		if (getenv("PR19262_JOURNAL_TEST") != NULL)
+			pr19262_journal_test(spa);
 		pr19262_runtime_test(spa);
 		(void) fflush(NULL);
 		/* Persistent images need the private importer. */
@@ -12472,6 +12753,10 @@ pr19262_tx_driver(const char *directory)
 int
 main(int argc, char **argv)
 {
+	(void) setvbuf(stdout, NULL, _IOLBF, 0);
+	const char *journal = getenv("PR19262_JOURNAL_COLD");
+	if (journal != NULL)
+		return (pr19262_journal_cold(journal));
 	const char *cold = getenv("PR19262_ENGINE_COLD");
 	if (cold != NULL)
 		return (pr19262_engine_cold_import(cold,

@@ -5910,7 +5910,7 @@ spa_ld_verify_pool_data(spa_t *spa)
 	return (0);
 }
 
-static void
+static int
 spa_ld_claim_log_blocks(spa_t *spa)
 {
 	dmu_tx_t *tx;
@@ -5926,6 +5926,14 @@ spa_ld_claim_log_blocks(spa_t *spa)
 	spa->spa_claiming = B_TRUE;
 
 	tx = dmu_tx_create_assigned(dp, spa_first_txg(spa));
+#ifndef _KERNEL
+	int error = pr19262_engine_journal_claim(spa, spa_first_txg(spa));
+	if (error != 0) {
+		dmu_tx_commit(tx);
+		spa->spa_claiming = B_FALSE;
+		return (error);
+	}
+#endif
 	(void) dmu_objset_find_dp(dp, dp->dp_root_dir_obj,
 	    zil_claim, tx, DS_FIND_CHILDREN);
 	dmu_tx_commit(tx);
@@ -5933,6 +5941,7 @@ spa_ld_claim_log_blocks(spa_t *spa)
 	spa->spa_claiming = B_FALSE;
 
 	spa_set_log_state(spa, SPA_LOG_GOOD);
+	return (0);
 }
 
 static void
@@ -6457,7 +6466,9 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 		/*
 		 * Traverse the ZIL and claim all blocks.
 		 */
-		spa_ld_claim_log_blocks(spa);
+		error = spa_ld_claim_log_blocks(spa);
+		if (error != 0)
+			goto fail;
 
 		/*
 		 * Have the first txg rewrite the labels of the raidz vdevs

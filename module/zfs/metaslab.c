@@ -5860,6 +5860,10 @@ metaslab_unalloc_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
 
 	msp = vd->vdev_ms[offset >> vd->vdev_ms_shift];
 
+#ifndef _KERNEL
+	if (pr19262_engine_journal_unalloc(spa, vd, offset, size))
+		return;
+#endif
 	mutex_enter(&msp->ms_lock);
 	zfs_range_tree_remove(msp->ms_allocating[txg & TXG_MASK],
 	    offset, size);
@@ -6082,6 +6086,11 @@ metaslab_claim_dva(spa_t *spa, const dva_t *dva, uint64_t birth, uint64_t txg)
 	if (DVA_GET_GANG(dva))
 		size = vdev_gang_header_asize(vd, birth);
 
+#ifndef _KERNEL
+	if (txg != 0 && pr19262_engine_journal_claimed(spa, vd,
+	    offset, size, txg))
+		return (0);
+#endif
 	return (metaslab_claim_impl(vd, offset, size, txg));
 }
 
@@ -6250,7 +6259,29 @@ metaslab_claim(spa_t *spa, const blkptr_t *bp, uint64_t txg)
 		 * First do a dry run to make sure all DVAs are claimable,
 		 * so we don't have to unwind from partial failures below.
 		 */
-		if ((error = metaslab_claim(spa, bp, 0)) != 0)
+#ifndef _KERNEL
+		if (pr19262_engine_persistent(spa)) {
+			/* J reserved some V extents before ZIL traversal. */
+			spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
+			for (int d = 0; d < ndvas && error == 0; d++) {
+				vdev_t *vd = vdev_lookup_top(spa,
+				    DVA_GET_VDEV(&dva[d]));
+				uint64_t size = DVA_GET_GANG(&dva[d]) ?
+				    vdev_gang_header_asize(vd,
+				    BP_GET_PHYSICAL_BIRTH(bp)) :
+				    DVA_GET_ASIZE(&dva[d]);
+				if (!pr19262_engine_journal_claimed(spa, vd,
+				    DVA_GET_OFFSET(&dva[d]), size, txg))
+					error = metaslab_claim_dva(spa, &dva[d],
+					    BP_GET_PHYSICAL_BIRTH(bp), 0);
+			}
+			spa_config_exit(spa, SCL_ALLOC, FTAG);
+		} else
+#endif
+		{
+			error = metaslab_claim(spa, bp, 0);
+		}
+		if (error != 0)
 			return (error);
 	}
 

@@ -5217,6 +5217,15 @@ zio_alloc_zil(spa_t *spa, objset_t *os, uint64_t txg, blkptr_t *new_bp,
 		    (u_longlong_t)min_size, (u_longlong_t)max_size, error);
 	}
 
+#ifndef _KERNEL
+	if (error == 0) {
+		error = pr19262_engine_journal_bind(spa, new_bp);
+		if (error != 0) {
+			metaslab_free(spa, new_bp, txg, B_TRUE);
+			BP_ZERO(new_bp);
+		}
+	}
+#endif
 	return (error);
 }
 

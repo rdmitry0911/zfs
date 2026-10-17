@@ -15,6 +15,16 @@ void pr19262_engine_store_unload(spa_t *);
 boolean_t pr19262_engine_store_ub(const uberblock_t *);
 int pr19262_engine_metadata_flush(vdev_t *);
 void pr19262_engine_store_crash(uint64_t);
+int pr19262_engine_journal_bind(spa_t *, const blkptr_t *);
+void pr19262_engine_journal_gate(zio_t *, spa_t *, const blkptr_t *);
+int pr19262_engine_journal_claim(spa_t *, uint64_t);
+boolean_t pr19262_engine_journal_claimed(spa_t *, vdev_t *, uint64_t,
+    uint64_t, uint64_t);
+boolean_t pr19262_engine_journal_unalloc(spa_t *, vdev_t *, uint64_t,
+    uint64_t);
+void pr19262_engine_journal_ub_committed(spa_t *);
+void pr19262_engine_journal_fault(uint_t);
+int pr19262_engine_journal_wait_error(void);
 void pr19262_engine_init(void);
 void pr19262_engine_fini(void);
 void pr19262_engine_start(spa_t *);
