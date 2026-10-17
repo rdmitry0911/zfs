@@ -1358,9 +1358,10 @@ static zio_t *
 zio_read_impl(zio_t *pio, spa_t *spa, const blkptr_t *bp,
     abd_t *data, uint64_t size, zio_done_func_t *done, void *private,
     zio_priority_t priority, zio_flag_t flags, const zbookmark_phys_t *zb,
-    void *bound_hold)
+    void *bound_hold, boolean_t physical)
 {
 	(void) bound_hold;
+	(void) physical;
 	zio_t *zio;
 
 	zio = zio_create(pio, spa, BP_GET_PHYSICAL_BIRTH(bp), bp,
@@ -1370,7 +1371,8 @@ zio_read_impl(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 	    ZIO_DDT_CHILD_READ_PIPELINE : ZIO_READ_PIPELINE);
 
 #ifndef _KERNEL
-	if (zio->io_logical == zio)
+	zio->io_pr19262_physical = physical;
+	if (!physical && zio->io_logical == zio)
 		zio->io_pr19262_hold = bound_hold != NULL ?
 		    bound_hold : pr19262_reloc_hold(spa, bp);
 #endif
@@ -1384,7 +1386,7 @@ zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
     zio_priority_t priority, zio_flag_t flags, const zbookmark_phys_t *zb)
 {
 	return (zio_read_impl(pio, spa, bp, data, size, done, private,
-	    priority, flags, zb, NULL));
+	    priority, flags, zb, NULL, B_FALSE));
 }
 
 #ifndef _KERNEL
@@ -1398,8 +1400,19 @@ pr19262_reloc_read_bound(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 	void *binding = *hold;
 	*hold = NULL;
 	zio_t *zio = zio_read_impl(pio, spa, bp, data, size, done, private,
-	    priority, flags, zb, binding);
+	    priority, flags, zb, binding, B_FALSE);
 	VERIFY3P(zio->io_logical, ==, zio);
+	return (zio);
+}
+
+zio_t *
+pr19262_read_physical(spa_t *spa, const blkptr_t *bp, abd_t *data,
+    uint64_t size)
+{
+	zio_t *zio = zio_read_impl(NULL, spa, bp, data, size, NULL, NULL,
+	    ZIO_PRIORITY_SYNC_READ, ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW |
+	    ZIO_FLAG_SPECULATIVE, NULL, NULL, B_TRUE);
+	VERIFY3P(zio->io_pr19262_hold, ==, NULL);
 	return (zio);
 }
 #endif
@@ -1441,11 +1454,13 @@ zio_write(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp,
 	return (zio);
 }
 
-zio_t *
-zio_rewrite(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp, abd_t *data,
-    uint64_t size, zio_done_func_t *done, void *private,
-    zio_priority_t priority, zio_flag_t flags, zbookmark_phys_t *zb)
+static zio_t *
+zio_rewrite_impl(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp,
+    abd_t *data, uint64_t size, zio_done_func_t *done, void *private,
+    zio_priority_t priority, zio_flag_t flags, zbookmark_phys_t *zb,
+    boolean_t physical)
 {
+	(void) physical;
 	zio_t *zio;
 
 	zio = zio_create(pio, spa, txg, bp, data, size, size, done, private,
@@ -1453,11 +1468,35 @@ zio_rewrite(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp, abd_t *data,
 	    ZIO_STAGE_OPEN, ZIO_REWRITE_PIPELINE);
 
 #ifndef _KERNEL
-	if (getenv("PR19262_SPACE_TEST") != NULL && zio->io_logical == zio)
+	zio->io_pr19262_physical = physical;
+	if (!physical && getenv("PR19262_SPACE_TEST") != NULL &&
+	    zio->io_logical == zio)
 		zio->io_pr19262_hold = pr19262_reloc_hold(spa, bp);
 #endif
 	return (zio);
 }
+
+zio_t *
+zio_rewrite(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp, abd_t *data,
+    uint64_t size, zio_done_func_t *done, void *private,
+    zio_priority_t priority, zio_flag_t flags, zbookmark_phys_t *zb)
+{
+	return (zio_rewrite_impl(pio, spa, txg, bp, data, size, done, private,
+	    priority, flags, zb, B_FALSE));
+}
+
+#ifndef _KERNEL
+zio_t *
+pr19262_write_physical(spa_t *spa, uint64_t txg, blkptr_t *bp, abd_t *data,
+    uint64_t size)
+{
+	zio_t *zio = zio_rewrite_impl(NULL, spa, txg, bp, data, size,
+	    NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL, B_TRUE);
+	VERIFY3P(zio->io_pr19262_hold, ==, NULL);
+	return (zio);
+}
+#endif
 
 void
 zio_write_override(zio_t *zio, blkptr_t *bp, int copies, int gang_copies,

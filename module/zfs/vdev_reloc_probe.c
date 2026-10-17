@@ -479,6 +479,181 @@ probe_space_test(spa_t *spa, const char *output, const blkptr_t *bp)
 	return (0);
 }
 
+static void
+probe_fixture_write(spa_t *spa, vdev_t *vd, uint64_t txg, blkptr_t *bp,
+    abd_t *data, uint64_t size, boolean_t physical)
+{
+	spa_mode_t mode = spa->spa_mode;
+	boolean_t trusted = spa->spa_trust_config;
+	spa->spa_mode |= SPA_MODE_WRITE;
+	spa->spa_trust_config = B_TRUE;
+	spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
+	for (uint64_t i = 0; i < vd->vdev_children; i++) {
+		VERIFY0(zio_wait(vdev_probe(vd->vdev_child[i], NULL)));
+		VERIFY(vdev_writeable(vd->vdev_child[i]));
+	}
+	spa_config_exit(spa, SCL_ALL, FTAG);
+	zio_t *write = physical ?
+	    pr19262_write_physical(spa, txg, bp, data, size) :
+	    zio_rewrite(NULL, spa, txg, bp, data, size, NULL, NULL,
+	    ZIO_PRIORITY_SYNC_WRITE, ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL);
+	VERIFY0(zio_wait(write));
+	spa->spa_mode = mode;
+	spa->spa_trust_config = trusted;
+}
+
+static int
+probe_copy_test(spa_t *spa, const char *output, const blkptr_t *bp)
+{
+	const char *guid = getenv("PR19262_SPACE_RW_GUID");
+	VERIFY3P(guid, !=, NULL);
+	VERIFY3U(strtoull(guid, NULL, 10), ==, spa_guid(spa));
+	VERIFY(!spa_writeable(spa));
+	blkptr_t original = *bp;
+	uint64_t size = BP_GET_PSIZE(bp);
+	abd_t *old = abd_alloc_for_io(size, B_FALSE);
+	abd_t *verify = abd_alloc_for_io(size, B_FALSE);
+	zio_t *queued = probe_read(spa, bp, old);
+	probe_entry_t *e = ((probe_handle_t *)queued->io_pr19262_hold)->entry;
+	void *scan = pr19262_scan_probe_create(spa, bp);
+	VERIFY3U(e->handles, ==, 2);
+	void *space = pr19262_space_create(spa);
+	uint64_t v0 = pr19262_space_available(space, B_FALSE);
+	uint64_t p0 = pr19262_space_available(space, B_TRUE);
+	txg_handle_t txh;
+	uint64_t birth = txg_hold_open(spa->spa_dsl_pool, &txh);
+	txg_rele_to_quiesce(&txh);
+	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
+	vdev_t *vd = vdev_lookup_top(spa, 0);
+	uint64_t target_size = vdev_psize_to_asize_txg(vd, size, birth);
+	uint64_t loan_size = 16 * 1024;
+	uint64_t loan_asize = vdev_psize_to_asize_txg(vd, loan_size, birth);
+	spa_config_exit(spa, SCL_ALL, FTAG);
+	VERIFY3U(target_size, >, DVA_GET_ASIZE(&bp->blk_dva[0]));
+	pr19262_stage_t stage;
+	VERIFY3S(pr19262_space_stage_alloc(space, target_size, &stage),
+	    ==, ENOSPC);
+	VERIFY0(pr19262_space_reserve(space, target_size));
+	VERIFY0(pr19262_space_stage_alloc(space, target_size, &stage));
+	VERIFY3U(pr19262_space_available(space, B_FALSE), ==, v0);
+	VERIFY3U(pr19262_space_available(space, B_TRUE), ==, p0 - target_size);
+	pr19262_stage_t wrong = stage;
+	wrong.owner++;
+	VERIFY3S(pr19262_space_stage_free(space, &wrong, B_TRUE), ==, EINVAL);
+	VERIFY0(probe_copy_begin(e));
+	VERIFY0(zio_wait(probe_read(spa, bp, verify)));
+	blkptr_t target = *bp;
+	DVA_SET_OFFSET(&target.blk_dva[0], stage.offset);
+	DVA_SET_ASIZE(&target.blk_dva[0], stage.asize);
+	BP_SET_PHYSICAL_BIRTH(&target, birth);
+	probe_fixture_write(spa, vd, birth, &target, verify, size, B_TRUE);
+	VERIFY0(memcmp(&target.blk_cksum, &bp->blk_cksum,
+	    sizeof (zio_cksum_t)));
+	abd_t *physical = abd_alloc_for_io(size, B_FALSE);
+	VERIFY0(zio_wait(pr19262_read_physical(spa, &target, physical, size)));
+	VERIFY0(abd_cmp(physical, verify));
+	pr19262_backing_desc_t desc = { stage.offset, birth, stage.asize };
+	VERIFY3S(probe_publish(e, desc, B_FALSE), ==, EIO);
+	VERIFY0(pr19262_space_stage_publish(space, &stage));
+	VERIFY0(probe_publish(e, desc, B_TRUE));
+	VERIFY3S(pr19262_space_stage_free(space, &stage, B_FALSE), ==, EAGAIN);
+	VERIFY0(probe_reclaim(e, 0, B_TRUE));
+	uint64_t old_asize = e->backing[0].desc.asize;
+	VERIFY0(pr19262_space_reclaim(space, e->offset, old_asize, B_TRUE));
+	VERIFY0(pr19262_space_reserve(space, loan_asize));
+	pr19262_space_pair_t pair;
+	VERIFY0(pr19262_space_allocate_at(space, loan_asize, birth,
+	    stage.offset, e->offset, &pair));
+	VERIFY3U(pair.virtual_offset, ==, stage.offset);
+	VERIFY3U(pair.physical_offset, ==, e->offset);
+	VERIFY3U(pr19262_space_available(space, B_FALSE), ==, v0 - loan_asize);
+	VERIFY3U(pr19262_space_available(space, B_TRUE), ==,
+	    p0 - target_size + old_asize - loan_asize);
+	blkptr_t loan = *bp;
+	BP_ZERO_DVAS(&loan);
+	BP_SET_LSIZE(&loan, loan_size);
+	BP_SET_PSIZE(&loan, loan_size);
+	BP_SET_BIRTH(&loan, birth, 0);
+	BP_SET_REWRITE(&loan, 0);
+	DVA_SET_OFFSET(&loan.blk_dva[0], pair.virtual_offset);
+	DVA_SET_ASIZE(&loan.blk_dva[0], pair.virtual_size);
+	mutex_enter(&probe_lock);
+	VERIFY3U(probe_count, <, PROBE_ENTRIES);
+	probe_entry_t *n = &probe_entries[probe_count++];
+	n->spa = spa;
+	n->offset = pair.virtual_offset;
+	n->birth = birth;
+	n->incarnation = 1;
+	n->live = n->fresh = B_TRUE;
+	n->count = 1;
+	n->backing[0].desc = (pr19262_backing_desc_t) {
+		pair.physical_offset, birth, loan_asize };
+	mutex_exit(&probe_lock);
+	void *buf = kmem_alloc(loan_size, KM_SLEEP);
+	FILE *f = fopen(getenv("PR19262_SPACE_INPUT"), "rb");
+	VERIFY3P(f, !=, NULL);
+	VERIFY3U(fread(buf, loan_size, 1, f), ==, 1);
+	VERIFY0(fclose(f));
+	abd_t *data = abd_alloc_for_io(loan_size, B_FALSE);
+	abd_copy_from_buf(data, buf, loan_size);
+	probe_fixture_write(spa, vd, birth, &loan, data, loan_size, B_FALSE);
+	txg_rele_to_sync(&txh);
+	abd_zero(data, loan_size);
+	VERIFY0(zio_wait(probe_read(spa, &loan, data)));
+	VERIFY0(abd_cmp_buf(data, buf, loan_size));
+	char path[1024];
+	(void) snprintf(path, sizeof (path), "%s.loan", output);
+	probe_save_abd(data, loan_size, path);
+	/* The same number is now a live V token and another allocation's P. */
+	VERIFY0(zio_wait(pr19262_read_physical(spa, &target, physical, size)));
+	VERIFY0(abd_cmp(physical, verify));
+	VERIFY3S(zio_wait(probe_read(spa, &target, physical)), ==, EINVAL);
+	(void) snprintf(path, sizeof (path), "%s.copy", output);
+	VERIFY0(zio_wait(pr19262_read_physical(spa, &target, physical, size)));
+	probe_save_abd(physical, size, path);
+	mutex_enter(&probe_lock);
+	probe_block_new_holds = B_TRUE;
+	mutex_exit(&probe_lock);
+	VERIFY0(pr19262_scan_probe_issue(scan));
+	mutex_enter(&probe_lock);
+	probe_block_new_holds = B_FALSE;
+	mutex_exit(&probe_lock);
+	VERIFY3U(e->handles, ==, 1);
+	VERIFY0(zio_wait(queued));
+	VERIFY0(abd_cmp(old, verify));
+	probe_save_abd(old, size, output);
+	VERIFY0(memcmp(bp, &original, sizeof (*bp)));
+	mutex_enter(&probe_lock);
+	n->live = B_FALSE;
+	mutex_exit(&probe_lock);
+	VERIFY0(probe_reclaim(n, 0, B_TRUE));
+	pr19262_space_release(space, &pair);
+	/* Teardown all transient bindings before discarding this fixture. */
+	mutex_enter(&probe_lock);
+	e->live = B_FALSE;
+	mutex_exit(&probe_lock);
+	VERIFY0(probe_reclaim(e, e->current, B_TRUE));
+	VERIFY0(pr19262_space_stage_free(space, &stage, B_TRUE));
+	VERIFY3S(pr19262_space_stage_free(space, &stage, B_TRUE), ==, EINVAL);
+	VERIFY3U(pr19262_space_available(space, B_FALSE), ==, v0);
+	VERIFY3U(pr19262_space_available(space, B_TRUE), ==, p0 + old_asize);
+	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
+	VERIFY3S(metaslab_claim_impl(vd, e->offset, old_asize, 0), ==, ENOENT);
+	spa_config_exit(spa, SCL_ALL, FTAG);
+	(void) fprintf(stderr, "PR19262_COPY_PASS %llu %llu %llu "
+	    "%llu %llu %llu %llu\n", (u_longlong_t)v0, (u_longlong_t)p0,
+	    (u_longlong_t)e->offset, (u_longlong_t)stage.offset,
+	    (u_longlong_t)old_asize, (u_longlong_t)target_size,
+	    (u_longlong_t)loan_asize);
+	pr19262_space_destroy(space);
+	abd_free(data);
+	abd_free(physical);
+	abd_free(verify);
+	abd_free(old);
+	kmem_free(buf, loan_size);
+	return (0);
+}
+
 int
 pr19262_reloc_test(spa_t *spa, const char *output)
 {
@@ -489,6 +664,8 @@ pr19262_reloc_test(spa_t *spa, const char *output)
 	blkptr_t bp;
 	VERIFY3U(fread(&bp, sizeof (bp), 1, f), ==, 1);
 	VERIFY0(fclose(f));
+	if (getenv("PR19262_COPY_TEST") != NULL)
+		return (probe_copy_test(spa, output, &bp));
 	if (getenv("PR19262_SPACE_TEST") != NULL)
 		return (probe_space_test(spa, output, &bp));
 	uint64_t size = BP_GET_PSIZE(&bp);

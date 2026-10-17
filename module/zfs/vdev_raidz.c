@@ -2664,6 +2664,9 @@ pr19262_probe_lookup(zio_t *zio, pr19262_probe_move_t *move)
 	const char *p = getenv("PR19262_PROBE_MAP");
 	const blkptr_t *bp = zio->io_bp;
 
+	if (zio->io_logical != NULL &&
+	    zio->io_logical->io_pr19262_physical)
+		return (B_FALSE);
 	if (getenv("PR19262_LIFETIME") != NULL &&
 	    pr19262_reloc_known(zio->io_spa, bp)) {
 		pr19262_backing_desc_t desc;

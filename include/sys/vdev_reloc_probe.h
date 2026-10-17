@@ -41,6 +41,19 @@ int pr19262_space_allocate(void *, uint64_t, uint64_t, uint64_t,
     pr19262_space_pair_t *);
 void pr19262_space_release(void *, const pr19262_space_pair_t *);
 int pr19262_space_reclaim(void *, uint64_t, uint64_t, boolean_t);
+typedef struct pr19262_stage {
+	uint64_t offset;
+	uint64_t asize;
+	uint64_t owner;
+} pr19262_stage_t;
+int pr19262_space_stage_alloc(void *, uint64_t, pr19262_stage_t *);
+int pr19262_space_stage_publish(void *, const pr19262_stage_t *);
+int pr19262_space_stage_free(void *, const pr19262_stage_t *, boolean_t);
+int pr19262_space_allocate_at(void *, uint64_t, uint64_t, uint64_t,
+    uint64_t, pr19262_space_pair_t *);
+zio_t *pr19262_read_physical(spa_t *, const blkptr_t *, abd_t *, uint64_t);
+zio_t *pr19262_write_physical(spa_t *, uint64_t, blkptr_t *, abd_t *,
+    uint64_t);
 
 #endif
 #endif

@@ -504,6 +504,7 @@ struct zio {
 	zio_t		*io_logical;
 #ifndef _KERNEL
 	void		*io_pr19262_hold;
+	boolean_t	io_pr19262_physical;
 #endif
 	zio_transform_t *io_transform_stack;
 
