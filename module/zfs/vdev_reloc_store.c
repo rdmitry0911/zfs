@@ -552,6 +552,126 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	return (engine_store_validate_virtual());
 }
 
+typedef struct engine_root_graph {
+	spa_t *spa;
+	uberblock_t *roots;
+	uint_t count;
+	uchar_t occupied[ENGINE_STORE_PAGES];
+} engine_root_graph_t;
+
+static int
+engine_root_add(void *arg, const uberblock_t *ub)
+{
+	engine_root_graph_t *g = arg;
+	const uint64_t *d = ub->ub_pr19262;
+	if (!pr19262_engine_store_ub(ub) || d[15] != 5 ||
+	    d[1] != engine.vd->vdev_guid || d[2] != engine.arena ||
+	    d[3] != engine.arena_bytes || d[12] != 12 ||
+	    d[13] != engine.vd->vdev_children || d[14] != engine.total ||
+	    d[5] == 0 || d[4] >= ENGINE_STORE_PAGES ||
+	    d[5] > ENGINE_STORE_PAGES - d[4] || d[7] == 0 ||
+	    d[7] > d[5] * ENGINE_STORE_PAGE || d[6] == 0 ||
+	    d[6] > ub->ub_txg ||
+	    (d[6] != ub->ub_txg && (ub->ub_checkpoint_txg == 0 ||
+	    d[6] > ub->ub_checkpoint_txg)))
+		return (EINVAL);
+	for (uint_t i = 0; i < g->count; i++) {
+		if (memcmp(g->roots[i].ub_pr19262, d,
+		    sizeof (ub->ub_pr19262)) != 0)
+			continue;
+		return (memcmp(&g->roots[i].ub_rootbp, &ub->ub_rootbp,
+		    sizeof (ub->ub_rootbp)) == 0 ? 0 : EINVAL);
+	}
+	if (g->count == ENGINE_STORE_PAGES)
+		return (EOVERFLOW);
+	g->roots[g->count++] = *ub;
+	return (0);
+}
+
+static int
+engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
+{
+	const uint64_t *d = ub->ub_pr19262;
+	abd_t *abd = abd_alloc_linear(d[5] * ENGINE_STORE_PAGE, B_TRUE);
+	int error = ECKSUM;
+	nvlist_t *nv = NULL;
+	for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
+		if (engine_store_io(engine.vd->vdev_child[c], d[4], d[5],
+		    abd, B_FALSE) != 0)
+			continue;
+		zio_cksum_t hash;
+		abd_checksum_sha256(abd, d[5] * ENGINE_STORE_PAGE, NULL, &hash);
+		if (memcmp(&hash, d + 8, sizeof (hash)) != 0)
+			continue;
+		error = nvlist_unpack(abd_to_buf(abd), d[7], &nv, KM_SLEEP);
+		break;
+	}
+	abd_free(abd);
+	if (error != 0)
+		return (error);
+	uint64_t txg, pool, top, *mos, *checkpoint;
+	uint_t nm, nc;
+	if (nvlist_lookup_uint64(nv, "txg", &txg) != 0 ||
+	    nvlist_lookup_uint64(nv, "pool", &pool) != 0 ||
+	    nvlist_lookup_uint64(nv, "top", &top) != 0 ||
+	    nvlist_lookup_uint64_array(nv, "mos", &mos, &nm) != 0 ||
+	    nvlist_lookup_uint64_array(nv, "checkpoint", &checkpoint,
+	    &nc) != 0 || nm != sizeof (blkptr_t) / sizeof (uint64_t) ||
+	    nc != sizeof (uberblock_t) / sizeof (uint64_t) || txg != d[6] ||
+	    pool != spa_guid(g->spa) || top != d[1] ||
+	    memcmp(mos, &ub->ub_rootbp, sizeof (blkptr_t)) != 0) {
+		error = EINVAL;
+	} else {
+		uberblock_t pin;
+		memcpy(&pin, checkpoint, sizeof (pin));
+		if (pin.ub_txg != 0) {
+			if (uberblock_verify(&pin) != 0 || pin.ub_txg > txg ||
+			    pin.ub_checkpoint_txg != pin.ub_txg ||
+			    pin.ub_pr19262[6] >= d[6])
+				error = EINVAL;
+			else
+				error = engine_root_add(g, &pin);
+		}
+		if (error == 0) {
+			memset(g->occupied + d[4], 1, d[5]);
+			(void) printf("PR19262_M_PIN catalog=%llu first=%llu "
+			    "pages=%llu cp=%llu cp_catalog=%llu\n",
+			    (u_longlong_t)d[6],
+			    (u_longlong_t)d[4], (u_longlong_t)d[5],
+			    (u_longlong_t)pin.ub_txg,
+			    (u_longlong_t)pin.ub_pr19262[6]);
+		}
+	}
+	nvlist_free(nv);
+	return (error);
+}
+
+/* Validated disk-root closure only; this does not authorize reclamation. */
+int
+pr19262_engine_store_inventory(spa_t *spa, uint64_t *roots, uint64_t *pages)
+{
+	*roots = *pages = 0;
+	if (!pr19262_engine_persistent(spa))
+		return (ENOTSUP);
+	engine_root_graph_t *g = kmem_zalloc(sizeof (*g), KM_SLEEP);
+	g->spa = spa;
+	g->roots = kmem_alloc(ENGINE_STORE_PAGES * sizeof (uberblock_t),
+	    KM_SLEEP);
+	spa_config_enter(spa, SCL_STATE | SCL_ZIO, FTAG, RW_READER);
+	int error = pr19262_vdev_uberblocks(spa, g, engine_root_add);
+	for (uint_t i = 0; error == 0 && i < g->count; i++)
+		error = engine_root_read(g, &g->roots[i]);
+	spa_config_exit(spa, SCL_STATE | SCL_ZIO, FTAG);
+	if (error == 0) {
+		*roots = g->count;
+		for (uint_t i = 0; i < ENGINE_STORE_PAGES; i++)
+			*pages += g->occupied[i] != 0;
+	}
+	kmem_free(g->roots, ENGINE_STORE_PAGES * sizeof (uberblock_t));
+	kmem_free(g, sizeof (*g));
+	return (error);
+}
+
 int
 pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 {
@@ -612,8 +732,9 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 		/* Open native space maps even for a read-only SPA. */
 		spa->spa_read_spacemaps = B_TRUE;
 		(void) printf("PR19262_STORE_LOAD pre-MOS txg=%llu "
-		    "owners=%llu\n", (u_longlong_t)ub->ub_txg,
-		    (u_longlong_t)avl_numnodes(&engine.owners));
+		    "owners=%llu catalog=%llu\n", (u_longlong_t)ub->ub_txg,
+		    (u_longlong_t)avl_numnodes(&engine.owners),
+		    (u_longlong_t)d[6]);
 	} else {
 		engine_store_clear();
 	}

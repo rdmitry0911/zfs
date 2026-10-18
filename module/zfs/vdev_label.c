@@ -1730,6 +1730,87 @@ vdev_uberblock_load_impl(zio_t *zio, vdev_t *vd, int flags,
 	}
 }
 
+#ifndef _KERNEL
+typedef struct pr19262_ub_inventory {
+	uberblock_t *roots;
+	uint_t count;
+	int error;
+} pr19262_ub_inventory_t;
+
+static void
+pr19262_ub_inventory_done(zio_t *zio)
+{
+	zio_t *rio = zio->io_private;
+	pr19262_ub_inventory_t *inventory = rio->io_private;
+	uberblock_t *ub = abd_to_buf(zio->io_abd);
+	mutex_enter(&rio->io_lock);
+	if (zio->io_error != 0 && zio->io_error != ECKSUM)
+		inventory->error = zio->io_error;
+	if (zio->io_error == 0 && uberblock_verify(ub) == 0 &&
+	    pr19262_engine_store_ub(ub))
+		inventory->roots[inventory->count++] = *ub;
+	mutex_exit(&rio->io_lock);
+	abd_free(zio->io_abd);
+}
+
+/* A disk snapshot only; publication and reader/writer leases are separate. */
+int
+pr19262_vdev_uberblocks(spa_t *spa, void *arg,
+    int (*visit)(void *, const uberblock_t *))
+{
+	ASSERT(spa_config_held(spa, SCL_STATE, RW_READER) == SCL_STATE ||
+	    spa_config_held(spa, SCL_STATE, RW_WRITER) == SCL_STATE);
+	vdev_t *root = spa->spa_root_vdev;
+	int error = ENOTSUP;
+	if (root->vdev_children != 1)
+		goto out;
+	vdev_t *vd = root->vdev_child[0];
+	uint64_t capacity = 0;
+	for (uint_t c = 0; c < vd->vdev_children; c++) {
+		vdev_t *leaf = vd->vdev_child[c];
+		if (!leaf->vdev_ops->vdev_op_leaf)
+			goto out;
+		capacity += VDEV_LABELS * VDEV_UBERBLOCK_COUNT(leaf);
+	}
+	if (capacity == 0 || capacity > 65536)
+		goto out;
+	pr19262_ub_inventory_t inventory = { 0 };
+	inventory.roots = kmem_alloc(capacity * sizeof (uberblock_t),
+	    KM_SLEEP);
+	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL |
+	    ZIO_FLAG_SPECULATIVE |
+	    ZIO_FLAG_DONT_PROPAGATE | ZIO_FLAG_DONT_RETRY;
+	zio_t *zio = zio_root(spa, NULL, &inventory, flags);
+	for (uint_t c = 0; c < vd->vdev_children; c++) {
+		vdev_t *leaf = vd->vdev_child[c];
+		if (!vdev_readable(leaf)) {
+			mutex_enter(&zio->io_lock);
+			inventory.error = ENXIO;
+			mutex_exit(&zio->io_lock);
+			continue;
+		}
+		/* Include stale labels and MMP slots. */
+		for (int l = 0; l < VDEV_LABELS; l++) {
+			for (int n = 0; n < VDEV_UBERBLOCK_COUNT(leaf); n++) {
+				vdev_label_read(zio, leaf, l,
+				    abd_alloc_linear(VDEV_UBERBLOCK_SIZE(leaf),
+				    B_TRUE), VDEV_UBERBLOCK_OFFSET(leaf, n),
+				    VDEV_UBERBLOCK_SIZE(leaf),
+				    pr19262_ub_inventory_done, zio, flags);
+			}
+		}
+	}
+	error = zio_wait(zio);
+	if (error == 0)
+		error = inventory.error;
+	for (uint_t i = 0; error == 0 && i < inventory.count; i++)
+		error = visit(arg, &inventory.roots[i]);
+	kmem_free(inventory.roots, capacity * sizeof (uberblock_t));
+out:
+	return (error);
+}
+#endif
+
 /*
  * Reads the 'best' uberblock from disk along with its associated
  * configuration. First, we read the uberblock array of each label of each

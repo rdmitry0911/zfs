@@ -12730,9 +12730,138 @@ pr19262_journal_replay_write(void *arg, void *record, boolean_t byteswap)
 }
 
 static int
+pr19262_journal_inventory(void *arg, const uberblock_t *ub)
+{
+	uint64_t *count = arg;
+	const uint64_t *d = ub->ub_pr19262;
+	(*count)++;
+	(void) printf("PR19262_M_ROOT txg=%llu first=%llu pages=%llu "
+	    "catalog=%llu\n", (u_longlong_t)ub->ub_txg,
+	    (u_longlong_t)d[4], (u_longlong_t)d[5], (u_longlong_t)d[6]);
+	return (0);
+}
+
+static int
+pr19262_journal_intent_owner(spa_t *spa)
+{
+	char name[] = "pr19262_tx/intent-data";
+	char *range = getenv("PR19262_JOURNAL_INTENT_ALLOC");
+	boolean_t allocate = range != NULL;
+	boolean_t repair = getenv("PR19262_JOURNAL_INTENT_REPAIR") != NULL;
+	uint64_t target = allocate ? strtoull(range, NULL, 10) : 0;
+	uint64_t blocksize = 1ULL << 20;
+	uint_t batch = 8;
+	if (allocate) {
+		VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0,
+		    NULL, NULL, NULL));
+		VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COPIES,
+		    1, B_FALSE));
+		VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+		    ZIO_COMPRESS_OFF, B_FALSE));
+	}
+	objset_t *os;
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, !allocate,
+	    B_TRUE, FTAG, &os));
+	uint64_t object = 0;
+	void *data = kmem_alloc(blocksize, KM_SLEEP);
+	blkptr_t *bps = kmem_alloc(batch * sizeof (*bps), KM_SLEEP);
+	if (allocate) {
+		VERIFY(pr19262_engine_free_range(spa, target, 6ULL << 20));
+		dmu_tx_t *tx = dmu_tx_create(os);
+		dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+		object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
+		    blocksize, DMU_OT_NONE, 0, tx);
+		dmu_tx_commit(tx);
+		boolean_t found = B_FALSE;
+		for (uint64_t base = 0; !found && base < 512; base += batch) {
+			tx = dmu_tx_create(os);
+			dmu_tx_hold_write(tx, object, base * blocksize,
+			    batch * blocksize);
+			VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+			for (uint64_t b = base; b < base + batch; b++) {
+				memset(data, b % 251 + 1, blocksize);
+				dmu_write(os, object, b * blocksize, blocksize,
+				    data, tx, 0);
+			}
+			dmu_tx_commit(tx);
+			txg_wait_synced(spa->spa_dsl_pool, 0);
+			size_t count = batch;
+			VERIFY0(dmu_read_l0_bps(os, object, base * blocksize,
+			    batch * blocksize, bps, &count));
+			VERIFY3U(count, ==, batch);
+			for (uint_t b = 0; b < count; b++) {
+				int ndvas = BP_GET_NDVAS(&bps[b]);
+				for (int d = 0; d < ndvas; d++) {
+					pr19262_engine_info_t info;
+					pr19262_engine_inspect(spa, &bps[b], d,
+					    &info);
+					if (info.p >= target + (6ULL << 20) ||
+					    target >= info.p + info.psize)
+						continue;
+					found = B_TRUE;
+					(void) printf("PR19262_J_INTENT_OWNER "
+					    "block=%llu p=%llu size=%llu "
+					    "v=%llu birth=%llu target=%llu\n",
+					    (u_longlong_t)(base + b),
+					    (u_longlong_t)info.p,
+					    (u_longlong_t)info.psize,
+					    (u_longlong_t)DVA_GET_OFFSET(
+					    &bps[b].blk_dva[d]),
+					    (u_longlong_t)BP_GET_BIRTH(&bps[b]),
+					    (u_longlong_t)target);
+				}
+			}
+			(void) printf("PR19262_J_INTENT_FILL blocks=%llu "
+			    "found=%u\n", (u_longlong_t)(base + batch), found);
+			(void) fflush(NULL);
+		}
+		VERIFY(found);
+		VERIFY(!pr19262_engine_free_range(spa, target, 6ULL << 20));
+	}
+	if (!allocate)
+		VERIFY0(dmu_object_next(os, &object, B_FALSE, 0));
+	dmu_object_info_t info;
+	VERIFY0(dmu_object_info(os, object, &info));
+	uint64_t blocks = info.doi_max_offset / blocksize;
+	for (uint64_t b = 0; b < blocks; b++) {
+		VERIFY0(dmu_read(os, object, b * blocksize, blocksize,
+		    data, DMU_READ_NO_PREFETCH));
+		for (uint64_t i = 0; i < blocksize; i++)
+			VERIFY3U(((uint8_t *)data)[i], ==, b % 251 + 1);
+	}
+	(void) printf("PR19262_J_INTENT_DATA_PASS blocks=%llu\n",
+	    (u_longlong_t)blocks);
+	if (getenv("PR19262_JOURNAL_INTENT_PAUSE") != NULL) {
+		(void) printf("PR19262_J_INTENT_RETURN_READY\n");
+		(void) fflush(NULL);
+		VERIFY3S(getchar(), ==, '\n');
+	}
+	if (repair) {
+		VERIFY0(pr19262_engine_journal_roll(spa));
+		(void) printf("PR19262_J_INTENT_REPAIRED\n");
+	}
+	pr19262_engine_check(spa, "ordinary-DMU-intent-owner");
+	kmem_free(data, blocksize);
+	kmem_free(bps, batch * sizeof (*bps));
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	spa_close(spa, FTAG);
+	if (allocate) {
+		(void) fflush(NULL);
+		_exit(0);
+	}
+	kernel_fini();
+	return (0);
+}
+
+static int
 pr19262_journal_cold(const char *directory)
 {
-	boolean_t write = getenv("PR19262_JOURNAL_REPLAY") != NULL;
+	boolean_t intent = getenv("PR19262_JOURNAL_INTENT_ALLOC") != NULL ||
+	    getenv("PR19262_JOURNAL_INTENT_CHECK") != NULL;
+	boolean_t write = getenv("PR19262_JOURNAL_REPLAY") != NULL ||
+	    getenv("PR19262_JOURNAL_INTENT_ALLOC") != NULL ||
+	    getenv("PR19262_JOURNAL_INTENT_REPAIR") != NULL;
 	char *cache;
 	VERIFY3S(asprintf(&cache, "%s/private-cache", directory), >, 0);
 	spa_config_path = cache;
@@ -12762,6 +12891,34 @@ pr19262_journal_cold(const char *directory)
 	spa_t *spa;
 	VERIFY0(spa_open(pool, &spa, FTAG));
 	VERIFY(pr19262_engine_persistent(spa));
+	if (getenv("PR19262_JOURNAL_ROOT_CLOSURE") != NULL) {
+		uint64_t roots, pages;
+		error = pr19262_engine_store_inventory(spa, &roots, &pages);
+		(void) printf("PR19262_M_CLOSURE roots=%llu pages=%llu "
+		    "error=%d\n", (u_longlong_t)roots, (u_longlong_t)pages,
+		    error);
+		if (error != 0) {
+			spa_close(spa, FTAG);
+			kernel_fini();
+			return (1);
+		}
+	}
+	if (getenv("PR19262_JOURNAL_ROOT_INVENTORY") != NULL) {
+		uint64_t count = 0;
+		spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+		error = pr19262_vdev_uberblocks(spa, &count,
+		    pr19262_journal_inventory);
+		spa_config_exit(spa, SCL_STATE, FTAG);
+		(void) printf("PR19262_M_ROOTS count=%llu error=%d\n",
+		    (u_longlong_t)count, error);
+		if (error != 0) {
+			spa_close(spa, FTAG);
+			kernel_fini();
+			return (1);
+		}
+	}
+	if (intent)
+		return (pr19262_journal_intent_owner(spa));
 	char *range = getenv("PR19262_JOURNAL_FREE_PROBE");
 	if (range != NULL) {
 		uint64_t p = strtoull(range, NULL, 10);
@@ -13095,6 +13252,8 @@ pr19262_tx_driver(const char *directory)
 		fnvlist_add_uint64(props, "feature@raidz_parity_epochs", 0);
 	if (getenv("PR19262_JOURNAL_CLONE") != NULL)
 		fnvlist_add_uint64(props, "feature@block_cloning", 0);
+	if (getenv("PR19262_JOURNAL_INTENT_FIXTURE") != NULL)
+		fnvlist_add_uint64(props, "feature@large_blocks", 0);
 	if (getenv("PR19262_ENGINE_CHECKPOINT") != NULL)
 		fnvlist_add_uint64(props, "feature@zpool_checkpoint", 0);
 	VERIFY0(spa_create("pr19262_tx", root, props, NULL, NULL, NULL));

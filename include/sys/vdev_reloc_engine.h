@@ -17,6 +17,10 @@ int pr19262_engine_checkpoint_validate(spa_t *, const uberblock_t *);
 int pr19262_engine_checkpoint_discard(vdev_t *, uint64_t, uint64_t,
     boolean_t *);
 boolean_t pr19262_engine_store_ub(const uberblock_t *);
+/* Caller holds SCL_STATE; callbacks run after all reads complete. */
+int pr19262_vdev_uberblocks(spa_t *, void *,
+    int (*)(void *, const uberblock_t *));
+int pr19262_engine_store_inventory(spa_t *, uint64_t *, uint64_t *);
 int pr19262_engine_metadata_flush(vdev_t *);
 void pr19262_engine_store_crash(uint64_t);
 int pr19262_engine_journal_bind(spa_t *, const blkptr_t *);
