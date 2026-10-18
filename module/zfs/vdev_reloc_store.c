@@ -68,6 +68,8 @@ pr19262_engine_store_enable(spa_t *spa)
 	engine.arena = p;
 	engine.arena_bytes = ENGINE_STORE_BYTES;
 	engine.bitmap = kmem_zalloc(ENGINE_STORE_PAGES, KM_SLEEP);
+	engine.store_codec = 6;
+	engine.bitmap[0] = engine.bitmap[1] = 1;
 	engine.persistent = B_TRUE;
 	engine.revision++;
 	zfs_range_tree_remove(engine.free, p,
@@ -136,6 +138,23 @@ engine_store_io(vdev_t *vd, uint64_t page, uint64_t pages, abd_t *abd,
     boolean_t write)
 {
 	return (engine_store_io_at(vd, engine.arena, page, pages, abd, write));
+}
+
+#include "vdev_reloc_pages.c"
+
+static boolean_t
+engine_store_layout(const uint64_t *d)
+{
+	if (d[7] == 0)
+		return (B_FALSE);
+	if (d[15] == 5)
+		return (d[5] != 0 && d[4] < ENGINE_STORE_PAGES &&
+		    d[5] <= ENGINE_STORE_PAGES - d[4] &&
+		    d[7] <= d[5] * ENGINE_STORE_PAGE);
+	uint64_t stripe = d[13] * ENGINE_STORE_PAGE;
+	return (d[15] == 6 && d[5] == 1 && d[7] <= ENGINE_STORE_BYTES &&
+	    stripe != 0 && d[4] >= d[2] && (d[4] - d[2]) % stripe == 0 &&
+	    (d[4] - d[2]) / stripe < ENGINE_STORE_PAGES);
 }
 
 typedef struct engine_ranges {
@@ -230,8 +249,8 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 	return (nv);
 }
 
-int
-pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
+static int
+engine_store_sync(spa_t *spa, uberblock_t *ub)
 {
 	mutex_enter(&engine.lock);
 	if (engine.spa != spa || !engine.persistent) {
@@ -245,6 +264,24 @@ pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
 		return (0);
 	}
 	nvlist_t *nv = engine_store_snapshot(spa, ub);
+	if (engine.store_codec == 6) {
+		uint64_t revision = engine.revision;
+		mutex_exit(&engine.lock);
+		uint64_t desc[16];
+		int error = engine_pages_store(spa, ub, nv, desc);
+		fnvlist_free(nv);
+		if (error == 0) {
+			mutex_enter(&engine.lock);
+			engine.stored_revision = revision;
+			mutex_exit(&engine.lock);
+			memcpy(ub->ub_pr19262, desc, sizeof (desc));
+			if (engine_store_crash_txg == ub->ub_txg) {
+				(void) fflush(NULL);
+				_exit(77);
+			}
+		}
+		return (error);
+	}
 	size_t size = 0;
 	char *packed = NULL;
 	VERIFY0(nvlist_pack(nv, &packed, &size, NV_ENCODE_XDR, KM_SLEEP));
@@ -317,10 +354,20 @@ pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
 	return (error);
 }
 
+int
+pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
+{
+	mutex_enter(&engine.store_lock);
+	int error = engine_store_sync(spa, ub);
+	mutex_exit(&engine.store_lock);
+	return (error);
+}
+
 static void
 engine_store_clear(void)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
+	engine_pages_clear();
 	engine_owner_t *e;
 	while ((e = avl_first(&engine.owners)) != NULL) {
 		VERIFY0(e->holds);
@@ -366,6 +413,7 @@ engine_store_clear(void)
 	engine.bitmap = NULL;
 	engine.persistent = B_FALSE;
 	engine.arena = engine.arena_bytes = engine.retired = 0;
+	engine.store_codec = 0;
 	engine.journal_arena = engine.journal_bytes = engine.journal_seq = 0;
 	engine.journal_serial = 0;
 	engine.journal_root = 0;
@@ -381,10 +429,12 @@ engine_store_clear(void)
 void
 pr19262_engine_store_unload(spa_t *spa)
 {
+	mutex_enter(&engine.store_lock);
 	mutex_enter(&engine.lock);
 	if (engine.spa == spa && engine.persistent)
 		engine_store_clear();
 	mutex_exit(&engine.lock);
+	mutex_exit(&engine.store_lock);
 }
 
 void
@@ -473,7 +523,8 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	    nb != ENGINE_STORE_PAGES || nr > 50000 || nl % 2 != 0)
 		return (EINVAL);
 	for (uint64_t i = 0; i < ENGINE_STORE_PAGES; i++)
-		if (bitmap[i] > 1 || (i >= ub->ub_pr19262[4] &&
+		if (bitmap[i] > 1 || (ub->ub_pr19262[15] == 5 &&
+		    i >= ub->ub_pr19262[4] &&
 		    i < ub->ub_pr19262[4] + ub->ub_pr19262[5] && !bitmap[i]))
 			return (EINVAL);
 	engine.bitmap = kmem_alloc(ENGINE_STORE_PAGES, KM_SLEEP);
@@ -564,13 +615,11 @@ engine_root_add(void *arg, const uberblock_t *ub)
 {
 	engine_root_graph_t *g = arg;
 	const uint64_t *d = ub->ub_pr19262;
-	if (!pr19262_engine_store_ub(ub) || d[15] != 5 ||
+	if (!pr19262_engine_store_ub(ub) || !engine_store_layout(d) ||
 	    d[1] != engine.vd->vdev_guid || d[2] != engine.arena ||
 	    d[3] != engine.arena_bytes || d[12] != 12 ||
 	    d[13] != engine.vd->vdev_children || d[14] != engine.total ||
-	    d[5] == 0 || d[4] >= ENGINE_STORE_PAGES ||
-	    d[5] > ENGINE_STORE_PAGES - d[4] || d[7] == 0 ||
-	    d[7] > d[5] * ENGINE_STORE_PAGE || d[6] == 0 ||
+	    d[6] == 0 ||
 	    d[6] > ub->ub_txg ||
 	    (d[6] != ub->ub_txg && (ub->ub_checkpoint_txg == 0 ||
 	    d[6] > ub->ub_checkpoint_txg)))
@@ -592,10 +641,14 @@ static int
 engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 {
 	const uint64_t *d = ub->ub_pr19262;
-	abd_t *abd = abd_alloc_linear(d[5] * ENGINE_STORE_PAGE, B_TRUE);
 	int error = ECKSUM;
 	nvlist_t *nv = NULL;
-	for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
+	uint8_t *seen = kmem_zalloc(ENGINE_STORE_PAGES, KM_SLEEP);
+	if (d[15] == 6)
+		error = engine_pages_read(g->spa, ub, &nv, seen, B_FALSE);
+	abd_t *abd = d[15] == 5 ?
+	    abd_alloc_linear(d[5] * ENGINE_STORE_PAGE, B_TRUE) : NULL;
+	for (uint_t c = 0; d[15] == 5 && c < engine.vd->vdev_children; c++) {
 		if (engine_store_io(engine.vd->vdev_child[c], d[4], d[5],
 		    abd, B_FALSE) != 0)
 			continue;
@@ -606,9 +659,12 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 		error = nvlist_unpack(abd_to_buf(abd), d[7], &nv, KM_SLEEP);
 		break;
 	}
-	abd_free(abd);
-	if (error != 0)
+	if (abd != NULL)
+		abd_free(abd);
+	if (error != 0) {
+		kmem_free(seen, ENGINE_STORE_PAGES);
 		return (error);
+	}
 	uint64_t txg, pool, top, *mos, *checkpoint;
 	uint_t nm, nc;
 	if (nvlist_lookup_uint64(nv, "txg", &txg) != 0 ||
@@ -633,7 +689,11 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 				error = engine_root_add(g, &pin);
 		}
 		if (error == 0) {
-			memset(g->occupied + d[4], 1, d[5]);
+			if (d[15] == 5)
+				memset(g->occupied + d[4], 1, d[5]);
+			else
+				for (uint_t i = 0; i < ENGINE_STORE_PAGES; i++)
+					g->occupied[i] |= seen[i];
 			(void) printf("PR19262_M_PIN catalog=%llu first=%llu "
 			    "pages=%llu cp=%llu cp_catalog=%llu\n",
 			    (u_longlong_t)d[6],
@@ -643,6 +703,7 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 		}
 	}
 	nvlist_free(nv);
+	kmem_free(seen, ENGINE_STORE_PAGES);
 	return (error);
 }
 
@@ -692,9 +753,7 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	    d[6] > ub->ub_txg ||
 	    (d[6] != ub->ub_txg && (ub->ub_checkpoint_txg == 0 ||
 	    d[6] > ub->ub_checkpoint_txg)) ||
-	    d[15] != 5 || d[5] == 0 ||
-	    d[4] >= ENGINE_STORE_PAGES || d[5] > ENGINE_STORE_PAGES - d[4] ||
-	    d[7] == 0 || d[7] > d[5] * ENGINE_STORE_PAGE ||
+	    !engine_store_layout(d) ||
 	    d[2] >= vd->vdev_asize ||
 	    d[3] * d[13] > vd->vdev_asize - d[2] ||
 	    d[2] % (vd->vdev_children * ENGINE_STORE_PAGE) != 0)
@@ -702,11 +761,18 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	engine.vd = vd;
 	engine.total = vd->vdev_asize;
 	engine.arena = d[2]; engine.arena_bytes = d[3];
-	abd_t *abd = abd_alloc_for_io(d[5] * ENGINE_STORE_PAGE, B_TRUE);
+	engine.store_codec = d[15];
+	abd_t *abd = d[15] == 5 ?
+	    abd_alloc_for_io(d[5] * ENGINE_STORE_PAGE, B_TRUE) : NULL;
 	int error = ECKSUM;
 	nvlist_t *nv = NULL;
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
-	for (uint64_t i = 0; i < vd->vdev_children; i++) {
+	if (d[15] == 6) {
+		uint8_t *seen = kmem_zalloc(ENGINE_STORE_PAGES, KM_SLEEP);
+		error = engine_pages_read(spa, ub, &nv, seen, B_TRUE);
+		kmem_free(seen, ENGINE_STORE_PAGES);
+	}
+	for (uint64_t i = 0; d[15] == 5 && i < vd->vdev_children; i++) {
 		if (engine_store_io(vd->vdev_child[i], d[4], d[5],
 		    abd, B_FALSE) != 0)
 			continue;
@@ -720,10 +786,13 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 		break;
 	}
 	spa_config_exit(spa, SCL_ZIO, FTAG);
-	abd_free(abd);
+	if (abd != NULL)
+		abd_free(abd);
 	mutex_enter(&engine.lock);
 	if (error == 0)
 		error = engine_store_decode(spa, ub, nv);
+	if (error == 0 && d[15] == 6)
+		error = engine_pages_install(nv);
 	nvlist_free(nv);
 	if (error == 0) {
 		engine.persistent = B_TRUE;

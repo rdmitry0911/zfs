@@ -92,6 +92,7 @@ static int engine_journal_bind_copy(engine_copy_t *);
 static struct {
 	kmutex_t lock;
 	kmutex_t journal_lock;
+	kmutex_t store_lock;
 	kcondvar_t changed;
 	spa_t *spa;
 	vdev_t *vd;
@@ -119,6 +120,7 @@ static struct {
 	uint64_t arena;
 	uint64_t arena_bytes;
 	uint8_t *bitmap;
+	uint64_t store_codec;
 	uint64_t revision;
 	uint64_t stored_revision;
 	uint64_t journal_arena;
@@ -281,6 +283,7 @@ pr19262_engine_init(void)
 {
 	mutex_init(&engine.lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&engine.journal_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&engine.store_lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&engine.changed, NULL, CV_DEFAULT, NULL);
 	avl_create(&engine.owners, engine_compare, sizeof (engine_owner_t),
 	    offsetof(engine_owner_t, avl));
@@ -295,6 +298,7 @@ pr19262_engine_fini(void)
 	avl_destroy(&engine.owners);
 	cv_destroy(&engine.changed);
 	mutex_destroy(&engine.journal_lock);
+	mutex_destroy(&engine.store_lock);
 	mutex_destroy(&engine.lock);
 }
 
