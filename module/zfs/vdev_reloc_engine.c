@@ -81,6 +81,10 @@ typedef struct engine_j_segment {
 	uint64_t epoch[2];
 	uint64_t seq;
 	zio_cksum_t hash;
+	uint64_t serial;
+	uint64_t phase;
+	uint64_t target;
+	uint64_t target_epoch[2];
 } engine_j_segment_t;
 
 static int engine_journal_bind_copy(engine_copy_t *);
@@ -125,7 +129,10 @@ static struct {
 	zfs_range_tree_t *journal_extents;
 	engine_j_segment_t *journal_segments;
 	engine_j_segment_t *journal_tail;
+	engine_j_segment_t *journal_current;
+	engine_j_segment_t *journal_pending;
 	uint64_t journal_seq;
+	uint64_t journal_serial;
 	zio_cksum_t journal_hash;
 	boolean_t journal_formatted;
 	boolean_t journal_ready;
@@ -899,6 +906,16 @@ pr19262_engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d,
 	*handle = c;
 	mutex_exit(&engine.lock);
 	return (0);
+}
+
+boolean_t
+pr19262_engine_free_range(spa_t *spa, uint64_t p, uint64_t size)
+{
+	mutex_enter(&engine.lock);
+	VERIFY3P(spa, ==, engine.spa);
+	boolean_t free = zfs_range_tree_contains(engine.free, p, size);
+	mutex_exit(&engine.lock);
+	return (free);
 }
 
 void

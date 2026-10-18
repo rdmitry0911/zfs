@@ -91,6 +91,7 @@ pr19262_engine_store_enable(spa_t *spa)
 	engine.journal_segments = engine.journal_tail =
 	    kmem_zalloc(sizeof (engine_j_segment_t), KM_SLEEP);
 	engine.journal_tail->arena = p;
+	engine.journal_current = engine.journal_tail;
 	memcpy(engine.journal_tail->epoch, engine.journal_epoch,
 	    sizeof (engine.journal_epoch));
 	mutex_exit(&engine.lock);
@@ -279,7 +280,7 @@ pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
 	uint64_t desc[16] = { ENGINE_STORE_MAGIC, engine.vd->vdev_guid,
 	    engine.arena, engine.arena_bytes, first, pages, ub->ub_txg,
 	    size, 0, 0, 0, 0, engine.vd->vdev_ashift,
-	    engine.vd->vdev_children, engine.total, 4 };
+	    engine.vd->vdev_children, engine.total, 5 };
 	zio_cksum_t hash;
 	abd_checksum_sha256(abd, pages * ENGINE_STORE_PAGE, NULL, &hash);
 	memcpy(&desc[8], &hash, sizeof (hash));
@@ -354,6 +355,11 @@ engine_store_clear(void)
 		kmem_free(s, sizeof (*s));
 	}
 	engine.journal_tail = NULL;
+	engine.journal_current = NULL;
+	if (engine.journal_pending != NULL) {
+		kmem_free(engine.journal_pending, sizeof (engine_j_segment_t));
+		engine.journal_pending = NULL;
+	}
 	engine.spa = NULL;
 	engine.vd = NULL;
 	engine.free = engine.legacy = NULL;
@@ -361,6 +367,7 @@ engine_store_clear(void)
 	engine.persistent = B_FALSE;
 	engine.arena = engine.arena_bytes = engine.retired = 0;
 	engine.journal_arena = engine.journal_bytes = engine.journal_seq = 0;
+	engine.journal_serial = 0;
 	engine.journal_root = 0;
 	memset(engine.journal_root_epoch, 0,
 	    sizeof (engine.journal_root_epoch));
@@ -497,6 +504,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	engine.journal_segments = engine.journal_tail =
 	    kmem_zalloc(sizeof (engine_j_segment_t), KM_SLEEP);
 	engine.journal_tail->arena = engine.journal_arena;
+	engine.journal_current = engine.journal_tail;
 	memcpy(engine.journal_tail->epoch, engine.journal_epoch,
 	    sizeof (engine.journal_epoch));
 	for (uint_t i = 0; i < nl; i += 2) {
@@ -564,7 +572,7 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	    d[6] > ub->ub_txg ||
 	    (d[6] != ub->ub_txg && (ub->ub_checkpoint_txg == 0 ||
 	    d[6] > ub->ub_checkpoint_txg)) ||
-	    d[15] != 4 || d[5] == 0 ||
+	    d[15] != 5 || d[5] == 0 ||
 	    d[4] >= ENGINE_STORE_PAGES || d[5] > ENGINE_STORE_PAGES - d[4] ||
 	    d[7] == 0 || d[7] > d[5] * ENGINE_STORE_PAGE ||
 	    d[2] >= vd->vdev_asize ||

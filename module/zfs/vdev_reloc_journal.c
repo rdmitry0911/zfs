@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: CDDL-1.0 */
 /* Private linked J segments, included by the same ownership engine. */
-#define	ENGINE_J_MAGIC 0x31393236324a3034ULL
+#define	ENGINE_J_MAGIC 0x31393236324a3035ULL
 #define	ENGINE_J_BIND 1
 #define	ENGINE_J_HEAD 2
 #define	ENGINE_J_FORWARD 3
+#define	ENGINE_J_NORMAL 0
+#define	ENGINE_J_PREPARE 1
+#define	ENGINE_J_ACTIVE 2
 #define	ENGINE_J_WORDS (ENGINE_STORE_PAGE / sizeof (uint64_t))
 #define	ENGINE_J_HASH (ENGINE_J_WORDS - 4)
 
@@ -11,6 +14,28 @@ static uint_t engine_journal_fault_stage;
 static uint64_t engine_journal_fault_seq;
 static uint_t engine_journal_roll_fault;
 static uint_t engine_journal_roll_phase;
+static int engine_journal_repair(spa_t *);
+static int engine_journal_read_head(spa_t *, abd_t *, boolean_t);
+
+static int
+engine_journal_empty(spa_t *spa, boolean_t all_io)
+{
+	abd_t *page = abd_alloc_linear(ENGINE_STORE_PAGE, B_TRUE);
+	int error = engine_journal_read_head(spa, page, all_io);
+	if (error == 0) {
+		uint64_t *w = abd_to_buf(page);
+		zio_cksum_t zero = { 0 };
+		if (w[3] != 0 || w[31] != ENGINE_J_NORMAL ||
+		    memcmp(w + 20, &zero, sizeof (zero)) != 0 ||
+		    w[32] != 0 || w[33] != 0 || w[34] != 0 || w[35] != 0)
+			error = EINVAL;
+	} else if (error == ECKSUM) {
+		/* No initialized header is expected before formatting. */
+		error = 0;
+	}
+	abd_free(page);
+	return (error);
+}
 
 void
 pr19262_engine_journal_roll_fault(uint_t stage)
@@ -111,21 +136,80 @@ engine_journal_write(spa_t *spa, uint64_t page, abd_t *abd)
 		    ((engine_journal_roll_phase == 1 && roll <= 3) ||
 		    (engine_journal_roll_phase == 2 &&
 		    roll >= 4 && roll <= 6) ||
-		    (engine_journal_roll_phase == 3 && roll >= 7));
+		    (engine_journal_roll_phase == 3 &&
+		    roll >= 7 && roll <= 9) ||
+		    (engine_journal_roll_phase == 4 &&
+		    roll >= 11 && roll <= 12));
 		int e = (inject && (engine_journal_fault_stage == 1 ||
 		    engine_journal_fault_stage == 4)) ||
-		    (roll_inject && roll % 3 == 1) ? EIO :
+		    (roll_inject && (roll % 3 == 1 || roll == 11)) ? EIO :
 		    engine_store_io_at(vd, engine.journal_arena, page,
 		    1, abd, B_TRUE);
 		if (e == 0)
 			e = (inject && (engine_journal_fault_stage == 2 ||
 			    engine_journal_fault_stage == 5)) ||
-			    (roll_inject && roll % 3 == 2) ? EIO :
+			    (roll_inject &&
+			    (roll % 3 == 2 || roll == 12)) ? EIO :
 			    pr19262_engine_metadata_flush(vd);
 		if (e != 0)
 			error = e;
+		if (e == 0 && i == 0 && engine_journal_roll_phase == 2 &&
+		    roll == 10) {
+			(void) printf("PR19262_J_SINGLE_FORWARD root=%llu "
+			    "next=%llu seq=%llu\n",
+			    (u_longlong_t)engine.journal_arena,
+			    (u_longlong_t)w[6], (u_longlong_t)w[3]);
+			(void) fflush(NULL);
+			_exit(90);
+		}
+		if (e == 0 && i == 0 &&
+		    ((roll == 14 && engine_journal_roll_phase == 4) ||
+		    (roll == 15 && engine_journal_roll_phase == 3) ||
+		    (roll == 16 && engine_journal_roll_phase == 1))) {
+			(void) printf("PR19262_J_MEMBER_CUT stage=%u "
+			    "root=%llu next=%llu seq=%llu\n", roll,
+			    (u_longlong_t)engine.journal_root,
+			    (u_longlong_t)(engine.journal_pending != NULL ?
+			    engine.journal_pending->arena : 0),
+			    (u_longlong_t)w[3]);
+			(void) fflush(NULL);
+			_exit(80 + roll);
+		}
 	}
 	spa_config_exit(spa, SCL_ZIO, FTAG);
+	return (error);
+}
+
+static int
+engine_journal_head(spa_t *spa, uint64_t seq, const zio_cksum_t *hash,
+    uint64_t phase, engine_j_segment_t *target)
+{
+	if (engine.journal_serial == UINT64_MAX)
+		return (EOVERFLOW);
+	abd_t *page = engine_journal_page(ENGINE_J_HEAD, seq);
+	uint64_t *w = abd_to_buf(page);
+	memcpy(w + 20, hash, sizeof (*hash));
+	w[30] = engine.journal_serial + 1;
+	w[31] = phase;
+	if (target != NULL) {
+		w[32] = target->arena; w[33] = engine.journal_bytes;
+		w[34] = target->epoch[0]; w[35] = target->epoch[1];
+	}
+	engine_journal_seal(page);
+	int error = engine_journal_write(spa, w[30] % 2, page);
+	if (error == 0) {
+		mutex_enter(&engine.lock);
+		engine_j_segment_t *s = engine.journal_current;
+		engine.journal_serial = s->serial = w[30];
+		engine.journal_seq = s->seq = seq;
+		engine.journal_hash = s->hash = *hash;
+		s->phase = phase;
+		s->target = w[32];
+		s->target_epoch[0] = w[34];
+		s->target_epoch[1] = w[35];
+		mutex_exit(&engine.lock);
+	}
+	abd_free(page);
 	return (error);
 }
 
@@ -133,10 +217,16 @@ static int
 engine_journal_format(spa_t *spa)
 {
 	abd_t *head = engine_journal_page(ENGINE_J_HEAD, 0);
+	((uint64_t *)abd_to_buf(head))[30] = 1;
 	engine_journal_seal(head);
 	int error = engine_journal_write(spa, 0, head);
 	if (error == 0)
 		error = engine_journal_write(spa, 1, head);
+	if (error == 0) {
+		mutex_enter(&engine.lock);
+		engine.journal_serial = engine.journal_current->serial = 1;
+		mutex_exit(&engine.lock);
+	}
 	abd_free(head);
 	return (error);
 }
@@ -148,13 +238,15 @@ engine_journal_select(engine_j_segment_t *s)
 	engine.journal_arena = s->arena;
 	memcpy(engine.journal_epoch, s->epoch, sizeof (s->epoch));
 	engine.journal_seq = s->seq;
+	engine.journal_serial = s->serial;
 	engine.journal_hash = s->hash;
+	engine.journal_current = s;
 	mutex_exit(&engine.lock);
 }
 
 static int
 engine_journal_segment(uint64_t arena, const uint64_t epoch[2],
-    boolean_t allocate, engine_j_segment_t **result)
+    boolean_t allocate, boolean_t link, engine_j_segment_t **result)
 {
 	mutex_enter(&engine.lock);
 	if (allocate) {
@@ -175,9 +267,14 @@ engine_journal_segment(uint64_t arena, const uint64_t epoch[2],
 	memcpy(s->epoch, epoch, sizeof (s->epoch));
 	zfs_range_tree_remove(engine.free, arena, bytes);
 	zfs_range_tree_add(engine.journal_extents, arena, bytes);
-	VERIFY3P(engine.journal_tail->next, ==, NULL);
-	engine.journal_tail->next = s;
-	engine.journal_tail = s;
+	if (link) {
+		VERIFY3P(engine.journal_tail->next, ==, NULL);
+		engine.journal_tail->next = s;
+		engine.journal_tail = s;
+	} else {
+		VERIFY3P(engine.journal_pending, ==, NULL);
+		engine.journal_pending = s;
+	}
 	engine.revision++;
 	*result = s;
 	mutex_exit(&engine.lock);
@@ -185,18 +282,19 @@ engine_journal_segment(uint64_t arena, const uint64_t epoch[2],
 }
 
 static int
-engine_journal_grow(spa_t *spa)
+engine_journal_finish_prepare(spa_t *spa)
 {
 	ASSERT(MUTEX_HELD(&engine.journal_lock));
 	engine_j_segment_t *old = engine.journal_tail;
-	uint64_t arena = UINT64_MAX, epoch[2];
-	VERIFY0(random_get_pseudo_bytes((void *)epoch, sizeof (epoch)));
-	engine_j_segment_t *next;
-	int error = engine_journal_segment(arena, epoch, B_TRUE, &next);
-	if (error != 0)
-		return (error);
-	arena = next->arena;
+	engine_j_segment_t *next = engine.journal_pending;
+	VERIFY3P(next, !=, NULL);
+	uint64_t arena = next->arena;
 	engine_journal_select(next);
+	int error = engine_journal_empty(spa, B_TRUE);
+	if (error != 0) {
+		engine_journal_select(old);
+		return (error);
+	}
 	engine_journal_roll_phase = 1;
 	error = engine_journal_format(spa);
 	engine_journal_roll_phase = 0;
@@ -208,7 +306,7 @@ engine_journal_grow(spa_t *spa)
 	abd_t *page = engine_journal_page(ENGINE_J_FORWARD, seq);
 	uint64_t *w = abd_to_buf(page);
 	w[6] = arena; w[7] = engine.journal_bytes;
-	w[8] = epoch[0]; w[9] = epoch[1];
+	w[8] = next->epoch[0]; w[9] = next->epoch[1];
 	memcpy(w + 20, &old->hash, sizeof (old->hash));
 	engine_journal_seal(page);
 	zio_cksum_t hash;
@@ -220,18 +318,18 @@ engine_journal_grow(spa_t *spa)
 	if (error == 0)
 		engine_journal_roll_stop(6);
 	if (error == 0) {
-		page = engine_journal_page(ENGINE_J_HEAD, seq);
-		memcpy((uint64_t *)abd_to_buf(page) + 20, &hash, sizeof (hash));
-		engine_journal_seal(page);
 		engine_journal_roll_phase = 3;
-		error = engine_journal_write(spa, seq % 2, page);
+		error = engine_journal_head(spa, seq, &hash,
+		    ENGINE_J_ACTIVE, next);
 		engine_journal_roll_phase = 0;
-		abd_free(page);
 	}
 	if (error == 0) {
 		engine_journal_roll_stop(9);
-		old->seq = seq;
-		old->hash = hash;
+		mutex_enter(&engine.lock);
+		old->next = next;
+		engine.journal_tail = next;
+		engine.journal_pending = NULL;
+		mutex_exit(&engine.lock);
 		engine_journal_select(next);
 		(void) printf("PR19262_J_FORWARD from=%llu to=%llu seq=%llu\n",
 		    (u_longlong_t)old->arena, (u_longlong_t)arena,
@@ -241,11 +339,37 @@ engine_journal_grow(spa_t *spa)
 	return (error);
 }
 
+static int
+engine_journal_grow(spa_t *spa)
+{
+	ASSERT(MUTEX_HELD(&engine.journal_lock));
+	uint64_t arena = UINT64_MAX, epoch[2];
+	VERIFY0(random_get_pseudo_bytes((void *)epoch, sizeof (epoch)));
+	engine_j_segment_t *next;
+	int error = engine_journal_segment(arena, epoch,
+	    B_TRUE, B_FALSE, &next);
+	if (error != 0)
+		return (error);
+	engine_journal_roll_phase = 4;
+	error = engine_journal_head(spa, engine.journal_seq,
+	    &engine.journal_hash, ENGINE_J_PREPARE, next);
+	engine_journal_roll_phase = 0;
+	if (error == 0) {
+		engine_journal_roll_stop(13);
+		error = engine_journal_finish_prepare(spa);
+	}
+	return (error);
+}
+
 int
 pr19262_engine_journal_roll(spa_t *spa)
 {
 	mutex_enter(&engine.journal_lock);
 	int error = engine.journal_error;
+	if (error == 0 && engine.journal_repair) {
+		error = engine_journal_repair(spa);
+		engine.journal_repair = error != 0;
+	}
 	if (error == 0)
 		error = engine_journal_grow(spa);
 	mutex_enter(&engine.lock);
@@ -284,12 +408,13 @@ engine_journal_read(spa_t *spa, uint64_t page, uint64_t kind,
 			continue;
 		if (error == 0) {
 			uint64_t *selected = abd_to_buf(out);
-			if (selected[3] == w[3] && memcmp(selected, w,
+			uint_t key = kind == ENGINE_J_HEAD ? 30 : 3;
+			if (selected[key] == w[key] && memcmp(selected, w,
 			    ENGINE_STORE_PAGE) != 0) {
 				error = EINVAL;
 				break;
 			}
-			if (selected[3] >= w[3])
+			if (selected[key] >= w[key])
 				continue;
 		}
 		abd_copy(out, candidate, ENGINE_STORE_PAGE);
@@ -298,6 +423,48 @@ engine_journal_read(spa_t *spa, uint64_t page, uint64_t kind,
 	spa_config_exit(spa, SCL_ZIO, FTAG);
 	abd_free(candidate);
 	return (error);
+}
+
+static int
+engine_journal_read_head(spa_t *spa, abd_t *selected, boolean_t all_io)
+{
+	abd_t *page = abd_alloc_linear(ENGINE_STORE_PAGE, B_TRUE);
+	int error = ECKSUM;
+	int io_error = 0;
+	boolean_t conflict = B_FALSE;
+	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+	for (uint_t slot = 0; slot < 2; slot++) {
+		for (uint_t child = 0; child < engine.vd->vdev_children;
+		    child++) {
+			int e = engine_store_io_at(engine.vd->vdev_child[child],
+			    engine.journal_arena, slot, 1, page, B_FALSE);
+			if (e != 0) {
+				io_error = e;
+				continue;
+			}
+			if (!engine_journal_valid(page, ENGINE_J_HEAD,
+			    UINT64_MAX))
+				continue;
+			uint64_t *w = abd_to_buf(page);
+			uint64_t *best = abd_to_buf(selected);
+			if (error == 0 && best[30] == w[30] &&
+			    memcmp(best, w, ENGINE_STORE_PAGE) != 0)
+				conflict = B_TRUE;
+			if (error != 0 || w[30] > best[30]) {
+				abd_copy(selected, page, ENGINE_STORE_PAGE);
+				conflict = B_FALSE;
+			}
+			error = 0;
+		}
+	}
+	spa_config_exit(spa, SCL_ZIO, FTAG);
+	abd_free(page);
+	if (error == 0) {
+		uint64_t *w = abd_to_buf(selected);
+		if (conflict || w[30] == 0 || w[31] > ENGINE_J_ACTIVE)
+			error = EINVAL;
+	}
+	return (all_io && io_error != 0 ? io_error : error);
 }
 
 static int
@@ -389,33 +556,43 @@ static int
 engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 {
 	abd_t *page = abd_alloc_linear(ENGINE_STORE_PAGE, B_TRUE);
-	uint64_t head = UINT64_MAX;
-	zio_cksum_t expected = { 0 }, previous = { 0 };
-	int error = 0;
-	for (uint_t i = 0; i < 2; i++) {
-		int e = engine_journal_read(spa, i, ENGINE_J_HEAD, UINT64_MAX,
-		    NULL, page);
-		if (e == EINVAL) {
-			error = ECKSUM;
-			break;
-		}
-		if (e != 0)
-			continue;
-		uint64_t *w = abd_to_buf(page);
-		if (head == w[3] && memcmp(&expected, w + 20,
-		    sizeof (expected)) != 0) {
-			error = ECKSUM;
-			break;
-		}
-		if (head == UINT64_MAX || w[3] > head) {
-			head = w[3];
-			memcpy(&expected, w + 20, sizeof (expected));
-		}
+	int error = engine_journal_read_head(spa, page, B_FALSE);
+	if (error != 0) {
+		abd_free(page);
+		return (error);
 	}
+	uint64_t *header = abd_to_buf(page);
+	uint64_t head = header[3], phase = header[31];
+	uint64_t target = header[32], bytes = header[33];
+	uint64_t epoch[] = { header[34], header[35] };
+	engine.journal_current->serial = engine.journal_serial = header[30];
+	engine.journal_current->phase = phase;
+	engine.journal_current->target = target;
+	memcpy(engine.journal_current->target_epoch, epoch, sizeof (epoch));
+	zio_cksum_t expected = { 0 }, previous = { 0 };
+	memcpy(&expected, header + 20, sizeof (expected));
 	uint64_t capacity = engine.journal_bytes / ENGINE_STORE_PAGE - 2;
-	if (head == UINT64_MAX || head > capacity ||
+	if (head > capacity ||
 	    (head == 0 && memcmp(&expected, &previous, sizeof (expected)) != 0))
 		error = ECKSUM;
+	if (phase == ENGINE_J_NORMAL &&
+	    (target != 0 || bytes != 0 || epoch[0] != 0 || epoch[1] != 0))
+		error = EINVAL;
+	if (phase != ENGINE_J_NORMAL) {
+		uint64_t size = bytes * engine.vd->vdev_children;
+		uint64_t stripe = ENGINE_STORE_PAGE * engine.vd->vdev_children;
+		uint64_t msize = engine.arena_bytes * engine.vd->vdev_children;
+		uint64_t found, span;
+		if (bytes != engine.journal_bytes || target % stripe != 0 ||
+		    target >= engine.total || size > engine.total - target ||
+		    (epoch[0] == engine.journal_epoch[0] &&
+		    epoch[1] == engine.journal_epoch[1]) ||
+		    (target < engine.arena + msize &&
+		    engine.arena < target + size) ||
+		    zfs_range_tree_find_in(engine.journal_extents,
+		    target, size, &found, &span))
+			error = EINVAL;
+	}
 	uint64_t last = 0;
 	for (uint64_t seq = 1; error == 0 && seq <= capacity; seq++) {
 		int e = engine_journal_read(spa, seq + 1, UINT64_MAX, seq,
@@ -430,6 +607,9 @@ engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 			error = EINVAL;
 			break;
 		}
+		if (w[1] == ENGINE_J_FORWARD && seq > head &&
+		    phase != ENGINE_J_PREPARE)
+			break;
 		memcpy(&previous, w + ENGINE_J_HASH, sizeof (previous));
 		if (seq == head && memcmp(&previous, &expected,
 		    sizeof (previous)) != 0)
@@ -438,15 +618,17 @@ engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 		if (error != 0)
 			break;
 		if (w[1] == ENGINE_J_FORWARD) {
-			if (head > seq || w[7] != engine.journal_bytes ||
-			    (w[8] == engine.journal_epoch[0] &&
-			    w[9] == engine.journal_epoch[1])) {
+			if (head > seq || phase == ENGINE_J_NORMAL ||
+			    w[6] != target || w[7] != bytes ||
+			    w[8] != epoch[0] || w[9] != epoch[1] ||
+			    (phase == ENGINE_J_ACTIVE && seq != head)) {
 				error = EINVAL;
 				break;
 			}
-			uint64_t epoch[] = { w[8], w[9] };
-			error = engine_journal_segment(w[6], epoch,
-			    B_FALSE, next);
+			error = engine_journal_segment(target, epoch,
+			    B_FALSE, B_TRUE, next);
+			if (error == 0)
+				engine.journal_current->phase = ENGINE_J_ACTIVE;
 			break;
 		}
 		if (seq == capacity) {
@@ -456,6 +638,27 @@ engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 		mutex_enter(&engine.lock);
 		error = engine_journal_apply(w);
 		mutex_exit(&engine.lock);
+	}
+	if (error == 0 && phase == ENGINE_J_ACTIVE && *next == NULL)
+		error = ECKSUM;
+	if (error == 0 && phase == ENGINE_J_PREPARE && *next == NULL) {
+		/* An intent reserves space without publishing log data. */
+		mutex_enter(&engine.lock);
+		boolean_t free = engine_store_extent(target,
+		    bytes * engine.vd->vdev_children);
+		mutex_exit(&engine.lock);
+		if (free) {
+			engine_j_segment_t *pending;
+			error = engine_journal_segment(target, epoch,
+			    B_FALSE, B_FALSE, &pending);
+			if (error == 0) {
+				engine_j_segment_t *old =
+				    engine.journal_current;
+				engine_journal_select(pending);
+				error = engine_journal_empty(spa, B_FALSE);
+				engine_journal_select(old);
+			}
+		}
 	}
 	if (error == 0) {
 		mutex_enter(&engine.lock);
@@ -497,7 +700,12 @@ engine_journal_repair_segment(spa_t *spa)
 {
 	abd_t *page = abd_alloc_linear(ENGINE_STORE_PAGE, B_TRUE);
 	zio_cksum_t previous = { 0 };
-	int error = 0;
+	/* A returning member can hold a higher unpublished header serial. */
+	int error = engine_journal_read_head(spa, page, B_TRUE);
+	if (error == 0) {
+		uint64_t serial = ((uint64_t *)abd_to_buf(page))[30];
+		engine.journal_serial = MAX(engine.journal_serial, serial);
+	}
 	for (uint64_t seq = 1; error == 0 && seq <= engine.journal_seq; seq++) {
 		error = engine_journal_read(spa, seq + 1, UINT64_MAX,
 		    seq, &previous, page);
@@ -509,12 +717,16 @@ engine_journal_repair_segment(spa_t *spa)
 	}
 	abd_free(page);
 	if (error == 0) {
-		page = engine_journal_page(ENGINE_J_HEAD, engine.journal_seq);
-		memcpy((uint64_t *)abd_to_buf(page) + 20, &previous,
-		    sizeof (previous));
-		engine_journal_seal(page);
-		error = engine_journal_write(spa, engine.journal_seq % 2, page);
-		abd_free(page);
+		engine_j_segment_t *s = engine.journal_current;
+		uint64_t phase = s->phase;
+		engine_j_segment_t *target = s->next;
+		if (phase == ENGINE_J_PREPARE) {
+			target = engine.journal_pending;
+			if (target == NULL)
+				phase = ENGINE_J_NORMAL;
+		}
+		error = engine_journal_head(spa, engine.journal_seq,
+		    &previous, phase, target);
 	}
 	return (error);
 }
@@ -529,6 +741,8 @@ engine_journal_repair(spa_t *spa)
 		error = engine_journal_repair_segment(spa);
 	}
 	engine_journal_select(engine.journal_tail);
+	if (error == 0 && engine.journal_pending != NULL)
+		error = engine_journal_finish_prepare(spa);
 	return (error);
 }
 
@@ -607,12 +821,8 @@ engine_journal_bind_impl(spa_t *spa, engine_hold_t *h,
 			_exit(78);
 		}
 		if (error == 0) {
-			page = engine_journal_page(ENGINE_J_HEAD, seq);
-			memcpy((uint64_t *)abd_to_buf(page) + 20, &hash,
-			    sizeof (hash));
-			engine_journal_seal(page);
-			error = engine_journal_write(spa, seq % 2, page);
-			abd_free(page);
+			error = engine_journal_head(spa, seq, &hash,
+			    ENGINE_J_NORMAL, NULL);
 		}
 		if (error == 0 && seq == engine_journal_fault_seq &&
 		    engine_journal_fault_stage == 6) {

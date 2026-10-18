@@ -12762,6 +12762,13 @@ pr19262_journal_cold(const char *directory)
 	spa_t *spa;
 	VERIFY0(spa_open(pool, &spa, FTAG));
 	VERIFY(pr19262_engine_persistent(spa));
+	char *range = getenv("PR19262_JOURNAL_FREE_PROBE");
+	if (range != NULL) {
+		uint64_t p = strtoull(range, NULL, 10);
+		(void) printf("PR19262_J_FREE_PROBE p=%llu free=%u\n",
+		    (u_longlong_t)p,
+		    pr19262_engine_free_range(spa, p, 6ULL << 20));
+	}
 	objset_t *os;
 	VERIFY0(dmu_objset_own("pr19262_tx/journal", DMU_OST_OTHER,
 	    !write, B_TRUE, FTAG, &os));
