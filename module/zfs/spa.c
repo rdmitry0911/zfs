@@ -5910,6 +5910,25 @@ spa_ld_verify_pool_data(spa_t *spa)
 	return (0);
 }
 
+#ifndef _KERNEL
+static int
+spa_ld_claim_reloc_blocks(spa_t *spa)
+{
+	if (!pr19262_engine_persistent(spa))
+		return (0);
+
+	/* Fence recovered V owners before any writable import activity. */
+	boolean_t claiming = spa->spa_claiming;
+	spa->spa_claiming = B_TRUE;
+	dmu_tx_t *tx = dmu_tx_create_assigned(spa_get_dsl(spa),
+	    spa_first_txg(spa));
+	int error = pr19262_engine_journal_claim(spa, spa_first_txg(spa));
+	dmu_tx_commit(tx);
+	spa->spa_claiming = claiming;
+	return (error);
+}
+#endif
+
 static int
 spa_ld_claim_log_blocks(spa_t *spa)
 {
@@ -5926,14 +5945,6 @@ spa_ld_claim_log_blocks(spa_t *spa)
 	spa->spa_claiming = B_TRUE;
 
 	tx = dmu_tx_create_assigned(dp, spa_first_txg(spa));
-#ifndef _KERNEL
-	int error = pr19262_engine_journal_claim(spa, spa_first_txg(spa));
-	if (error != 0) {
-		dmu_tx_commit(tx);
-		spa->spa_claiming = B_FALSE;
-		return (error);
-	}
-#endif
 	(void) dmu_objset_find_dp(dp, dp->dp_root_dir_obj,
 	    zil_claim, tx, DS_FIND_CHILDREN);
 	dmu_tx_commit(tx);
@@ -6149,8 +6160,9 @@ spa_ld_checkpoint_rewind(spa_t *spa)
 	ASSERT3U(checkpoint.ub_txg, ==, checkpoint.ub_checkpoint_txg);
 
 #ifndef _KERNEL
-	/* A new timeline/catalog pair needs its durable fence first. */
-	if (pr19262_engine_store_ub(&checkpoint) && spa_writeable(spa))
+	/* Preactivation checkpoints need the same durable timeline fence. */
+	if (spa_writeable(spa) && (pr19262_engine_store_ub(&checkpoint) ||
+	    pr19262_engine_persistent(spa)))
 		return (SET_ERROR(ENOTSUP));
 #endif
 
@@ -6458,6 +6470,20 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 		spa_import_progress_set_notes(spa, "Starting import");
 
 		ASSERT(spa->spa_load_state != SPA_LOAD_TRYIMPORT);
+
+#ifndef _KERNEL
+		/* Raw arena recovery needs the trusted, writeable vdev tree. */
+		error = pr19262_engine_store_recover(spa);
+		if (error != 0) {
+			spa_load_failed(spa, "private arena recovery failed "
+			    "[error=%d]", error);
+			goto fail;
+		}
+		/* This also precedes the first MOS allocation by the syncer. */
+		error = spa_ld_claim_reloc_blocks(spa);
+		if (error != 0)
+			goto fail;
+#endif
 
 		/*
 		 * Before we do any zio_write's, complete the raidz expansion

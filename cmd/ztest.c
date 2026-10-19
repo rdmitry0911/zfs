@@ -12746,12 +12746,23 @@ pr19262_journal_intent_owner(spa_t *spa)
 {
 	char name[] = "pr19262_tx/intent-data";
 	char *range = getenv("PR19262_JOURNAL_INTENT_ALLOC");
-	boolean_t allocate = range != NULL;
+	char *growth = getenv("PR19262_ENGINE_GROW_BLOCKS");
+	boolean_t grow_only = growth != NULL;
+	boolean_t allocate = range != NULL || grow_only;
+	boolean_t resume = getenv("PR19262_JOURNAL_INTENT_RESUME") != NULL;
+	char *minimum = getenv("PR19262_JOURNAL_INTENT_MIN_BLOCKS");
+	uint64_t min_blocks = minimum == NULL ? 0 :
+	    strtoull(minimum, NULL, 10);
+	if (grow_only) {
+		VERIFY3P(range, ==, NULL);
+		min_blocks = strtoull(growth, NULL, 10);
+	}
+	VERIFY3U(min_blocks, <=, 512);
 	boolean_t repair = getenv("PR19262_JOURNAL_INTENT_REPAIR") != NULL;
-	uint64_t target = allocate ? strtoull(range, NULL, 10) : 0;
+	uint64_t target = range != NULL ? strtoull(range, NULL, 10) : 0;
 	uint64_t blocksize = 1ULL << 20;
 	uint_t batch = 8;
-	if (allocate) {
+	if (allocate && !resume) {
 		VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0,
 		    NULL, NULL, NULL));
 		VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COPIES,
@@ -12766,15 +12777,28 @@ pr19262_journal_intent_owner(spa_t *spa)
 	void *data = kmem_alloc(blocksize, KM_SLEEP);
 	blkptr_t *bps = kmem_alloc(batch * sizeof (*bps), KM_SLEEP);
 	if (allocate) {
-		VERIFY(pr19262_engine_free_range(spa, target, 6ULL << 20));
-		dmu_tx_t *tx = dmu_tx_create(os);
-		dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
-		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
-		object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
-		    blocksize, DMU_OT_NONE, 0, tx);
-		dmu_tx_commit(tx);
+		uint64_t start = 0;
+		dmu_tx_t *tx;
+		if (resume) {
+			VERIFY0(dmu_object_next(os, &object, B_FALSE, 0));
+			dmu_object_info_t info;
+			VERIFY0(dmu_object_info(os, object, &info));
+			start = info.doi_max_offset / blocksize;
+		} else {
+			if (!grow_only)
+				VERIFY(pr19262_engine_free_range(spa, target,
+				    6ULL << 20));
+			tx = dmu_tx_create(os);
+			dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+			VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+			object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
+			    blocksize, DMU_OT_NONE, 0, tx);
+			dmu_tx_commit(tx);
+		}
 		boolean_t found = B_FALSE;
-		for (uint64_t base = 0; !found && base < 512; base += batch) {
+		for (uint64_t base = start; base < 512 &&
+		    (base < min_blocks || (!grow_only && !found));
+		    base += batch) {
 			tx = dmu_tx_create(os);
 			dmu_tx_hold_write(tx, object, base * blocksize,
 			    batch * blocksize);
@@ -12796,7 +12820,8 @@ pr19262_journal_intent_owner(spa_t *spa)
 					pr19262_engine_info_t info;
 					pr19262_engine_inspect(spa, &bps[b], d,
 					    &info);
-					if (info.p >= target + (6ULL << 20) ||
+					if (grow_only ||
+					    info.p >= target + (6ULL << 20) ||
 					    target >= info.p + info.psize)
 						continue;
 					found = B_TRUE;
@@ -12816,8 +12841,10 @@ pr19262_journal_intent_owner(spa_t *spa)
 			    "found=%u\n", (u_longlong_t)(base + batch), found);
 			(void) fflush(NULL);
 		}
-		VERIFY(found);
-		VERIFY(!pr19262_engine_free_range(spa, target, 6ULL << 20));
+		VERIFY(grow_only || found);
+		if (!grow_only)
+			VERIFY(!pr19262_engine_free_range(spa, target,
+			    6ULL << 20));
 	}
 	if (!allocate)
 		VERIFY0(dmu_object_next(os, &object, B_FALSE, 0));
@@ -12854,13 +12881,568 @@ pr19262_journal_intent_owner(spa_t *spa)
 	return (0);
 }
 
+static struct {
+	kmutex_t lock;
+	kcondvar_t changed;
+	spa_t *spa;
+	uint64_t txg;
+	uint64_t roots;
+	uint64_t pages;
+	int inventory_error;
+	boolean_t inventory_locked;
+	boolean_t sync_waiting;
+	boolean_t release_inventory;
+	boolean_t release_sync;
+	boolean_t inventory_done;
+	boolean_t sync_done;
+	boolean_t writer_done;
+} pr19262_store_witness;
+
+static void
+pr19262_store_witness_hook(spa_t *spa, int phase)
+{
+	if (spa != pr19262_store_witness.spa)
+		return;
+	mutex_enter(&pr19262_store_witness.lock);
+	if (phase == 1) {
+		pr19262_store_witness.inventory_locked = B_TRUE;
+		(void) printf("PR19262_STORE_LOCK I_LOCKED\n");
+		(void) fflush(NULL);
+		cv_broadcast(&pr19262_store_witness.changed);
+		while (!pr19262_store_witness.release_inventory)
+			cv_wait(&pr19262_store_witness.changed,
+			    &pr19262_store_witness.lock);
+	} else if (phase == 2 && spa_syncing_txg(spa) ==
+	    pr19262_store_witness.txg) {
+		VERIFY(dsl_pool_sync_context(spa->spa_dsl_pool));
+		pr19262_store_witness.sync_waiting = B_TRUE;
+		(void) printf("PR19262_STORE_LOCK T_PRESTORE txg=%llu\n",
+		    (u_longlong_t)spa_syncing_txg(spa));
+		(void) fflush(NULL);
+		cv_broadcast(&pr19262_store_witness.changed);
+		while (!pr19262_store_witness.release_sync)
+			cv_wait(&pr19262_store_witness.changed,
+			    &pr19262_store_witness.lock);
+	}
+	mutex_exit(&pr19262_store_witness.lock);
+}
+
+static void
+pr19262_store_witness_inventory(void *arg)
+{
+	spa_t *spa = arg;
+	uint64_t roots, pages;
+	int error = pr19262_engine_store_inventory(spa, &roots, &pages);
+	mutex_enter(&pr19262_store_witness.lock);
+	pr19262_store_witness.inventory_error = error;
+	pr19262_store_witness.roots = roots;
+	pr19262_store_witness.pages = pages;
+	pr19262_store_witness.inventory_done = B_TRUE;
+	cv_broadcast(&pr19262_store_witness.changed);
+	mutex_exit(&pr19262_store_witness.lock);
+	thread_exit();
+}
+
+static void
+pr19262_store_witness_sync(void *arg)
+{
+	spa_t *spa = arg;
+	txg_wait_synced(spa->spa_dsl_pool, pr19262_store_witness.txg);
+	VERIFY3U(spa_last_synced_txg(spa), >=, pr19262_store_witness.txg);
+	mutex_enter(&pr19262_store_witness.lock);
+	pr19262_store_witness.sync_done = B_TRUE;
+	cv_broadcast(&pr19262_store_witness.changed);
+	mutex_exit(&pr19262_store_witness.lock);
+	thread_exit();
+}
+
+static void
+pr19262_store_witness_writer(void *arg)
+{
+	spa_t *spa = arg;
+	spa_config_enter(spa, SCL_STATE_ALL, FTAG, RW_WRITER);
+	(void) printf("PR19262_STORE_LOCK W_ACQUIRED\n");
+	spa_config_exit(spa, SCL_STATE_ALL, FTAG);
+	mutex_enter(&pr19262_store_witness.lock);
+	pr19262_store_witness.writer_done = B_TRUE;
+	cv_broadcast(&pr19262_store_witness.changed);
+	mutex_exit(&pr19262_store_witness.lock);
+	thread_exit();
+}
+
+static void
+pr19262_store_witness_wait(boolean_t *flag, const char *phase)
+{
+	hrtime_t deadline = gethrtime() + SEC2NSEC(30);
+	mutex_enter(&pr19262_store_witness.lock);
+	while (!*flag && gethrtime() < deadline)
+		(void) cv_timedwait_hires(&pr19262_store_witness.changed,
+		    &pr19262_store_witness.lock, deadline, USEC2NSEC(1),
+		    CALLOUT_FLAG_ABSOLUTE);
+	if (!*flag) {
+		(void) printf("PR19262_STORE_LOCK TIMEOUT phase=%s "
+		    "locked=%u prestore=%u inventory=%u sync=%u writer=%u\n",
+		    phase, pr19262_store_witness.inventory_locked,
+		    pr19262_store_witness.sync_waiting,
+		    pr19262_store_witness.inventory_done,
+		    pr19262_store_witness.sync_done,
+		    pr19262_store_witness.writer_done);
+		(void) fflush(NULL);
+		_exit(146);
+	}
+	mutex_exit(&pr19262_store_witness.lock);
+}
+
+static void
+pr19262_store_lock_witness(spa_t *spa)
+{
+	char name[ZFS_MAX_DATASET_NAME_LEN];
+	(void) snprintf(name, sizeof (name), "%s/store_lock", spa_name(spa));
+	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	objset_t *os;
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE,
+	    FTAG, &os));
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER, 4096,
+	    DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_write(tx, object, 0, 4096);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	pr19262_store_witness.txg = dmu_tx_get_txg(tx);
+	pr19262_store_witness.spa = spa;
+	mutex_init(&pr19262_store_witness.lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&pr19262_store_witness.changed, NULL, CV_DEFAULT, NULL);
+	pr19262_engine_store_test_hook(pr19262_store_witness_hook);
+	kthread_t *inventory = _thread_create(NULL, 0,
+	    pr19262_store_witness_inventory, spa, 0, NULL,
+	    TS_RUN | TS_JOINABLE, defclsyspri);
+	pr19262_store_witness_wait(&pr19262_store_witness.inventory_locked,
+	    "inventory-locked");
+	uint64_t size = 4096;
+	uint8_t *data = kmem_alloc(size, KM_SLEEP);
+	memset(data, 0x6d, size);
+	dmu_write(os, object, 0, size, data, tx, 0);
+	dmu_tx_commit(tx);
+	kthread_t *sync = _thread_create(NULL, 0, pr19262_store_witness_sync,
+	    spa, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
+	pr19262_store_witness_wait(&pr19262_store_witness.sync_waiting,
+	    "sync-prestore");
+	spa_config_lock_t *state =
+	    &spa->spa_config_lock[highbit64(SCL_STATE) - 1];
+	mutex_enter(&state->scl_lock);
+	VERIFY0(state->scl_write_wanted);
+	VERIFY3P(state->scl_writer, ==, NULL);
+	mutex_exit(&state->scl_lock);
+	kthread_t *writer = _thread_create(NULL, 0,
+	    pr19262_store_witness_writer, spa, 0, NULL,
+	    TS_RUN | TS_JOINABLE, defclsyspri);
+	hrtime_t deadline = gethrtime() + SEC2NSEC(30);
+	boolean_t queued = B_FALSE;
+	uint32_t count = 0;
+	while (!queued && gethrtime() < deadline) {
+		mutex_enter(&state->scl_lock);
+		queued = state->scl_write_wanted != 0;
+		count = state->scl_count;
+		mutex_exit(&state->scl_lock);
+		if (!queued)
+			(void) poll(NULL, 0, 10);
+	}
+	VERIFY(queued);
+	(void) printf("PR19262_STORE_LOCK W_QUEUED state_count=%u\n", count);
+	(void) fflush(NULL);
+	mutex_enter(&pr19262_store_witness.lock);
+	pr19262_store_witness.release_sync = B_TRUE;
+	pr19262_store_witness.release_inventory = B_TRUE;
+	cv_broadcast(&pr19262_store_witness.changed);
+	mutex_exit(&pr19262_store_witness.lock);
+	pr19262_store_witness_wait(&pr19262_store_witness.inventory_done,
+	    "inventory-complete");
+	pr19262_store_witness_wait(&pr19262_store_witness.sync_done,
+	    "sync-complete");
+	pr19262_store_witness_wait(&pr19262_store_witness.writer_done,
+	    "writer-complete");
+	VERIFY0(thread_join(inventory));
+	VERIFY0(thread_join(sync));
+	VERIFY0(thread_join(writer));
+	pr19262_engine_store_test_hook(NULL);
+	VERIFY0(pr19262_store_witness.inventory_error);
+	VERIFY3U(pr19262_store_witness.roots, >, 0);
+	VERIFY3U(pr19262_store_witness.pages, >, 0);
+	uint8_t *check = kmem_alloc(size, KM_SLEEP);
+	VERIFY0(dmu_read(os, object, 0, size, check,
+	    DMU_READ_NO_PREFETCH));
+	VERIFY0(memcmp(data, check, size));
+	kmem_free(check, size);
+	kmem_free(data, size);
+	(void) printf("PR19262_STORE_LOCK PASS roots=%llu pages=%llu "
+	    "target=%llu synced=%llu inventory=1 sync=1 writer=1\n",
+	    (u_longlong_t)pr19262_store_witness.roots,
+	    (u_longlong_t)pr19262_store_witness.pages,
+	    (u_longlong_t)pr19262_store_witness.txg,
+	    (u_longlong_t)spa_last_synced_txg(spa));
+	(void) fflush(NULL);
+	_exit(0);
+}
+
+static int
+pr19262_store_lock_readback(spa_t *spa)
+{
+	char name[ZFS_MAX_DATASET_NAME_LEN];
+	(void) snprintf(name, sizeof (name), "%s/store_lock", spa_name(spa));
+	objset_t *os;
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_TRUE, B_TRUE,
+	    FTAG, &os));
+	uint64_t object = 0;
+	VERIFY0(dmu_object_next(os, &object, B_FALSE, 0));
+	dmu_object_info_t info;
+	VERIFY0(dmu_object_info(os, object, &info));
+	VERIFY3U(info.doi_type, ==, DMU_OT_UINT64_OTHER);
+	VERIFY3U(info.doi_max_offset, >=, 4096);
+	uint64_t size = 4096;
+	uint8_t *data = kmem_alloc(size, KM_SLEEP);
+	VERIFY0(dmu_read(os, object, 0, size, data,
+	    DMU_READ_NO_PREFETCH));
+	for (uint_t i = 0; i < size; i++)
+		VERIFY3U(data[i], ==, 0x6d);
+	(void) printf("PR19262_STORE_LOCK_READBACK PASS object=%llu "
+	    "bytes=%lu value=109 readonly=1\n", (u_longlong_t)object,
+	    (unsigned long)size);
+	kmem_free(data, size);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	spa_close(spa, FTAG);
+	kernel_fini();
+	return (0);
+}
+
+static int
+pr19262_unalloc_native_claim(spa_t *spa, const blkptr_t *bp)
+{
+	const dva_t *dva = &bp->blk_dva[0];
+	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
+	vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(dva));
+	VERIFY3P(vd, !=, NULL);
+	int error = metaslab_claim_impl(vd, DVA_GET_OFFSET(dva),
+	    DVA_GET_ASIZE(dva), 0);
+	spa_config_exit(spa, SCL_ALLOC, FTAG);
+	return (error);
+}
+
+static struct {
+	kmutex_t lock;
+	spa_t *spa;
+	blkptr_t bp;
+	void *hold;
+	uint64_t aborts;
+	uint64_t retained;
+} pr19262_unalloc_witness;
+
+static void
+pr19262_unalloc_ready(zio_t *zio)
+{
+	VERIFY3U(BP_GET_NDVAS(zio->io_bp), ==, 1);
+	mutex_enter(&pr19262_unalloc_witness.lock);
+	pr19262_unalloc_witness.bp = *zio->io_bp;
+	pr19262_unalloc_witness.hold = pr19262_engine_hold(zio->io_spa,
+	    zio->io_bp, NULL, B_TRUE, B_FALSE);
+	VERIFY3P(pr19262_unalloc_witness.hold, !=, NULL);
+	mutex_exit(&pr19262_unalloc_witness.lock);
+}
+
+static void
+pr19262_unalloc_observe(spa_t *spa, const blkptr_t *bp, int phase)
+{
+	if (spa != pr19262_unalloc_witness.spa || (phase != 3 && phase != 4))
+		return;
+	mutex_enter(&pr19262_unalloc_witness.lock);
+	if (DVA_GET_OFFSET(&bp->blk_dva[0]) ==
+	    DVA_GET_OFFSET(&pr19262_unalloc_witness.bp.blk_dva[0])) {
+		pr19262_unalloc_witness.aborts += phase == 3;
+		pr19262_unalloc_witness.retained += phase == 4;
+	}
+	mutex_exit(&pr19262_unalloc_witness.lock);
+}
+
+static void
+pr19262_alloc_nomem_witness(spa_t *spa, uint64_t txg, abd_t *data,
+    uint64_t size, const zio_prop_t *prop)
+{
+	uint64_t free_before = pr19262_engine_limit(spa, B_TRUE);
+	for (uint_t attempt = 1; attempt <= 2; attempt++) {
+		blkptr_t failed = { 0 };
+		BP_SET_LSIZE(&failed, size);
+		BP_SET_PSIZE(&failed, size);
+		zio_alloc_list_t trace;
+		metaslab_trace_init(&trace);
+		pr19262_engine_alloc_fail_after(attempt);
+		int error = metaslab_alloc(spa, spa_normal_class(spa), size,
+		    &failed, 2, txg, NULL, 0, &trace, 0, FTAG);
+		pr19262_engine_alloc_fail_after(0);
+		(void) printf("PR19262_ALLOC_NOMEM NATIVE attempt=%u error=%d "
+		    "ndvas=%u birth=%llu\n", attempt, error,
+		    (uint_t)BP_GET_NDVAS(&failed),
+		    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(&failed));
+		(void) fflush(NULL);
+		VERIFY3S(error, ==, ENOMEM);
+		VERIFY0(BP_GET_NDVAS(&failed));
+		VERIFY0(BP_GET_PHYSICAL_BIRTH(&failed));
+		VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==, free_before);
+		metaslab_trace_fini(&trace);
+	}
+	blkptr_t failed = { 0 };
+	pr19262_engine_alloc_fail_after(1);
+	int error = zio_wait(zio_write(NULL, spa, txg, &failed, data,
+	    size, size, prop, NULL, NULL, NULL, NULL,
+	    ZIO_PRIORITY_SYNC_WRITE, ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY,
+	    NULL));
+	pr19262_engine_alloc_fail_after(0);
+	(void) printf("PR19262_ALLOC_NOMEM ZIO error=%d ndvas=%u gang=%u\n",
+	    error, (uint_t)BP_GET_NDVAS(&failed),
+	    (uint_t)BP_IS_GANG(&failed));
+	(void) fflush(NULL);
+	VERIFY3S(error, ==, ENOMEM);
+	VERIFY0(BP_GET_NDVAS(&failed));
+	VERIFY0(BP_GET_PHYSICAL_BIRTH(&failed));
+	VERIFY(!BP_IS_GANG(&failed));
+	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==, free_before);
+	blkptr_t retry = { 0 };
+	VERIFY0(zio_wait(zio_write(NULL, spa, txg, &retry, data,
+	    size, size, prop, NULL, NULL, NULL, NULL,
+	    ZIO_PRIORITY_SYNC_WRITE, ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY,
+	    NULL)));
+	VERIFY3U(BP_GET_NDVAS(&retry), ==, 1);
+	VERIFY(!BP_IS_GANG(&retry));
+	metaslab_free(spa, &retry, txg, B_TRUE);
+	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==, free_before);
+	(void) printf("PR19262_ALLOC_NOMEM PASS native=2 zio=1 "
+	    "partial_rollback=1 retry=1 no_gang=1 p_preserved=1\n");
+	(void) fflush(NULL);
+}
+
+static void
+pr19262_unalloc_zio_witness(spa_t *spa)
+{
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	dmu_tx_t *fence = dmu_tx_create_dd(spa->spa_dsl_pool->dp_mos_dir);
+	VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
+	uint64_t txg = dmu_tx_get_txg(fence);
+	txg_wait_synced(spa->spa_dsl_pool, txg - 1);
+	pr19262_unalloc_witness.spa = spa;
+	mutex_init(&pr19262_unalloc_witness.lock, NULL, MUTEX_DEFAULT, NULL);
+	uint64_t size = 16384;
+	abd_t *data = abd_alloc_for_io(size * 2, B_FALSE);
+	abd_zero(data, size * 2);
+	zio_prop_t prop = { 0 };
+	prop.zp_checksum = ZIO_CHECKSUM_SHA256;
+	prop.zp_compress = ZIO_COMPRESS_OFF;
+	prop.zp_copies = 1;
+	prop.zp_type = DMU_OT_UINT64_OTHER;
+	pr19262_alloc_nomem_witness(spa, txg, data, size, &prop);
+	pr19262_engine_journal_test_hook(pr19262_unalloc_observe);
+	blkptr_t failed = { 0 };
+	uint64_t free_before = pr19262_engine_limit(spa, B_TRUE);
+	pr19262_engine_fail_writes(B_TRUE);
+	int error = zio_wait(zio_write(NULL, spa, txg, &failed, data,
+	    size, size, &prop, pr19262_unalloc_ready, NULL, NULL, NULL,
+	    ZIO_PRIORITY_SYNC_WRITE, ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY,
+	    NULL));
+	pr19262_engine_fail_writes(B_FALSE);
+	(void) printf("PR19262_UNALLOC_ZIO RETURN error=%d aborts=%llu "
+	    "retained=%llu\n", error,
+	    (u_longlong_t)pr19262_unalloc_witness.aborts,
+	    (u_longlong_t)pr19262_unalloc_witness.retained);
+	(void) fflush(NULL);
+	VERIFY3S(error, ==, EIO);
+	VERIFY3U(pr19262_unalloc_witness.aborts, ==, 1);
+	VERIFY0(pr19262_unalloc_witness.retained);
+	blkptr_t held = pr19262_unalloc_witness.bp;
+	pr19262_engine_info_t info;
+	pr19262_engine_inspect(spa, &held, 0, &info);
+	VERIFY(info.aborted && !info.retired && !info.journal_touched);
+	VERIFY3U(info.holds, ==, 1);
+	VERIFY0(info.journal_seq);
+	VERIFY(!pr19262_engine_free_range(spa, info.p, info.psize));
+	VERIFY0(pr19262_unalloc_native_claim(spa, &held));
+	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==,
+	    free_before - info.psize);
+	blkptr_t larger = { 0 };
+	VERIFY0(zio_wait(zio_write(NULL, spa, txg, &larger, data,
+	    size * 2, size * 2, &prop, NULL, NULL, NULL, NULL,
+	    ZIO_PRIORITY_SYNC_WRITE, ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY,
+	    NULL)));
+	VERIFY3U(BP_GET_NDVAS(&larger), ==, 1);
+	const dva_t *old = &held.blk_dva[0], *new = &larger.blk_dva[0];
+	VERIFY3U(DVA_GET_ASIZE(new), >, DVA_GET_ASIZE(old));
+	if (DVA_GET_VDEV(new) == DVA_GET_VDEV(old)) {
+		VERIFY(DVA_GET_OFFSET(new) >= DVA_GET_OFFSET(old) +
+		    DVA_GET_ASIZE(old) || DVA_GET_OFFSET(old) >=
+		    DVA_GET_OFFSET(new) + DVA_GET_ASIZE(new));
+	}
+	metaslab_free(spa, &larger, txg, B_TRUE);
+	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==,
+	    free_before - info.psize);
+	pr19262_engine_rele(pr19262_unalloc_witness.hold);
+	pr19262_unalloc_witness.hold = NULL;
+	VERIFY(pr19262_engine_free_range(spa, info.p, info.psize));
+	VERIFY0(pr19262_unalloc_native_claim(spa, &held));
+	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==, free_before);
+	/* A separate API control admits J before native rollback. */
+	blkptr_t admitted = { 0 };
+	VERIFY0(zio_wait(zio_write(NULL, spa, txg, &admitted, data,
+	    size, size, &prop, NULL, NULL, NULL, NULL,
+	    ZIO_PRIORITY_SYNC_WRITE, ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY,
+	    NULL)));
+	mutex_enter(&pr19262_unalloc_witness.lock);
+	pr19262_unalloc_witness.bp = admitted;
+	pr19262_unalloc_witness.aborts = 0;
+	pr19262_unalloc_witness.retained = 0;
+	mutex_exit(&pr19262_unalloc_witness.lock);
+	VERIFY0(pr19262_engine_journal_bind(spa, &admitted));
+	pr19262_engine_info_t retained;
+	pr19262_engine_inspect(spa, &admitted, 0, &retained);
+	VERIFY(retained.journal_touched && !retained.aborted);
+	VERIFY3U(retained.journal_seq, >, 0);
+	metaslab_free(spa, &admitted, txg, B_TRUE);
+	VERIFY0(pr19262_unalloc_witness.aborts);
+	VERIFY3U(pr19262_unalloc_witness.retained, ==, 1);
+	pr19262_engine_inspect(spa, &admitted, 0, &retained);
+	VERIFY(retained.retired && !retained.aborted);
+	VERIFY(!pr19262_engine_free_range(spa, retained.p, retained.psize));
+	VERIFY3S(pr19262_unalloc_native_claim(spa, &admitted), ==, ENOENT);
+	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
+	vdev_t *vd = vdev_lookup_top(spa,
+	    DVA_GET_VDEV(&admitted.blk_dva[0]));
+	uint64_t v = DVA_GET_OFFSET(&admitted.blk_dva[0]);
+	uint64_t span = DVA_GET_ASIZE(&admitted.blk_dva[0]);
+	uint64_t birth = BP_GET_PHYSICAL_BIRTH(&admitted);
+	VERIFY3U(birth, <, UINT64_MAX);
+	VERIFY(pr19262_engine_journal_claimed(spa, vd, v, span, birth, txg));
+	VERIFY(!pr19262_engine_journal_claimed(spa, vd, v, span,
+	    birth + 1, txg));
+	spa_config_exit(spa, SCL_ALLOC, FTAG);
+	(void) printf("PR19262_UNALLOC_J_RETAIN PASS api_control=1 "
+	    "natural_race_claim=0 native_retained=1 exact_birth=1 "
+	    "wrong_birth_rejected=1 journal_seq=%llu "
+	    "incarnation=%llu\n", (u_longlong_t)retained.journal_seq,
+	    (u_longlong_t)retained.incarnation);
+	pr19262_engine_journal_test_hook(NULL);
+	pr19262_engine_check(spa, "actual-ZIO-error-held-owner-abort");
+	abd_free(data);
+	(void) printf("PR19262_UNALLOC_ZIO PASS actual_zio_eio=1 "
+	    "native_free_v=1 held_p=1 picker_excluded_v=1 drained_p=1 "
+	    "incarnation=%llu v=%llu p=%llu size=%llu\n",
+	    (u_longlong_t)info.incarnation,
+	    (u_longlong_t)DVA_GET_OFFSET(old), (u_longlong_t)info.p,
+	    (u_longlong_t)info.psize);
+	(void) fflush(NULL);
+	_exit(0);
+}
+
+static int
+pr19262_mgrowth_report(spa_t *spa, boolean_t advance, const char *label,
+    pr19262_mgrowth_probe_t *probe)
+{
+	int error = pr19262_engine_mgrowth_probe(spa, advance, probe);
+	(void) printf("PR19262_M_GROW_PROBE label=%s error=%d p=%llu "
+	    "pages=%llu uuid=%llu,%llu phase=%llu format_generation=%llu "
+	    "serial=%llu control_serial=%llu capacity=%llu "
+	    "directory_bytes=%llu",
+	    label, error, (u_longlong_t)probe->p, (u_longlong_t)probe->pages,
+	    (u_longlong_t)probe->uuid[0], (u_longlong_t)probe->uuid[1],
+	    (u_longlong_t)probe->phase,
+	    (u_longlong_t)probe->format_generation,
+	    (u_longlong_t)probe->serial, (u_longlong_t)probe->control_serial,
+	    (u_longlong_t)probe->capacity,
+	    (u_longlong_t)probe->directory_bytes);
+	(void) printf(" candidate=");
+	for (uint_t i = 0; i < 6; i++)
+		(void) printf("%s%llu", i == 0 ? "" : ",",
+		    (u_longlong_t)probe->candidate[i]);
+	(void) printf(" directory=");
+	for (uint_t i = 0; i < 6; i++)
+		(void) printf("%s%llu", i == 0 ? "" : ",",
+		    (u_longlong_t)probe->directory[i]);
+	(void) printf(" directory_hash=");
+	for (uint_t i = 0; i < 4; i++)
+		(void) printf("%s%llx", i == 0 ? "" : ",",
+		    (u_longlong_t)probe->directory_hash[i]);
+	(void) printf(" bitmap_hash=");
+	for (uint_t i = 0; i < 4; i++)
+		(void) printf("%s%llx", i == 0 ? "" : ",",
+		    (u_longlong_t)probe->bitmap_hash[i]);
+	(void) printf(" bitmap_canonical=");
+	for (uint_t i = 0; i < 4; i++)
+		(void) printf("%s%llx", i == 0 ? "" : ",",
+		    (u_longlong_t)probe->bitmap_canonical[i]);
+	(void) printf(" bitmap_used=%llu arenas=%llu\n",
+	    (u_longlong_t)probe->bitmap_used,
+	    (u_longlong_t)probe->arenas);
+	(void) fflush(NULL);
+	return (error);
+}
+
+static void
+pr19262_mgrowth_retry_witness(spa_t *spa)
+{
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	dmu_tx_t *fence = dmu_tx_create_dd(spa->spa_dsl_pool->dp_mos_dir);
+	VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
+	txg_wait_synced(spa->spa_dsl_pool, dmu_tx_get_txg(fence) - 1);
+	pr19262_mgrowth_probe_t before, failed, after, snapshot;
+	VERIFY0(pr19262_mgrowth_report(spa, B_FALSE, "before", &before));
+	VERIFY3U(before.phase, ==, 0);
+	VERIFY3S(pr19262_mgrowth_report(spa, B_TRUE, "returned-error",
+	    &failed), ==, EIO);
+	VERIFY3U(failed.phase, ==, 7);
+	VERIFY3U(failed.pages, >, 0);
+	VERIFY(failed.uuid[0] != 0 || failed.uuid[1] != 0);
+	VERIFY0(memcmp(before.directory, failed.directory,
+	    sizeof (before.directory)));
+	VERIFY(memcmp(failed.candidate, failed.directory,
+	    sizeof (failed.candidate)) != 0);
+	VERIFY3U(failed.capacity, >, before.capacity);
+	VERIFY3U(failed.directory_bytes, >, before.directory_bytes);
+	VERIFY0(pr19262_mgrowth_report(spa, B_TRUE, "same-spa-retry", &after));
+	VERIFY3U(after.phase, ==, 0);
+	VERIFY3U(failed.p, ==, after.p);
+	VERIFY3U(failed.pages, ==, after.pages);
+	VERIFY0(memcmp(failed.uuid, after.uuid, sizeof (failed.uuid)));
+	VERIFY0(memcmp(failed.candidate, after.directory,
+	    sizeof (failed.candidate)));
+	VERIFY3U(failed.capacity, ==, after.capacity);
+	VERIFY3U(failed.directory_bytes, ==, after.directory_bytes);
+	VERIFY0(memcmp(failed.directory_hash, after.directory_hash,
+	    sizeof (failed.directory_hash)));
+	VERIFY0(memcmp(failed.bitmap_hash, after.bitmap_hash,
+	    sizeof (failed.bitmap_hash)));
+	VERIFY0(pr19262_mgrowth_report(spa, B_FALSE, "retry-snapshot",
+	    &snapshot));
+	VERIFY0(memcmp(&after, &snapshot, sizeof (after)));
+	(void) printf("PR19262_M_ACTIVE_RETRY PASS error=%d "
+	    "same_spa=1 same_candidate=1 union_preserved=1 bitmap_preserved=1 "
+	    "uuid=%llu,%llu p=%llu pages=%llu\n", EIO,
+	    (u_longlong_t)failed.uuid[0], (u_longlong_t)failed.uuid[1],
+	    (u_longlong_t)failed.p, (u_longlong_t)failed.pages);
+	(void) fflush(NULL);
+	_exit(0);
+}
+
 static int
 pr19262_journal_cold(const char *directory)
 {
 	boolean_t intent = getenv("PR19262_JOURNAL_INTENT_ALLOC") != NULL ||
+	    getenv("PR19262_ENGINE_GROW_BLOCKS") != NULL ||
 	    getenv("PR19262_JOURNAL_INTENT_CHECK") != NULL;
 	boolean_t write = getenv("PR19262_JOURNAL_REPLAY") != NULL ||
+	    getenv("PR19262_ENGINE_STORE_LOCK_WITNESS") != NULL ||
+	    getenv("PR19262_ENGINE_M_ACTIVE_RETRY") != NULL ||
+	    getenv("PR19262_ENGINE_M_ACTIVE_RESUME") != NULL ||
+	    getenv("PR19262_ENGINE_UNALLOC_ZIO_WITNESS") != NULL ||
 	    getenv("PR19262_JOURNAL_INTENT_ALLOC") != NULL ||
+	    getenv("PR19262_ENGINE_GROW_BLOCKS") != NULL ||
 	    getenv("PR19262_JOURNAL_INTENT_REPAIR") != NULL;
 	char *cache;
 	VERIFY3S(asprintf(&cache, "%s/private-cache", directory), >, 0);
@@ -12891,6 +13473,24 @@ pr19262_journal_cold(const char *directory)
 	spa_t *spa;
 	VERIFY0(spa_open(pool, &spa, FTAG));
 	VERIFY(pr19262_engine_persistent(spa));
+	if (getenv("PR19262_ENGINE_STORE_LOCK_READBACK") != NULL)
+		return (pr19262_store_lock_readback(spa));
+	if (getenv("PR19262_ENGINE_UNALLOC_ZIO_WITNESS") != NULL)
+		pr19262_unalloc_zio_witness(spa);
+	if (getenv("PR19262_ENGINE_M_ACTIVE_RETRY") != NULL)
+		pr19262_mgrowth_retry_witness(spa);
+	if (getenv("PR19262_ENGINE_M_ACTIVE_SNAPSHOT") != NULL ||
+	    getenv("PR19262_ENGINE_M_ACTIVE_RESUME") != NULL) {
+		pr19262_mgrowth_probe_t snapshot;
+		int result = pr19262_mgrowth_report(spa, B_FALSE,
+		    write ? "cold-resume" : "cold-snapshot", &snapshot);
+		if (result == 0 && write)
+			VERIFY3U(snapshot.phase, ==, 0);
+		(void) fflush(NULL);
+		_exit(result != 0);
+	}
+	if (getenv("PR19262_ENGINE_STORE_LOCK_WITNESS") != NULL)
+		pr19262_store_lock_witness(spa);
 	if (getenv("PR19262_JOURNAL_ROOT_CLOSURE") != NULL) {
 		uint64_t roots, pages;
 		error = pr19262_engine_store_inventory(spa, &roots, &pages);

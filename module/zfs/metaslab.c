@@ -36,6 +36,9 @@
 #include <sys/zap.h>
 #include <sys/btree.h>
 
+static void metaslab_unalloc_dva_impl(spa_t *, const dva_t *, uint64_t,
+    boolean_t);
+
 #define	GANG_ALLOCATION(flags) \
 	((flags) & (METASLAB_GANG_CHILD | METASLAB_GANG_HEADER))
 
@@ -4909,7 +4912,8 @@ metaslab_group_alloc_decrement(spa_t *spa, uint64_t vdev, int allocator,
 
 static uint64_t
 metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t max_size,
-    uint64_t txg, uint64_t *actual_size)
+    uint64_t txg, uint64_t *actual_size, boolean_t *engine_blocked,
+    int *alloc_error)
 {
 	uint64_t start;
 	zfs_range_tree_t *rt = msp->ms_allocatable;
@@ -4920,7 +4924,23 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t max_size,
 	VERIFY0(msp->ms_disabled);
 	VERIFY0(msp->ms_new);
 
-	start = mc->mc_ops->msop_alloc(msp, size, max_size, txg, actual_size);
+	*engine_blocked = B_FALSE;
+	*alloc_error = 0;
+#ifndef _KERNEL
+	pr19262_engine_alloc_result_t result = pr19262_engine_alloc(
+	    msp->ms_group->mg_vd->vdev_spa, msp->ms_group->mg_vd, rt,
+	    msp->ms_start, size, max_size, txg, &start, actual_size);
+	if (result != PR19262_ALLOC_INACTIVE && result != PR19262_ALLOC_OK) {
+		if (result == PR19262_ALLOC_NOMEM)
+			*alloc_error = ENOMEM;
+		else
+			*engine_blocked = result != PR19262_ALLOC_NATIVE_FULL;
+		*actual_size = 0;
+		start = -1ULL;
+	} else if (result == PR19262_ALLOC_INACTIVE)
+#endif
+		start = mc->mc_ops->msop_alloc(msp, size, max_size, txg,
+		    actual_size);
 	if (start != -1ULL) {
 		size = *actual_size;
 		metaslab_group_t *mg = msp->ms_group;
@@ -4967,7 +4987,7 @@ static metaslab_t *
 find_valid_metaslab(metaslab_group_t *mg, uint64_t activation_weight,
     dva_t *dva, int d, uint64_t asize, int allocator,
     boolean_t try_hard, zio_alloc_list_t *zal, metaslab_t *search,
-    boolean_t *was_active)
+    boolean_t *was_active, const uint8_t *excluded)
 {
 	avl_index_t idx;
 	avl_tree_t *t = &mg->mg_metaslab_tree;
@@ -4978,6 +4998,8 @@ find_valid_metaslab(metaslab_group_t *mg, uint64_t activation_weight,
 	uint_t tries = 0;
 	for (; msp != NULL; msp = AVL_NEXT(t, msp)) {
 		int i;
+		if (excluded != NULL && excluded[msp->ms_id] != 0)
+			continue;
 
 		if (!try_hard && tries > zfs_metaslab_find_max_tries) {
 			METASLABSTAT_BUMP(metaslabstat_too_many_tries);
@@ -5067,10 +5089,17 @@ static uint64_t
 metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
     uint64_t asize, uint64_t max_asize, uint64_t txg,
     dva_t *dva, int d, int allocator, boolean_t try_hard,
-    uint64_t *actual_asize)
+    uint64_t *actual_asize, int *alloc_error)
 {
 	metaslab_t *msp = NULL;
 	uint64_t offset = -1ULL;
+	uint8_t *excluded = NULL;
+	boolean_t engine_blocked_group = B_FALSE;
+	*alloc_error = 0;
+#ifndef _KERNEL
+	if (pr19262_engine_active(mg->mg_vd->vdev_spa))
+		excluded = kmem_zalloc(mg->mg_vd->vdev_ms_count, KM_SLEEP);
+#endif
 
 	uint64_t activation_weight = METASLAB_WEIGHT_PRIMARY;
 	for (int i = 0; i < d; i++) {
@@ -5111,7 +5140,8 @@ metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
 		mutex_enter(&mg->mg_lock);
 
 		if (activation_weight == METASLAB_WEIGHT_PRIMARY &&
-		    mga->mga_primary != NULL) {
+		    mga->mga_primary != NULL && (excluded == NULL ||
+		    excluded[mga->mga_primary->ms_id] == 0)) {
 			msp = mga->mga_primary;
 
 			/*
@@ -5127,7 +5157,8 @@ metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
 			was_active = B_TRUE;
 			ASSERT(msp->ms_weight & METASLAB_ACTIVE_MASK);
 		} else if (activation_weight == METASLAB_WEIGHT_SECONDARY &&
-		    mga->mga_secondary != NULL) {
+		    mga->mga_secondary != NULL && (excluded == NULL ||
+		    excluded[mga->mga_secondary->ms_id] == 0)) {
 			msp = mga->mga_secondary;
 
 			/*
@@ -5143,7 +5174,7 @@ metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
 		} else {
 			msp = find_valid_metaslab(mg, activation_weight, dva, d,
 			    asize, allocator, try_hard, zal, search,
-			    &was_active);
+			    &was_active, excluded);
 		}
 
 		mutex_exit(&mg->mg_lock);
@@ -5282,8 +5313,28 @@ metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
 			continue;
 		}
 
+		boolean_t engine_blocked;
 		offset = metaslab_block_alloc(msp, asize, max_asize, txg,
-		    actual_asize);
+		    actual_asize, &engine_blocked, alloc_error);
+		if (*alloc_error != 0) {
+			/* Preserve ENOMEM through class/gang policy. */
+			mutex_exit(&msp->ms_lock);
+			break;
+		}
+		if (engine_blocked) {
+			/*
+			 * Native space and weights remain authoritative. A V
+			 * quarantine or P shortage is local to this attempt;
+			 * Try each other MS once; retain native weights.
+			 */
+			VERIFY3P(excluded, !=, NULL);
+			excluded[msp->ms_id] = 1;
+			engine_blocked_group = B_TRUE;
+			metaslab_trace_add(zal, mg, msp, asize, d, offset,
+			    allocator);
+			mutex_exit(&msp->ms_lock);
+			continue;
+		}
 
 		if (offset != -1ULL) {
 			metaslab_trace_add(zal, mg, msp, *actual_asize, d,
@@ -5347,11 +5398,14 @@ next:
 		mutex_exit(&msp->ms_lock);
 	}
 	kmem_free(search, sizeof (*search));
+	if (excluded != NULL)
+		kmem_free(excluded, mg->mg_vd->vdev_ms_count);
 
 	if (offset == -1ULL) {
 		metaslab_trace_add(zal, mg, NULL, asize, d,
 		    TRACE_GROUP_FAILURE, allocator);
-		if (asize <= vdev_get_min_alloc(mg->mg_vd)) {
+		if (*alloc_error == 0 && !engine_blocked_group &&
+		    asize <= vdev_get_min_alloc(mg->mg_vd)) {
 			/*
 			 * This metaslab group was unable to allocate
 			 * the minimum block size so it must be out of
@@ -5504,8 +5558,12 @@ top:
 		uint64_t max_asize = vdev_psize_to_asize_txg(vd, max_psize,
 		    txg);
 		ASSERT0(P2PHASE(max_asize, 1ULL << vd->vdev_ashift));
+		int alloc_error;
 		uint64_t offset = metaslab_group_alloc(mg, zal, asize,
-		    max_asize, txg, dva, d, allocator, try_hard, &asize);
+		    max_asize, txg, dva, d, allocator, try_hard, &asize,
+		    &alloc_error);
+		if (alloc_error != 0)
+			return (SET_ERROR(alloc_error));
 
 		if (offset != -1ULL) {
 			/*
@@ -5530,13 +5588,7 @@ top:
 			    ((flags & METASLAB_GANG_HEADER) ? 1 : 0));
 			DVA_SET_ASIZE(&dva[d], asize);
 #ifndef _KERNEL
-			int pair_error = pr19262_engine_pair(spa, vd, offset,
-			    asize, txg);
-			if (pair_error != 0) {
-				metaslab_unalloc_dva(spa, &dva[d], txg);
-				memset(&dva[d], 0, sizeof (dva_t));
-				return (pair_error);
-			}
+			/* V/P was reserved before native bookkeeping. */
 			pr19262_tx_allocated(spa, mc, vd, offset, asize, txg);
 #endif
 			return (0);
@@ -5827,9 +5879,11 @@ spa_remap_blkptr(spa_t *spa, blkptr_t *bp, spa_remap_cb_t callback, void *arg)
 /*
  * Undo the allocation of a DVA which happened in the given transaction group.
  */
-void
-metaslab_unalloc_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
+static void
+metaslab_unalloc_dva_impl(spa_t *spa, const dva_t *dva, uint64_t txg,
+    boolean_t pair_created)
 {
+	(void) pair_created;
 	metaslab_t *msp;
 	vdev_t *vd;
 	uint64_t vdev = DVA_GET_VDEV(dva);
@@ -5860,11 +5914,20 @@ metaslab_unalloc_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
 
 	msp = vd->vdev_ms[offset >> vd->vdev_ms_shift];
 
-#ifndef _KERNEL
-	if (pr19262_engine_journal_unalloc(spa, vd, offset, size))
-		return;
-#endif
 	mutex_enter(&msp->ms_lock);
+#ifndef _KERNEL
+	/*
+	 * Mark the exact allocation aborted before publishing native-free V.
+	 * Outstanding holds/leases retain its owner as a picker exclusion.
+	 */
+	if (pair_created) {
+		if (pr19262_engine_abort(spa, vd, offset, size, txg)) {
+			mutex_exit(&msp->ms_lock);
+			return;
+		}
+		pr19262_tx_unallocated(spa, vd, offset, size, txg);
+	}
+#endif
 	zfs_range_tree_remove(msp->ms_allocating[txg & TXG_MASK],
 	    offset, size);
 	msp->ms_allocating_total -= size;
@@ -5878,10 +5941,12 @@ metaslab_unalloc_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
 	VERIFY0(P2PHASE(size, 1ULL << vd->vdev_ashift));
 	zfs_range_tree_add(msp->ms_allocatable, offset, size);
 	mutex_exit(&msp->ms_lock);
-#ifndef _KERNEL
-	pr19262_tx_unallocated(spa, vd, offset, size, txg);
-	pr19262_engine_abort(spa, vd, offset, size);
-#endif
+}
+
+void
+metaslab_unalloc_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
+{
+	metaslab_unalloc_dva_impl(spa, dva, txg, B_TRUE);
 }
 
 /*
@@ -6088,7 +6153,7 @@ metaslab_claim_dva(spa_t *spa, const dva_t *dva, uint64_t birth, uint64_t txg)
 
 #ifndef _KERNEL
 	if (txg != 0 && pr19262_engine_journal_claimed(spa, vd,
-	    offset, size, txg))
+	    offset, size, birth, txg))
 		return (0);
 #endif
 	return (metaslab_claim_impl(vd, offset, size, txg));
@@ -6271,7 +6336,8 @@ metaslab_claim(spa_t *spa, const blkptr_t *bp, uint64_t txg)
 				    BP_GET_PHYSICAL_BIRTH(bp)) :
 				    DVA_GET_ASIZE(&dva[d]);
 				if (!pr19262_engine_journal_claimed(spa, vd,
-				    DVA_GET_OFFSET(&dva[d]), size, txg))
+				    DVA_GET_OFFSET(&dva[d]), size,
+				    BP_GET_PHYSICAL_BIRTH(bp), txg))
 					error = metaslab_claim_dva(spa, &dva[d],
 					    BP_GET_PHYSICAL_BIRTH(bp), 0);
 			}

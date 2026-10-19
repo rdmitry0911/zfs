@@ -746,13 +746,50 @@ engine_journal_repair(spa_t *spa)
 	return (error);
 }
 
+static void (*engine_journal_observer)(spa_t *, const blkptr_t *, int);
+
+void
+pr19262_engine_journal_test_hook(void (*hook)(spa_t *, const blkptr_t *, int))
+{
+	/* Install/remove this private test hook only with all callers idle. */
+	engine_journal_observer = hook;
+}
+
+static void
+engine_journal_test_event(spa_t *spa, const blkptr_t *bp, int phase)
+{
+	if (engine_journal_observer != NULL)
+		engine_journal_observer(spa, bp, phase);
+}
+
+/* A held identity survives lookup replacement until this decision completes. */
+static int
+engine_journal_admit_locked(spa_t *spa, engine_hold_t *h)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	if (h == NULL || engine.spa != spa || !engine.persistent)
+		return (ENOENT);
+	if (h->error != 0)
+		return (h->error);
+	for (uint_t i = 0; i < h->count; i++) {
+		engine_owner_t *e = h->owner[i];
+		if (e->aborted || engine_find(e->v) != e)
+			return (ESTALE);
+	}
+	for (uint_t i = 0; i < h->count; i++)
+		h->owner[i]->journal_touched = B_TRUE;
+	return (0);
+}
+
 static int
 engine_journal_bind_impl(spa_t *spa, engine_hold_t *h,
     engine_version_t *staging)
 {
-	if (h == NULL)
-		return (0);
-	int error = h->error;
+	mutex_enter(&engine.lock);
+	int error = engine_journal_admit_locked(spa, h);
+	mutex_exit(&engine.lock);
+	if (error != 0)
+		return (error);
 	mutex_enter(&engine.journal_lock);
 	if (error == 0 && engine.journal_repair) {
 		error = engine_journal_repair(spa);
@@ -768,6 +805,11 @@ engine_journal_bind_impl(spa_t *spa, engine_hold_t *h,
 			mutex_exit(&engine.lock);
 			mutex_enter(&engine.journal_lock);
 			mutex_enter(&engine.lock);
+		}
+		if (e->aborted || engine_find(e->v) != e) {
+			error = ESTALE;
+			mutex_exit(&engine.lock);
+			break;
 		}
 		engine_version_t *b = staging != NULL ? staging : e->current;
 		ASSERT(staging == NULL || (h->count == 1 && e->copying));
@@ -873,6 +915,7 @@ pr19262_engine_journal_bind(spa_t *spa, const blkptr_t *bp)
 	if (!pr19262_engine_persistent(spa))
 		return (0);
 	engine_hold_t *h = pr19262_engine_hold(spa, bp, NULL, B_FALSE, B_FALSE);
+	engine_journal_test_event(spa, bp, 2);
 	int error = engine_journal_bind_hold(spa, h);
 	pr19262_engine_rele(h);
 	return (error);
@@ -907,11 +950,15 @@ engine_journal_collect(spa_t *spa, const blkptr_t *bp, void *arg)
 		return (error);
 	}
 	mutex_enter(&engine.lock);
-	h->write = B_TRUE;
-	for (uint_t i = 0; i < h->count; i++) {
-		h->owner[i]->queued_writers++;
-		h->owner[i]->journal_touched = B_TRUE;
+	int error = engine_journal_admit_locked(spa, h);
+	if (error != 0) {
+		mutex_exit(&engine.lock);
+		pr19262_engine_rele(h);
+		return (error);
 	}
+	h->write = B_TRUE;
+	for (uint_t i = 0; i < h->count; i++)
+		h->owner[i]->queued_writers++;
 	mutex_exit(&engine.lock);
 	engine_j_dep_t *dep = kmem_alloc(sizeof (*dep), KM_SLEEP);
 	dep->hold = h;
@@ -924,8 +971,8 @@ static void
 engine_journal_worker(void *arg)
 {
 	engine_j_job_t *job = arg;
-	int error = 0;
-	if (BP_IS_GANG(&job->bp))
+	int error = job->hold == NULL ? ENOENT : job->hold->error;
+	if (error == 0 && BP_IS_GANG(&job->bp))
 		error = pr19262_zio_walk_gang(job->spa, &job->bp, job->hold,
 		    engine_journal_collect, job);
 	if (error == 0)
@@ -958,37 +1005,15 @@ pr19262_engine_journal_gate(zio_t *parent, spa_t *spa, const blkptr_t *bp)
 	job->spa = spa;
 	job->bp = *bp;
 	job->hold = pr19262_engine_hold(spa, bp, NULL, B_FALSE, B_FALSE);
+	engine_journal_test_event(spa, bp, 1);
 	mutex_enter(&engine.lock);
-	if (job->hold != NULL)
-		for (uint_t i = 0; i < job->hold->count; i++)
-			job->hold->owner[i]->journal_touched = B_TRUE;
+	int error = engine_journal_admit_locked(spa, job->hold);
+	if (job->hold != NULL && error != 0)
+		job->hold->error = error;
 	mutex_exit(&engine.lock);
 	job->gate = zio_null(parent, spa, NULL, NULL, NULL, ZIO_FLAG_CANFAIL);
 	VERIFY3U(taskq_dispatch(system_taskq, engine_journal_worker, job,
 	    TQ_SLEEP), !=, TASKQID_INVALID);
-}
-
-boolean_t
-pr19262_engine_journal_unalloc(spa_t *spa, vdev_t *vd, uint64_t v,
-    uint64_t size)
-{
-	boolean_t held = B_FALSE;
-	mutex_enter(&engine.lock);
-	if (engine.spa == spa && engine.persistent && vd == engine.vd) {
-		engine_owner_t *e = engine_find(v);
-		if (e != NULL && e->journal_touched) {
-			VERIFY3U(e->size, ==, size);
-			if (!e->retired) {
-				e->retired = B_TRUE;
-				e->retired_at = ++engine.sequence;
-				engine.retired += e->current->size;
-				engine.revision++;
-			}
-			held = B_TRUE;
-		}
-	}
-	mutex_exit(&engine.lock);
-	return (held);
 }
 
 int
@@ -999,6 +1024,10 @@ pr19262_engine_journal_claim(spa_t *spa, uint64_t txg)
 	int error = 0;
 	mutex_enter(&engine.lock);
 	uint64_t capacity = avl_numnodes(&engine.owners), count = 0;
+	if (capacity > SIZE_MAX / sizeof (engine_owner_t *)) {
+		mutex_exit(&engine.lock);
+		return (EOVERFLOW);
+	}
 	engine_owner_t **pending = kmem_alloc(capacity * sizeof (*pending),
 	    KM_SLEEP);
 	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
@@ -1009,6 +1038,11 @@ pr19262_engine_journal_claim(spa_t *spa, uint64_t txg)
 		pending[count++] = e;
 	}
 	mutex_exit(&engine.lock);
+	boolean_t trace = getenv("PR19262_J_CLAIM_TRACE") != NULL;
+	if (trace)
+		(void) printf("PR19262_J_CLAIM_BEGIN owners=%llu txg=%llu "
+		    "sync_on=%d\n", (u_longlong_t)count, (u_longlong_t)txg,
+		    spa->spa_sync_on);
 	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
 	/* Validate every reservation before mutating the native V allocator. */
 	for (uint64_t i = 0; i < count && error == 0; i++)
@@ -1019,6 +1053,12 @@ pr19262_engine_journal_claim(spa_t *spa, uint64_t txg)
 		error = metaslab_claim_impl(engine.vd, e->v, e->size, txg);
 		if (error != 0)
 			break;
+		/* A successful claim must change the real native free tree. */
+		if (metaslab_claim_impl(engine.vd,
+		    e->v, e->size, 0) != ENOENT) {
+			error = EIO;
+			break;
+		}
 		mutex_enter(&engine.lock);
 		e->journal_pending = B_FALSE;
 		e->claimed_txg = e->catalog_txg = txg;
@@ -1026,29 +1066,64 @@ pr19262_engine_journal_claim(spa_t *spa, uint64_t txg)
 		mutex_exit(&engine.lock);
 		spa->spa_claim_max_txg = MAX(spa->spa_claim_max_txg,
 		    e->allocation_txg);
+		if (trace)
+			(void) printf("PR19262_J_CLAIM_NATIVE v=%llu size=%llu "
+			    "txg=%llu native_free=0\n", (u_longlong_t)e->v,
+			    (u_longlong_t)e->size, (u_longlong_t)txg);
 	}
 	spa_config_exit(spa, SCL_ALLOC, FTAG);
 	mutex_enter(&engine.lock);
+	if (error == 0) {
+		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
+		    e = AVL_NEXT(&engine.owners, e)) {
+			if (e->journal_pending) {
+				error = EBUSY;
+				break;
+			}
+		}
+	}
 	for (uint64_t i = 0; i < count; i++) {
 		VERIFY3U(pending[i]->holds, >, 0);
 		pending[i]->holds--;
 	}
 	mutex_exit(&engine.lock);
 	kmem_free(pending, capacity * sizeof (*pending));
+	if (trace)
+		(void) printf("PR19262_J_CLAIM_END owners=%llu error=%d "
+		    "sync_on=%d\n", (u_longlong_t)count, error,
+		    spa->spa_sync_on);
 	return (error);
 }
 
 boolean_t
 pr19262_engine_journal_claimed(spa_t *spa, vdev_t *vd, uint64_t v,
-    uint64_t size, uint64_t txg)
+    uint64_t size, uint64_t birth, uint64_t txg)
 {
 	boolean_t known = B_FALSE;
 	mutex_enter(&engine.lock);
 	if (engine.spa == spa && engine.persistent && vd == engine.vd) {
 		engine_owner_t *e = engine_find(v);
-		known = e != NULL && e->size == size && e->journal_touched &&
-		    !e->journal_pending && (e->claimed_txg == txg ||
-		    e->catalog_txg <= spa_last_synced_txg(spa));
+		boolean_t identity = e != NULL && birth != 0 &&
+		    e->allocation_txg == birth;
+		/* A legacy V retains its original allocation birth. */
+		if (e != NULL && e->allocation_txg == 0 && birth != 0) {
+			for (engine_version_t *b = e->versions; b != NULL;
+			    b = b->next) {
+				if (b->p == e->v && b->size == e->size &&
+				    b->birth == birth) {
+					identity = B_TRUE;
+					break;
+				}
+			}
+		}
+		/*
+		 * The native not-free check below proves the V is still
+		 * allocated.  The catalog only has to know this identity by
+		 * the claim txg: restored, J-claimed, or still open.
+		 */
+		known = identity && e->size == size && !e->aborted &&
+		    e->journal_touched && !e->journal_pending &&
+		    e->catalog_txg <= txg;
 	}
 	mutex_exit(&engine.lock);
 	return (known && metaslab_claim_impl(vd, v, size, 0) == ENOENT);

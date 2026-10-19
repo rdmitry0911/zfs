@@ -88,6 +88,7 @@ typedef struct engine_j_segment {
 } engine_j_segment_t;
 
 static int engine_journal_bind_copy(engine_copy_t *);
+static void engine_journal_test_event(spa_t *, const blkptr_t *, int);
 
 static struct {
 	kmutex_t lock;
@@ -102,6 +103,7 @@ static struct {
 	uint64_t total;
 	uint64_t next_incarnation;
 	uint64_t pairs;
+	uint64_t alloc_fail_after;
 	uint64_t retired;
 	uint64_t aborts;
 	uint64_t translated;
@@ -121,6 +123,7 @@ static struct {
 	uint64_t arena_bytes;
 	uint8_t *bitmap;
 	uint64_t store_codec;
+	zfs_range_tree_t *store_extents;
 	uint64_t revision;
 	uint64_t stored_revision;
 	uint64_t journal_arena;
@@ -248,6 +251,14 @@ pr19262_engine_block_new(boolean_t block)
 	mutex_exit(&engine.lock);
 }
 
+void
+pr19262_engine_alloc_fail_after(uint64_t attempts)
+{
+	mutex_enter(&engine.lock);
+	engine.alloc_fail_after = attempts;
+	mutex_exit(&engine.lock);
+}
+
 uint64_t
 pr19262_engine_limit(spa_t *spa, boolean_t netfree)
 {
@@ -276,6 +287,21 @@ engine_find(uint64_t v)
 {
 	engine_owner_t key = { .v = v };
 	return (avl_find(&engine.owners, &key, NULL));
+}
+
+static engine_owner_t *
+engine_overlap(uint64_t v, uint64_t size)
+{
+	engine_owner_t key = { .v = v };
+	avl_index_t where;
+	engine_owner_t *e = avl_find(&engine.owners, &key, &where);
+	if (e != NULL)
+		return (e);
+	e = avl_nearest(&engine.owners, where, AVL_BEFORE);
+	if (e != NULL && v - e->v < e->size)
+		return (e);
+	e = avl_nearest(&engine.owners, where, AVL_AFTER);
+	return (e != NULL && e->v - v < size ? e : NULL);
 }
 
 void
@@ -367,6 +393,168 @@ engine_pick_p(void *arg, uint64_t start, uint64_t size)
 		p->found = high - p->size;
 }
 
+typedef struct engine_alloc_pick {
+	uint64_t low;
+	uint64_t high;
+	uint64_t min;
+	uint64_t max;
+	uint64_t mult;
+	uint64_t align;
+	uint64_t found;
+	uint64_t size;
+	uint64_t native_max;
+} engine_alloc_pick_t;
+
+static uint64_t
+engine_alloc_size(engine_alloc_pick_t *pick, uint64_t low, uint64_t high)
+{
+	if (high <= low)
+		return (0);
+	return (rounddown(MIN(high - low, pick->max), pick->mult));
+}
+
+static void
+engine_alloc_p(void *arg, uint64_t start, uint64_t size)
+{
+	engine_alloc_pick_t *pick = arg;
+	uint64_t low = MAX(start, pick->low);
+	uint64_t high = MIN(start + size, pick->high);
+	uint64_t span = engine_alloc_size(pick, low, high);
+	if (span >= pick->min && span > pick->size) {
+		pick->size = span;
+		pick->found = high - span;
+	}
+}
+
+static boolean_t
+engine_alloc_gap(engine_alloc_pick_t *pick, uint64_t low, uint64_t high)
+{
+	low = P2ROUNDUP(low, pick->align);
+	uint64_t span = engine_alloc_size(pick, low, high);
+	if (span < pick->min)
+		return (B_FALSE);
+	pick->found = low;
+	pick->size = span;
+	return (B_TRUE);
+}
+
+static void
+engine_alloc_v(void *arg, uint64_t start, uint64_t size)
+{
+	engine_alloc_pick_t *pick = arg;
+	if (pick->found != UINT64_MAX)
+		return;
+	uint64_t low = P2ROUNDUP(start, pick->align);
+	uint64_t high = start + size;
+	pick->native_max = MAX(pick->native_max,
+	    engine_alloc_size(pick, low, high));
+	engine_owner_t key = { .v = low };
+	avl_index_t where;
+	engine_owner_t *e = avl_find(&engine.owners, &key, &where);
+	if (e == NULL) {
+		e = avl_nearest(&engine.owners, where, AVL_BEFORE);
+		if (e == NULL || low - e->v >= e->size)
+			e = avl_nearest(&engine.owners, where, AVL_AFTER);
+	}
+	while (e != NULL && e->v < high) {
+		if (e->v > low && engine_alloc_gap(pick, low, e->v))
+			return;
+		low = MAX(low, e->v + e->size);
+		if (low >= high)
+			return;
+		e = AVL_NEXT(&engine.owners, e);
+	}
+	(void) engine_alloc_gap(pick, low, high);
+}
+
+/*
+ * The owner AVL is also the V exclusion index, including aborted owners
+ * awaiting their last hold or physical lease. The candidate and its P pair
+ * are committed under the same engine lock, before native V is removed.
+ */
+pr19262_engine_alloc_result_t
+pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
+    uint64_t ms_start, uint64_t size, uint64_t max_size, uint64_t txg,
+    uint64_t *offset, uint64_t *actual_size)
+{
+	pr19262_engine_alloc_result_t result = PR19262_ALLOC_INACTIVE;
+	engine_owner_t *e = NULL;
+	engine_version_t *b = NULL;
+	mutex_enter(&engine.lock);
+	if (engine.spa != spa || spa == NULL)
+		goto out;
+	VERIFY3P(vd, ==, engine.vd);
+	engine_alloc_pick_t p = {
+		.low = ms_start,
+		.high = ms_start + (1ULL << vd->vdev_ms_shift),
+		.min = size,
+		.max = max_size,
+		.mult = vdev_alloc_factor(vd, txg),
+		.align = 1ULL << vd->vdev_ashift,
+		.found = UINT64_MAX
+	};
+	zfs_range_tree_walk(engine.free, engine_alloc_p, &p);
+	if (p.found == UINT64_MAX) {
+		result = PR19262_ALLOC_P_BLOCKED;
+		goto out;
+	}
+	engine_alloc_pick_t v = p;
+	v.max = p.size;
+	v.size = 0;
+	v.found = UINT64_MAX;
+	zfs_range_tree_walk(native, engine_alloc_v, &v);
+	if (v.found == UINT64_MAX) {
+		result = v.native_max < size ? PR19262_ALLOC_NATIVE_FULL :
+		    PR19262_ALLOC_V_BLOCKED;
+		goto out;
+	}
+	if (engine.alloc_fail_after != 0 && --engine.alloc_fail_after == 0) {
+		(void) printf("PR19262_ALLOC_NOMEM v=%llu size=%llu p=%llu "
+		    "eligible=1\n", (u_longlong_t)v.found,
+		    (u_longlong_t)v.size,
+		    (u_longlong_t)(p.found + p.size - v.size));
+		result = PR19262_ALLOC_NOMEM;
+		goto out;
+	}
+	/* Reserve ticket memory without sleeping or issuing I/O. */
+	e = kmem_zalloc(sizeof (*e), KM_NOSLEEP);
+	b = kmem_zalloc(sizeof (*b), KM_NOSLEEP);
+	if (e == NULL || b == NULL) {
+		result = PR19262_ALLOC_NOMEM;
+		goto out;
+	}
+	VERIFY3P(engine_overlap(v.found, v.size), ==, NULL);
+	VERIFY(!zfs_range_tree_contains(engine.legacy, v.found, v.size));
+	e->v = v.found;
+	e->size = v.size;
+	e->allocation_txg = e->catalog_txg = txg;
+	e->incarnation = ++engine.next_incarnation;
+	e->created = ++engine.sequence;
+	b->owner = e;
+	b->p = p.found + p.size - v.size;
+	b->size = v.size;
+	b->birth = txg;
+	b->generation = ++engine.sequence;
+	vdev_raidz_layout_for_birth(vd, txg, &b->width, &b->parity);
+	e->current = e->versions = b;
+	zfs_range_tree_remove(engine.free, b->p, b->size);
+	avl_add(&engine.owners, e);
+	engine.pairs++;
+	engine.revision++;
+	*offset = v.found;
+	*actual_size = v.size;
+	e = NULL;
+	b = NULL;
+	result = PR19262_ALLOC_OK;
+out:
+	mutex_exit(&engine.lock);
+	if (e != NULL)
+		kmem_free(e, sizeof (*e));
+	if (b != NULL)
+		kmem_free(b, sizeof (*b));
+	return (result);
+}
+
 int
 pr19262_engine_pair(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
     uint64_t txg)
@@ -377,7 +565,15 @@ pr19262_engine_pair(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
 		goto out;
 	VERIFY3P(vd, ==, engine.vd);
 	VERIFY(!zfs_range_tree_contains(engine.legacy, v, size));
-	if (engine_find(v) != NULL) {
+	engine_owner_t *collision = engine_overlap(v, size);
+	if (collision != NULL) {
+		(void) printf("PR19262_V_PAIR_COLLISION v=%llu size=%llu "
+		    "txg=%llu owner=%llu owner_size=%llu pending=%u "
+		    "retired=%u aborted=%u\n", (u_longlong_t)v,
+		    (u_longlong_t)size, (u_longlong_t)txg,
+		    (u_longlong_t)collision->v,
+		    (u_longlong_t)collision->size, collision->journal_pending,
+		    collision->retired, collision->aborted);
 		error = ENOSPC;
 		goto out;
 	}
@@ -429,16 +625,32 @@ engine_abort_done(engine_owner_t *e)
 	kmem_free(e, sizeof (*e));
 }
 
-void
-pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size)
+boolean_t
+pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
+    uint64_t txg)
 {
+	boolean_t retained = B_FALSE;
+	boolean_t classified = B_FALSE;
 	mutex_enter(&engine.lock);
 	if (engine.spa == spa && spa != NULL) {
 		VERIFY3P(vd, ==, engine.vd);
 		engine_owner_t *e = engine_find(v);
-		/* Pair creation can fail before any P ownership was created. */
-		if (e != NULL && !e->aborted) {
+		if (e != NULL) {
 			VERIFY3U(e->size, ==, size);
+			VERIFY3U(e->allocation_txg, ==, txg);
+			VERIFY(!e->aborted);
+			classified = B_TRUE;
+			/* Admission and abort choose exactly one outcome. */
+			if (engine.persistent && e->journal_touched) {
+				if (!e->retired) {
+					e->retired = B_TRUE;
+					e->retired_at = ++engine.sequence;
+					engine.retired += e->current->size;
+					engine.revision++;
+				}
+				retained = B_TRUE;
+				goto out;
+			}
 			VERIFY(!e->retired);
 			e->aborted = B_TRUE;
 			engine.revision++;
@@ -446,7 +658,18 @@ pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size)
 			engine_abort_done(e);
 		}
 	}
+out:
 	mutex_exit(&engine.lock);
+	if (classified) {
+		/* The observer records only; caller still holds ms_lock. */
+		blkptr_t bp = { 0 };
+		DVA_SET_VDEV(&bp.blk_dva[0], vd->vdev_id);
+		DVA_SET_OFFSET(&bp.blk_dva[0], v);
+		DVA_SET_ASIZE(&bp.blk_dva[0], size);
+		BP_SET_BIRTH(&bp, txg, txg);
+		engine_journal_test_event(spa, &bp, retained ? 4 : 3);
+	}
+	return (retained);
 }
 
 boolean_t
@@ -717,17 +940,8 @@ pr19262_engine_dispatch(zio_t *zio)
 		return (ENOTSUP);
 	}
 	if (zio->io_flags & ZIO_FLAG_PHYSICAL) {
-		uint64_t low = VDEV_LABEL_START_SIZE +
-		    engine.arena / engine.vd->vdev_children;
+		uint64_t low = VDEV_LABEL_START_SIZE;
 		boolean_t metadata = engine.persistent &&
-		    zio->io_pr19262_metadata_authority == &engine &&
-		    zio->io_vd->vdev_parent == engine.vd &&
-		    zio->io_offset >= low &&
-		    zio->io_offset - low <= engine.arena_bytes &&
-		    zio->io_size <= engine.arena_bytes -
-		    (zio->io_offset - low);
-		low = VDEV_LABEL_START_SIZE;
-		metadata |= engine.persistent &&
 		    zio->io_pr19262_metadata_authority == &engine &&
 		    zio->io_vd->vdev_parent == engine.vd &&
 		    zio->io_offset >= low &&
@@ -735,10 +949,14 @@ pr19262_engine_dispatch(zio_t *zio)
 		    engine.total / engine.vd->vdev_children &&
 		    zio->io_size <= engine.total / engine.vd->vdev_children -
 		    (zio->io_offset - low) &&
-		    engine.journal_extents != NULL &&
+		    ((engine.store_extents != NULL &&
+		    zfs_range_tree_contains(engine.store_extents,
+		    (zio->io_offset - low) * engine.vd->vdev_children,
+		    zio->io_size * engine.vd->vdev_children)) ||
+		    (engine.journal_extents != NULL &&
 		    zfs_range_tree_contains(engine.journal_extents,
 		    (zio->io_offset - low) * engine.vd->vdev_children,
-		    zio->io_size * engine.vd->vdev_children);
+		    zio->io_size * engine.vd->vdev_children)));
 		/* Labels/probes are outside the data area. */
 		boolean_t unsafe = zio->io_type == ZIO_TYPE_WRITE &&
 		    zio->io_vd->vdev_ops->vdev_op_leaf &&
@@ -933,7 +1151,10 @@ pr19262_engine_inspect(spa_t *spa, const blkptr_t *bp, int d,
 	*info = (pr19262_engine_info_t) {
 	    .p = e->current->p, .vsize = e->size,
 	    .psize = e->current->size, .birth = e->current->birth,
-	    .leases = e->current->leases };
+	    .leases = e->current->leases, .incarnation = e->incarnation,
+	    .holds = e->holds, .journal_seq = e->current->journal_seq,
+	    .aborted = e->aborted, .retired = e->retired,
+	    .journal_touched = e->journal_touched };
 	for (engine_version_t *b = e->versions; b != NULL; b = b->next) {
 		info->versions++;
 		if (b != e->current)
@@ -1076,12 +1297,13 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 	}
 	VERIFY3U(owned + zfs_range_tree_space(engine.free) +
 	    zfs_range_tree_space(engine.legacy) +
-	    engine.arena_bytes * engine.vd->vdev_children +
+	    (engine.store_extents == NULL ? 0 :
+	    zfs_range_tree_space(engine.store_extents)) +
 	    (engine.journal_extents == NULL ? 0 :
 	    zfs_range_tree_space(engine.journal_extents)), ==, engine.total);
-	if (engine.arena_bytes != 0)
-		zfs_range_tree_add(seen, engine.arena,
-		    engine.arena_bytes * engine.vd->vdev_children);
+	if (engine.store_extents != NULL)
+		zfs_range_tree_walk(engine.store_extents,
+		    zfs_range_tree_add, seen);
 	if (engine.journal_extents != NULL)
 		zfs_range_tree_walk(engine.journal_extents,
 		    zfs_range_tree_add, seen);
