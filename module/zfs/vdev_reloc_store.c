@@ -227,6 +227,8 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 		    e->journal_pending)
 			continue;
 		nvlist_t *row = rows[n++] = fnvlist_alloc();
+		if (e->retired && e->retired_txg == 0)
+			e->retired_txg = ub->ub_txg;
 		uint64_t identity[] = { e->v, e->size, e->allocation_txg,
 		    e->incarnation, e->created, e->retired_at,
 		    e->retired ? 1 : (e->checkpoint_only ? 2 : 0),
@@ -241,6 +243,8 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 		engine_version_t *b = e->current;
 		for (;;) {
 			if (b == e->current || b->retired) {
+				if (b != e->current && b->retired_txg == 0)
+					b->retired_txg = ub->ub_txg;
 				uint64_t values[] = { b->p, b->size, b->birth,
 				    b->width, b->parity, b->ready, b->retired,
 				    b->generation };
@@ -297,6 +301,7 @@ engine_store_sync(spa_t *spa, uberblock_t *ub)
 		if (error == 0) {
 			mutex_enter(&engine.lock);
 			engine.stored_revision = revision;
+			memcpy(engine.stored_desc, desc, sizeof (desc));
 			mutex_exit(&engine.lock);
 			memcpy(ub->ub_pr19262, desc, sizeof (desc));
 			if (engine_store_crash_txg == ub->ub_txg) {
@@ -363,6 +368,7 @@ engine_store_sync(spa_t *spa, uberblock_t *ub)
 	if (error == 0) {
 		mutex_enter(&engine.lock);
 		engine.stored_revision = revision;
+		memcpy(engine.stored_desc, desc, sizeof (desc));
 		mutex_exit(&engine.lock);
 		memcpy(ub->ub_pr19262, desc, sizeof (desc));
 		(void) printf("PR19262_STORE_SYNC txg=%llu page=%llu "
@@ -406,6 +412,7 @@ engine_store_clear(void)
 		avl_remove(&engine.owners, e);
 		kmem_free(e, sizeof (*e));
 	}
+	engine_tombstones_clear();
 	if (engine.free != NULL) {
 		zfs_range_tree_vacate(engine.free, NULL, NULL);
 		zfs_range_tree_destroy(engine.free);
@@ -413,6 +420,10 @@ engine_store_clear(void)
 	if (engine.legacy != NULL) {
 		zfs_range_tree_vacate(engine.legacy, NULL, NULL);
 		zfs_range_tree_destroy(engine.legacy);
+	}
+	if (engine.unusable != NULL) {
+		zfs_range_tree_vacate(engine.unusable, NULL, NULL);
+		zfs_range_tree_destroy(engine.unusable);
 	}
 	if (engine.bitmap != NULL)
 		kmem_free(engine.bitmap, ENGINE_STORE_PAGES);
@@ -439,7 +450,7 @@ engine_store_clear(void)
 	}
 	engine.spa = NULL;
 	engine.vd = NULL;
-	engine.free = engine.legacy = NULL;
+	engine.free = engine.legacy = engine.unusable = NULL;
 	engine.bitmap = NULL;
 	engine.persistent = B_FALSE;
 	engine.arena = engine.arena_bytes = engine.retired = 0;
@@ -454,6 +465,11 @@ engine_store_clear(void)
 	engine.journal_ready = engine.journal_formatted = B_FALSE;
 	engine.journal_repair = B_FALSE;
 	memset(&engine.checkpoint, 0, sizeof (engine.checkpoint));
+	engine.durable_ub_txg = engine.durable_catalog_txg = 0;
+	memset(engine.stored_desc, 0, sizeof (engine.stored_desc));
+	memset(engine.durable_desc, 0, sizeof (engine.durable_desc));
+	engine.certified = 0;
+	engine.release_thread = NULL;
 }
 
 void
@@ -558,6 +574,9 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		    i >= ub->ub_pr19262[4] &&
 		    i < ub->ub_pr19262[4] + ub->ub_pr19262[5] && !bitmap[i]))
 			return (EINVAL);
+	boolean_t at_floor = engine.store_codec >= 6 &&
+	    engine_pages.floor != 0 && ub->ub_txg == engine_pages.floor;
+	uint64_t dropped = 0;
 	engine.bitmap = kmem_alloc(ENGINE_STORE_PAGES, KM_SLEEP);
 	memcpy(engine.bitmap, bitmap, ENGINE_STORE_PAGES);
 	engine.sequence = state[0];
@@ -610,6 +629,39 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		zfs_range_tree_remove(engine.free, legacy[i], legacy[i + 1]);
 		zfs_range_tree_add(engine.legacy, legacy[i], legacy[i + 1]);
 	}
+	/* Released owner identities: their journal bindings are folded. */
+	uint64_t *tombs;
+	uint_t nt;
+	if (nvlist_lookup_uint64_array(nv, "tombstones", &tombs, &nt) == 0) {
+		if (nt % 2 != 0)
+			return (EINVAL);
+		for (uint_t i = 0; i < nt; i += 2) {
+			engine_tomb_t *t = kmem_zalloc(sizeof (*t), KM_SLEEP);
+			t->v = tombs[i];
+			t->incarnation = tombs[i + 1];
+			avl_index_t where;
+			if (avl_find(&engine.tombstones, t, &where) != NULL) {
+				kmem_free(t, sizeof (*t));
+				return (EINVAL);
+			}
+			avl_insert(&engine.tombstones, t, where);
+		}
+	}
+	/* Older images list the rows past the last metaslab as legacy. */
+	engine.unusable = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	    NULL, 0, 0);
+	if (engine.vd->vdev_ms_shift == 0)
+		return (EINVAL);
+	uint64_t covered = P2ALIGN_TYPED(engine.total,
+	    1ULL << engine.vd->vdev_ms_shift, uint64_t);
+	if (covered < engine.total) {
+		zfs_range_tree_clear(engine.free, covered,
+		    engine.total - covered);
+		zfs_range_tree_clear(engine.legacy, covered,
+		    engine.total - covered);
+		zfs_range_tree_add(engine.unusable, covered,
+		    engine.total - covered);
+	}
 	for (uint_t i = 0; i < nr; i++) {
 		uint64_t *v, *p;
 		uint_t nv, np;
@@ -626,19 +678,34 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		e->catalog_txg = v[7];
 		e->retired_at = v[5]; e->retired = v[6] == 1;
 		e->checkpoint_only = v[6] == 2;
+		if (e->retired)
+			e->retired_txg = txg;
 		avl_add(&engine.owners, e);
 		for (uint_t j = 0; j < np; j += 8) {
-			if (!engine_store_extent(p[j], p[j + 1]) ||
-			    p[j + 3] <= p[j + 4] ||
+			if (p[j + 3] <= p[j + 4] ||
 			    p[j + 3] > engine.vd->vdev_children ||
 			    p[j + 4] == 0 || p[j + 4] > 3 ||
-			    p[j + 5] > 1 || p[j + 6] > 1)
+			    p[j + 5] > 1 || p[j + 6] > 1 ||
+			    (j != 0 && p[j + 6] != 1))
+				return (EINVAL);
+			/*
+			 * The floor root itself was fenced: every retired
+			 * version older than its current binding was returned
+			 * to the physical allocator and may be in use again.
+			 */
+			if (j != 0 && at_floor && p[j + 7] < p[7]) {
+				dropped++;
+				continue;
+			}
+			if (!engine_store_extent(p[j], p[j + 1]))
 				return (EINVAL);
 			engine_version_t *b = engine_version_new(e, p[j],
 			    p[j + 1], p[j + 2], B_TRUE);
 			b->width = p[j + 3]; b->parity = p[j + 4];
 			b->retired = p[j + 6];
 			b->ready = p[j + 5]; b->generation = p[j + 7];
+			if (j != 0)
+				b->retired_txg = txg;
 			if (j == 0)
 				e->current = b;
 			zfs_range_tree_remove(engine.free, b->p, b->size);
@@ -646,6 +713,11 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 				engine.retired += b->size;
 		}
 	}
+	if (dropped != 0)
+		(void) printf("PR19262_FLOOR_DROP root=%llu catalog=%llu "
+		    "floor=%llu versions=%llu\n", (u_longlong_t)ub->ub_txg,
+		    (u_longlong_t)txg, (u_longlong_t)engine_pages.floor,
+		    (u_longlong_t)dropped);
 	return (engine_store_validate_virtual());
 }
 
@@ -662,6 +734,9 @@ engine_root_add(void *arg, const uberblock_t *ub)
 {
 	engine_root_graph_t *g = arg;
 	const uint64_t *d = ub->ub_pr19262;
+	/* Roots below the durable floor are not importable: skip them. */
+	if (pr19262_engine_store_ub(ub) && ub->ub_txg < engine_pages.floor)
+		return (0);
 	if (!pr19262_engine_store_ub(ub) || !engine_store_layout(d) ||
 	    d[1] != engine.vd->vdev_guid || d[2] != engine.arena ||
 	    d[3] != engine.arena_bytes || d[12] != 12 ||
@@ -879,6 +954,17 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	if (abd != NULL)
 		abd_free(abd);
 	mutex_enter(&engine.lock);
+	/* Roots below the durable floor may reference reused backing. */
+	if (error == 0 && d[15] >= 6 && ub->ub_txg < engine_pages.floor) {
+		(void) printf("PR19262_FLOOR_REFUSED ub=%llu floor=%llu\n",
+		    (u_longlong_t)ub->ub_txg,
+		    (u_longlong_t)engine_pages.floor);
+		error = SET_ERROR(ESTALE);
+	}
+	/* The label certificate is published after the control record. */
+	if (error == 0 && d[15] >= 6 &&
+	    pr19262_vdev_certified_parity(vd) > engine_pages.certified)
+		error = SET_ERROR(EINVAL);
 	if (error == 0)
 		error = engine_store_decode(spa, ub, nv);
 	if (error == 0 && d[15] >= 6)
@@ -888,6 +974,11 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 		engine.persistent = B_TRUE;
 		engine.spa = spa;
 		engine.stored_revision = engine.revision;
+		engine.durable_ub_txg = ub->ub_txg;
+		engine.durable_catalog_txg = d[6];
+		memcpy(engine.stored_desc, d, sizeof (engine.stored_desc));
+		memcpy(engine.durable_desc, d, sizeof (engine.durable_desc));
+		engine.certified = engine_pages.certified;
 		/* Open native space maps even for a read-only SPA. */
 		spa->spa_read_spacemaps = B_TRUE;
 		(void) printf("PR19262_STORE_LOAD pre-MOS txg=%llu "

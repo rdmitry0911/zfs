@@ -41,6 +41,8 @@ typedef struct pr19262_mgrowth_probe {
 	uint64_t bitmap_canonical[4];
 	uint64_t bitmap_used;
 	uint64_t arenas;
+	uint64_t floor;
+	uint64_t certified;
 } pr19262_mgrowth_probe_t;
 int pr19262_engine_mgrowth_probe(spa_t *, boolean_t,
     pr19262_mgrowth_probe_t *);
@@ -55,7 +57,7 @@ int pr19262_zio_walk_gang(spa_t *, const blkptr_t *, void *,
 int pr19262_engine_journal_claim(spa_t *, uint64_t);
 boolean_t pr19262_engine_journal_claimed(spa_t *, vdev_t *, uint64_t,
     uint64_t, uint64_t, uint64_t);
-void pr19262_engine_journal_ub_committed(spa_t *);
+void pr19262_engine_journal_ub_committed(spa_t *, const uberblock_t *);
 void pr19262_engine_journal_fault(uint_t);
 int pr19262_engine_journal_roll(spa_t *);
 void pr19262_engine_journal_roll_fault(uint_t);
@@ -94,6 +96,7 @@ void pr19262_engine_io_rele(zio_t *);
 int pr19262_engine_copy_begin(spa_t *, const blkptr_t *, int, uint64_t,
     void **);
 int pr19262_engine_copy_run(void *, boolean_t);
+int pr19262_engine_rebind_unwritten(spa_t *, const blkptr_t *, int, uint64_t);
 zio_t *pr19262_engine_physical_io(spa_t *, blkptr_t *, vdev_t *,
     uint64_t, abd_t *, uint64_t, zio_type_t, uint64_t, void *);
 void pr19262_engine_park_next(void);
@@ -121,5 +124,61 @@ void pr19262_engine_check(spa_t *, const char *);
 zio_t *pr19262_engine_read_bound(zio_t *, spa_t *, const blkptr_t *,
     abd_t *, uint64_t, zio_done_func_t *, void *, zio_priority_t,
     zio_flag_t, const zbookmark_phys_t *, void **);
+/* Whole-vdev converter, census, durable floor and certificate. */
+typedef struct pr19262_engine_census {
+	uint64_t owners;
+	uint64_t legacy_bytes;
+	uint64_t legacy_segments;
+	/* Rows beyond the last metaslab: never allocatable in either domain. */
+	uint64_t unusable_bytes;
+	uint64_t current_versions;
+	uint64_t current_bytes;
+	uint64_t weak_current;
+	uint64_t weak_current_bytes;
+	uint64_t retired_versions;
+	uint64_t retired_bytes;
+	uint64_t weak_retired;
+	uint64_t retired_owners;
+	uint64_t free_bytes;
+	uint64_t store_bytes;
+	uint64_t journal_bytes;
+	uint64_t min_parity;
+	uint64_t floor;
+	uint64_t certified;
+	uint64_t durable_txg;
+	uint64_t journal_seq;
+	uint64_t pages_used;
+	uint64_t pages_capacity;
+} pr19262_engine_census_t;
+void pr19262_engine_census(spa_t *, uint64_t, pr19262_engine_census_t *);
+typedef struct pr19262_engine_convert_stats {
+	uint64_t passes;
+	uint64_t visited;
+	uint64_t gang_members;
+	uint64_t zil_blocks;
+	uint64_t candidates;
+	uint64_t copied;
+	/* Allocated but never written log blocks rebound without a copy. */
+	uint64_t unwritten;
+	uint64_t old_bytes;
+	uint64_t new_bytes;
+	uint64_t busy;
+	uint64_t stale;
+	uint64_t fences;
+	uint64_t reclaimed_bytes;
+	uint64_t released_owners;
+	uint64_t peak_retired_bytes;
+	uint64_t floor;
+	/* The first physical extent any fence returned to the allocator. */
+	uint64_t sample[2];
+} pr19262_engine_convert_stats_t;
+int pr19262_engine_convert(spa_t *, uint64_t, uint64_t, uint64_t,
+    pr19262_engine_convert_stats_t *);
+int pr19262_engine_fence(spa_t *, uint64_t *, uint64_t *, uint64_t *,
+    uint64_t *);
+int pr19262_engine_certify(spa_t *, uint64_t);
+uint64_t pr19262_engine_floor(spa_t *);
+/* Incarnation of an owner overlapping [V, V + size), or 0 when none. */
+uint64_t pr19262_engine_owner_incarnation(spa_t *, uint64_t, uint64_t);
 #endif
 #endif

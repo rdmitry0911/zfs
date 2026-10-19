@@ -24,6 +24,8 @@ typedef struct engine_version {
 	uint64_t writers;
 	uint64_t generation;
 	uint64_t journal_seq;
+	/* First durable catalog txg that listed this version as retired. */
+	uint64_t retired_txg;
 	boolean_t ready;
 	boolean_t retired;
 } engine_version_t;
@@ -53,8 +55,11 @@ typedef struct engine_owner {
 	uint64_t holds;
 	uint64_t created;
 	uint64_t retired_at;
+	/* First durable catalog txg that listed the owner as retired. */
+	uint64_t retired_txg;
 	boolean_t retired;
 	boolean_t aborted;
+	boolean_t releasing;
 } engine_owner_t;
 
 typedef struct engine_hold {
@@ -66,6 +71,13 @@ typedef struct engine_hold {
 	boolean_t gang;
 	boolean_t write;
 } engine_hold_t;
+
+/* A released owner identity: its journal bindings are folded. */
+typedef struct engine_tomb {
+	avl_node_t avl;
+	uint64_t v;
+	uint64_t incarnation;
+} engine_tomb_t;
 
 typedef struct engine_copy {
 	engine_owner_t *owner;
@@ -98,8 +110,10 @@ static struct {
 	spa_t *spa;
 	vdev_t *vd;
 	avl_tree_t owners;
+	avl_tree_t tombstones;
 	zfs_range_tree_t *free;
 	zfs_range_tree_t *legacy;
+	zfs_range_tree_t *unusable;
 	uint64_t total;
 	uint64_t next_incarnation;
 	uint64_t pairs;
@@ -144,6 +158,15 @@ static struct {
 	boolean_t journal_repair;
 	int journal_error;
 	uberblock_t checkpoint;
+	/* Last uberblock written and flushed, and its catalog txg. */
+	uint64_t durable_ub_txg;
+	uint64_t durable_catalog_txg;
+	/* Descriptor of the last stored and of the last durable catalog. */
+	uint64_t stored_desc[16];
+	uint64_t durable_desc[16];
+	uint64_t certified;
+	/* The owner-release sync task frees native V through this thread. */
+	void *release_thread;
 } engine;
 
 static engine_version_t *
@@ -289,6 +312,33 @@ engine_find(uint64_t v)
 	return (avl_find(&engine.owners, &key, NULL));
 }
 
+static int
+engine_tomb_compare(const void *arg1, const void *arg2)
+{
+	const engine_tomb_t *a = arg1, *b = arg2;
+	if (a->v != b->v)
+		return (a->v < b->v ? -1 : 1);
+	return (a->incarnation < b->incarnation ? -1 :
+	    a->incarnation > b->incarnation ? 1 : 0);
+}
+
+static boolean_t
+engine_tombstoned(uint64_t v, uint64_t incarnation)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	engine_tomb_t key = { .v = v, .incarnation = incarnation };
+	return (avl_find(&engine.tombstones, &key, NULL) != NULL);
+}
+
+static void
+engine_tombstones_clear(void)
+{
+	void *cookie = NULL;
+	engine_tomb_t *t;
+	while ((t = avl_destroy_nodes(&engine.tombstones, &cookie)) != NULL)
+		kmem_free(t, sizeof (*t));
+}
+
 static engine_owner_t *
 engine_overlap(uint64_t v, uint64_t size)
 {
@@ -313,6 +363,8 @@ pr19262_engine_init(void)
 	cv_init(&engine.changed, NULL, CV_DEFAULT, NULL);
 	avl_create(&engine.owners, engine_compare, sizeof (engine_owner_t),
 	    offsetof(engine_owner_t, avl));
+	avl_create(&engine.tombstones, engine_tomb_compare,
+	    sizeof (engine_tomb_t), offsetof(engine_tomb_t, avl));
 }
 
 void
@@ -322,6 +374,8 @@ pr19262_engine_fini(void)
 	VERIFY3P(engine.spa, ==, NULL);
 	VERIFY(avl_is_empty(&engine.owners));
 	avl_destroy(&engine.owners);
+	engine_tombstones_clear();
+	avl_destroy(&engine.tombstones);
 	cv_destroy(&engine.changed);
 	mutex_destroy(&engine.journal_lock);
 	mutex_destroy(&engine.store_lock);
@@ -365,9 +419,21 @@ pr19262_engine_start(spa_t *spa)
 		    legacy);
 		mutex_exit(&ms->ms_lock);
 	}
+	/* Rows past the last metaslab belong to neither domain. */
+	zfs_range_tree_t *unusable = zfs_range_tree_create(NULL,
+	    ZFS_RANGE_SEG64, NULL, 0, 0);
+	VERIFY3U(vd->vdev_ms_shift, !=, 0);
+	uint64_t covered = P2ALIGN_TYPED(vd->vdev_asize,
+	    1ULL << vd->vdev_ms_shift, uint64_t);
+	if (covered < vd->vdev_asize) {
+		zfs_range_tree_clear(free, covered, vd->vdev_asize - covered);
+		zfs_range_tree_clear(legacy, covered, vd->vdev_asize - covered);
+		zfs_range_tree_add(unusable, covered, vd->vdev_asize - covered);
+	}
 	mutex_enter(&engine.lock);
 	engine.free = free;
 	engine.legacy = legacy;
+	engine.unusable = unusable;
 	engine.vd = vd;
 	engine.total = vd->vdev_asize;
 	engine.retired_limit = 64ULL << 20;
@@ -681,6 +747,9 @@ pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
 	if (engine.spa != vd->vdev_spa || engine.spa == NULL)
 		goto out;
 	VERIFY3P(vd, ==, engine.vd);
+	/* A fenced owner release performs the native free itself. */
+	if (engine.release_thread == curthread)
+		goto out;
 	engine_owner_t *e = engine_find(v);
 	if (e == NULL) {
 		VERIFY(zfs_range_tree_contains(engine.legacy, v, size));
@@ -861,6 +930,11 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 		}
 		boolean_t descendant = prior != NULL && prior->error == 0 &&
 		    prior->gang && gang_child && read;
+		/* A released and reused V must not serve an older BP. */
+		if (e->allocation_txg != 0 && !inherited &&
+		    !BP_GET_DEDUP(bp) &&
+		    BP_GET_PHYSICAL_BIRTH(bp) != e->allocation_txg)
+			h->error = ESTALE;
 		if ((e->retired && !inherited &&
 		    !(descendant && h->started < e->retired_at)) ||
 		    (e->aborted && !inherited) ||
@@ -1112,6 +1186,16 @@ pr19262_engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d,
 	    ms + (1ULL << engine.vd->vdev_ms_shift), size, UINT64_MAX };
 	zfs_range_tree_walk(engine.free, engine_pick_p, &pick);
 	if (pick.found == UINT64_MAX) {
+		/*
+		 * The V's own metaslab is full: a relocation may take backing
+		 * anywhere on the vdev rather than fail, so a metaslab packed
+		 * with weak data does not need its own headroom.
+		 */
+		pick.start = 0;
+		pick.end = engine.total;
+		zfs_range_tree_walk(engine.free, engine_pick_p, &pick);
+	}
+	if (pick.found == UINT64_MAX) {
 		mutex_exit(&engine.lock);
 		return (ENOSPC);
 	}
@@ -1177,42 +1261,9 @@ engine_copy_io(engine_copy_t *c, engine_version_t *b, abd_t *abd,
 	return (error);
 }
 
-int
-pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
+static int
+engine_copy_finish(engine_copy_t *c, int error, boolean_t ready)
 {
-	engine_copy_t *c = arg;
-	abd_t *source = abd_alloc_for_io(c->psize, B_FALSE);
-	abd_t *verify = abd_alloc_for_io(c->psize, B_FALSE);
-	int error = engine_copy_io(c, c->source, source, ZIO_TYPE_READ);
-	if (error == 0)
-		error = engine_copy_io(c, c->stage, source, ZIO_TYPE_WRITE);
-	if (error == 0 && fail_verify) {
-		/* Corrupt real staging bytes for the negative control. */
-		abd_copy(verify, source, c->psize);
-		uint64_t corrupt;
-		abd_copy_to_buf(&corrupt, verify, sizeof (corrupt));
-		corrupt ^= 1;
-		abd_copy_from_buf_off(verify, &corrupt, 0, sizeof (corrupt));
-		error = engine_copy_io(c, c->stage, verify, ZIO_TYPE_WRITE);
-	}
-	if (error == 0)
-		error = engine_copy_io(c, c->stage, verify, ZIO_TYPE_READ);
-	if (error == 0 && abd_cmp(source, verify) != 0)
-		error = ECKSUM;
-	abd_free(source);
-	abd_free(verify);
-	/* Flush data before publishing its J binding. */
-	if (error == 0 && engine.persistent) {
-		spa_t *spa = engine.spa;
-		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
-		for (uint64_t i = 0; i < engine.vd->vdev_children; i++) {
-			int e = pr19262_engine_metadata_flush(
-			    engine.vd->vdev_child[i]);
-			if (e != 0)
-				error = e;
-		}
-		spa_config_exit(spa, SCL_ZIO, FTAG);
-	}
 	mutex_enter(&engine.lock);
 	engine_owner_t *e = c->owner;
 	VERIFY(e->copying);
@@ -1222,7 +1273,7 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 		error = ESTALE;
 	boolean_t journal_attempted = error == 0 && engine.persistent;
 	if (error == 0)
-		c->stage->ready = B_TRUE;
+		c->stage->ready = ready;
 	mutex_exit(&engine.lock);
 	if (journal_attempted)
 		error = engine_journal_bind_copy(c);
@@ -1263,6 +1314,61 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 	return (error);
 }
 
+int
+pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
+{
+	engine_copy_t *c = arg;
+	abd_t *source = abd_alloc_for_io(c->psize, B_FALSE);
+	abd_t *verify = abd_alloc_for_io(c->psize, B_FALSE);
+	int error = engine_copy_io(c, c->source, source, ZIO_TYPE_READ);
+	if (error == 0)
+		error = engine_copy_io(c, c->stage, source, ZIO_TYPE_WRITE);
+	if (error == 0 && fail_verify) {
+		/* Corrupt real staging bytes for the negative control. */
+		abd_copy(verify, source, c->psize);
+		uint64_t corrupt;
+		abd_copy_to_buf(&corrupt, verify, sizeof (corrupt));
+		corrupt ^= 1;
+		abd_copy_from_buf_off(verify, &corrupt, 0, sizeof (corrupt));
+		error = engine_copy_io(c, c->stage, verify, ZIO_TYPE_WRITE);
+	}
+	if (error == 0)
+		error = engine_copy_io(c, c->stage, verify, ZIO_TYPE_READ);
+	if (error == 0 && abd_cmp(source, verify) != 0)
+		error = ECKSUM;
+	abd_free(source);
+	abd_free(verify);
+	/* Flush data before publishing its J binding. */
+	if (error == 0 && engine.persistent) {
+		spa_t *spa = engine.spa;
+		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+		for (uint64_t i = 0; i < engine.vd->vdev_children; i++) {
+			int e = pr19262_engine_metadata_flush(
+			    engine.vd->vdev_child[i]);
+			if (e != 0)
+				error = e;
+		}
+		spa_config_exit(spa, SCL_ZIO, FTAG);
+	}
+	return (engine_copy_finish(c, error, B_TRUE));
+}
+
+/*
+ * A log block allocated ahead of its write carries nothing to copy: the
+ * chain ends at it until the ZIL writes it.  Bind it to a fresh backing
+ * of the requested layout so that write lands in the stronger layout.
+ */
+int
+pr19262_engine_rebind_unwritten(spa_t *spa, const blkptr_t *bp, int d,
+    uint64_t birth)
+{
+	void *handle;
+	int error = pr19262_engine_copy_begin(spa, bp, d, birth, &handle);
+	if (error != 0)
+		return (error);
+	return (engine_copy_finish(handle, 0, B_FALSE));
+}
+
 void
 pr19262_engine_check(spa_t *spa, const char *phase)
 {
@@ -1297,6 +1403,7 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 	}
 	VERIFY3U(owned + zfs_range_tree_space(engine.free) +
 	    zfs_range_tree_space(engine.legacy) +
+	    zfs_range_tree_space(engine.unusable) +
 	    (engine.store_extents == NULL ? 0 :
 	    zfs_range_tree_space(engine.store_extents)) +
 	    (engine.journal_extents == NULL ? 0 :
@@ -1309,6 +1416,7 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 		    zfs_range_tree_add, seen);
 	zfs_range_tree_walk(engine.free, zfs_range_tree_add, seen);
 	zfs_range_tree_walk(engine.legacy, zfs_range_tree_add, seen);
+	zfs_range_tree_walk(engine.unusable, zfs_range_tree_add, seen);
 	VERIFY3U(zfs_range_tree_space(seen), ==, engine.total);
 	zfs_range_tree_vacate(seen, NULL, NULL);
 	zfs_range_tree_destroy(seen);
@@ -1358,3 +1466,4 @@ static int engine_journal_format(spa_t *);
 static int engine_journal_recover(spa_t *);
 #include "vdev_reloc_store.c"
 #include "vdev_reloc_journal.c"
+#include "vdev_reloc_convert.c"

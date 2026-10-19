@@ -75,6 +75,9 @@ typedef struct engine_mcontrol {
 	uint64_t codec;
 	engine_mref_t directory;
 	uint64_t pending[4];
+	/* Durable recovery floor and certified parity travel with it. */
+	uint64_t floor;
+	uint64_t certified;
 } engine_mcontrol_t;
 
 static struct {
@@ -84,10 +87,14 @@ static struct {
 	engine_marena_t *arenas;
 	engine_mref_t directory;
 	uint64_t pending[4];
+	uint64_t floor;
+	uint64_t certified;
 	uint64_t serial;
 	uint64_t control_serial;
 	engine_mcontrol_t control;
 	boolean_t publishing_active;
+	/* RAM bits are a subset of the disk masks until both slots refresh. */
+	boolean_t gc_relaxed;
 	zfs_range_tree_t *directory_pages;
 	engine_mref_t root;
 	uint64_t generation;
@@ -767,6 +774,8 @@ engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
 	h->low[2] = engine.vd->vdev_children;
 	h->high[0] = a->pages;
 	h->high[1] = serial;
+	h->high[2] = control->floor;
+	h->high[3] = control->certified;
 	memcpy(h->reserved, &control->directory, sizeof (control->directory));
 	memcpy(h->reserved + 6, control->pending, sizeof (control->pending));
 	memcpy(h->reserved + 10, a->uuid, sizeof (a->uuid));
@@ -834,16 +843,51 @@ engine_pages_reserve_control(spa_t *spa, uint64_t generation,
 		engine_pages.control.serial = serial;
 		engine_pages.control.codec = ENGINE_M_ALLOC_MAGIC;
 		engine_pages.control_serial = serial;
+		engine_pages.floor = control->floor;
+		engine_pages.certified = control->certified;
 	}
 	return (error);
+}
+
+static engine_mcontrol_t
+engine_pages_control_current(const engine_mref_t *directory)
+{
+	engine_mcontrol_t control = { .directory = *directory,
+	    .floor = engine_pages.floor,
+	    .certified = engine_pages.certified };
+	memcpy(control.pending, engine_pages.pending, sizeof (control.pending));
+	return (control);
 }
 
 static int
 engine_pages_reserve(spa_t *spa, uint64_t generation)
 {
-	engine_mcontrol_t control = { .directory = engine_pages.directory };
-	memcpy(control.pending, engine_pages.pending, sizeof (control.pending));
+	engine_mcontrol_t control =
+	    engine_pages_control_current(&engine_pages.directory);
 	return (engine_pages_reserve_control(spa, generation, &control));
+}
+
+/*
+ * Publish a new durable floor and certificate in both control slots of
+ * every member.  The caller holds store_lock and SCL_STATE.
+ */
+static int
+engine_pages_publish_control(spa_t *spa, uint64_t floor, uint64_t certified)
+{
+	if (engine_pages.pending[1] != 0)
+		return (EBUSY);
+	engine_mcontrol_t control =
+	    engine_pages_control_current(&engine_pages.directory);
+	control.floor = floor;
+	control.certified = certified;
+	int error = engine_pages_reserve_control(spa, engine_pages.generation,
+	    &control);
+	if (error == 0)
+		error = engine_pages_reserve_control(spa,
+		    engine_pages.generation, &control);
+	if (error == 0)
+		engine_pages.gc_relaxed = B_FALSE;
+	return (error);
 }
 
 static boolean_t
@@ -878,9 +922,12 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 					error = EIO;
 				continue;
 			}
-			if (engine_store_io_at(engine.vd->vdev_child[c], p, 0,
-			    1, abd, B_FALSE) != 0) {
-				if (strict)
+			int e = engine_store_io_at(engine.vd->vdev_child[c],
+			    p, 0, 1, abd, B_FALSE);
+			if (e != 0) {
+				/* Read-only import tolerates absent members. */
+				if (strict && (e != ENXIO ||
+				    spa_writeable(spa)))
 					error = EIO;
 				continue;
 			}
@@ -927,7 +974,8 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 			    h->generation : h->high[1];
 			if (control != NULL && serial >= control->serial) {
 				engine_mcontrol_t selected = { .serial = serial,
-				    .codec = h->magic };
+				    .codec = h->magic, .floor = h->high[2],
+				    .certified = h->high[3] };
 				memcpy(&selected.directory, h->reserved,
 				    sizeof (selected.directory));
 				memcpy(selected.pending, h->reserved + 6,
@@ -1003,7 +1051,8 @@ engine_mcontrol_payload_same(const engine_mcontrol_t *a,
 {
 	return (memcmp(&a->directory, &b->directory,
 	    sizeof (a->directory)) == 0 &&
-	    memcmp(a->pending, b->pending, sizeof (a->pending)) == 0);
+	    memcmp(a->pending, b->pending, sizeof (a->pending)) == 0 &&
+	    a->floor == b->floor && a->certified == b->certified);
 }
 
 static int
@@ -1023,7 +1072,8 @@ engine_pages_control_repair(spa_t *spa, const engine_mcontrol_t *proposed)
 		    B_TRUE);
 		mutex_enter(&engine.lock);
 		for (uint64_t i = 0; error == 0 && i < a->pages; i++)
-			if (bits[i] && !engine_pages.bits[a->first + i])
+			if (bits[i] && !engine_pages.bits[a->first + i] &&
+			    !engine_pages.gc_relaxed)
 				error = ECKSUM;
 		mutex_exit(&engine.lock);
 		kmem_free(bits, a->pages);
@@ -1051,6 +1101,120 @@ engine_mref_empty(const engine_mref_t *ref)
 	return (memcmp(ref, &empty, sizeof (empty)) == 0);
 }
 
+typedef struct engine_mmarker {
+	spa_t *spa;
+	uint8_t *marked;
+} engine_mmarker_t;
+
+/* Mark every page reachable from a blob chain or a page-tree reference. */
+static int
+engine_pages_mark_ref(engine_mmarker_t *m, const engine_mref_t *ref)
+{
+	uint64_t index;
+	if (ref->p == UINT64_MAX || engine_mref_empty(ref))
+		return (0);
+	if (!engine_mindex(ref->p, &index))
+		return (EINVAL);
+	if (m->marked[index])
+		return (0);
+	m->marked[index] = 1;
+	engine_mnode_t *n = engine_pages.cache[index];
+	boolean_t owned = B_FALSE;
+	if (n == NULL || n->dirty || !n->sealed ||
+	    memcmp(&engine_mheader(n)->hash, &ref->hash,
+	    sizeof (ref->hash)) != 0) {
+		int error = engine_mread(m->spa, ref, &n);
+		if (error != 0)
+			return (error);
+		owned = B_TRUE;
+	}
+	engine_mheader_t *h = engine_mheader(n);
+	int error = 0;
+	if (h->type == ENGINE_M_BRANCH) {
+		engine_mchild_t *children = engine_mpayload(n);
+		for (uint_t i = 0; error == 0 && i < h->count; i++)
+			error = engine_pages_mark_ref(m, &children[i].ref);
+	} else if (h->type == ENGINE_M_BLOB) {
+		engine_mref_t next;
+		memcpy(&next, h->reserved, sizeof (next));
+		error = engine_pages_mark_ref(m, &next);
+	}
+	if (owned)
+		kmem_free(n, sizeof (*n));
+	return (error);
+}
+
+static void
+engine_pages_mark_range(void *arg, uint64_t p, uint64_t size)
+{
+	engine_mmarker_t *m = arg;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine.vd->vdev_children;
+	for (uint64_t at = p; at < p + size; at += stripe) {
+		uint64_t index;
+		if (engine_mindex(at, &index))
+			m->marked[index] = 1;
+	}
+}
+
+/*
+ * Free every page that neither the last durable catalog nor the current
+ * RAM tree, the control slots or a directory node reaches.  Only valid
+ * once every root below the latest one is refused by the floor, so the
+ * caller publishes the shrunken masks together with that floor in both
+ * control slots.  The caller holds store_lock.
+ */
+static int
+engine_pages_gc(spa_t *spa, uint64_t *freed)
+{
+	ASSERT(MUTEX_HELD(&engine.store_lock));
+	*freed = 0;
+	if (engine_pages.capacity == 0 || engine_pages.pending[1] != 0)
+		return (0);
+	mutex_enter(&engine.lock);
+	boolean_t durable = engine.stored_desc[0] == ENGINE_STORE_MAGIC &&
+	    memcmp(engine.stored_desc, engine.durable_desc,
+	    sizeof (engine.stored_desc)) == 0;
+	mutex_exit(&engine.lock);
+	if (!durable)
+		return (0);
+	engine_mmarker_t m = { .spa = spa,
+	    .marked = kmem_zalloc(engine_pages.capacity, KM_SLEEP) };
+	for (engine_marena_t *a = engine_pages.arenas; a != NULL; a = a->next)
+		m.marked[a->first] = m.marked[a->first + 1] = 1;
+	if (engine_pages.directory_pages != NULL)
+		zfs_range_tree_walk(engine_pages.directory_pages,
+		    engine_pages_mark_range, &m);
+	engine_mref_t blob = { .p = engine.stored_desc[4] };
+	memcpy(&blob.hash, engine.stored_desc + 8, sizeof (blob.hash));
+	int error = engine_pages_mark_ref(&m, &blob);
+	if (error == 0)
+		error = engine_pages_mark_ref(&m, &engine_pages.root);
+	if (error == 0) {
+		mutex_enter(&engine.lock);
+		for (uint64_t i = 0; i < engine_pages.capacity; i++) {
+			if (!engine_pages.bits[i] || m.marked[i])
+				continue;
+			engine_pages.bits[i] = 0;
+			if (i < ENGINE_STORE_PAGES)
+				engine.bitmap[i] = 0;
+			if (engine_pages.cache[i] != NULL) {
+				VERIFY(!engine_pages.cache[i]->dirty);
+				kmem_free(engine_pages.cache[i],
+				    sizeof (engine_mnode_t));
+				engine_pages.cache[i] = NULL;
+			}
+			(*freed)++;
+		}
+		if (*freed != 0) {
+			engine_pages.gc_relaxed = B_TRUE;
+			engine.revision++;
+		}
+		mutex_exit(&engine.lock);
+	}
+	kmem_free(m.marked, engine_pages.capacity);
+	return (error);
+}
+
 static int
 engine_pages_manifest(spa_t *spa)
 {
@@ -1071,6 +1235,8 @@ engine_pages_manifest(spa_t *spa)
 	engine_pages.control_serial = control.serial;
 	engine_pages.serial = serial;
 	engine_pages.directory = control.directory;
+	engine_pages.floor = control.floor;
+	engine_pages.certified = control.certified;
 	memcpy(engine_pages.pending, control.pending,
 	    sizeof (engine_pages.pending));
 	engine_mref_t ref = engine_pages.directory;
@@ -1249,7 +1415,9 @@ engine_pages_finish(spa_t *spa, engine_marena_t *a, uint64_t generation)
 			return (error);
 		a->directory_flushed = B_TRUE;
 	}
-	engine_mcontrol_t active = { .directory = a->candidate };
+	engine_mcontrol_t active = { .directory = a->candidate,
+	    .floor = engine_pages.floor,
+	    .certified = engine_pages.certified };
 	engine_pages.publishing_active = B_TRUE;
 	error = engine_pages_reserve_control(spa, generation, &active);
 	engine_pages.publishing_active = B_FALSE;
@@ -1423,7 +1591,9 @@ engine_pages_pending_inspect(spa_t *spa, engine_marena_t *a)
 				}
 				engine_mcontrol_t control = {
 				    .serial = h->high[1], .codec = h->magic,
-				    .directory = published };
+				    .directory = published,
+				    .floor = h->high[2],
+				    .certified = h->high[3] };
 				memcpy(control.pending, pending,
 				    sizeof (pending));
 				if (control.serial > highest.serial) {
@@ -1534,7 +1704,9 @@ engine_pages_reconcile(spa_t *spa, boolean_t write)
 	if (a->formatted)
 		return (ECKSUM);
 	/* A lone, unformatted PREPARE cannot override a recovered owner. */
-	engine_mcontrol_t cancel = { .directory = engine_pages.directory };
+	engine_mcontrol_t cancel = { .directory = engine_pages.directory,
+	    .floor = engine_pages.floor,
+	    .certified = engine_pages.certified };
 	int error = engine_pages_reserve_control(spa, engine_pages.generation,
 	    &cancel);
 	if (error == 0)
@@ -1620,6 +1792,8 @@ engine_pages_growth_probe(spa_t *spa, boolean_t advance,
 	out->serial = engine_pages.serial;
 	out->control_serial = engine_pages.control_serial;
 	out->capacity = engine_pages.capacity;
+	out->floor = engine_pages.floor;
+	out->certified = engine_pages.certified;
 	uint64_t count = engine_pages.directory_pages == NULL ? 0 :
 	    zfs_range_tree_numsegs(engine_pages.directory_pages);
 	engine_munion_t u = { .ranges = kmem_zalloc(MAX(1, count) * 16,
@@ -1849,6 +2023,9 @@ typedef struct engine_mreader {
 	uint_t capacity;
 	uint64_t last[4];
 	boolean_t have_last;
+	uint64_t *tombs;
+	uint_t tomb_count;
+	uint_t tomb_capacity;
 } engine_mreader_t;
 
 static int
@@ -1861,8 +2038,29 @@ engine_mcollect(engine_mreader_t *r, const engine_mrow_t *row)
 		return (EINVAL);
 	memcpy(r->last, row->key, sizeof (r->last));
 	r->have_last = B_TRUE;
-	if (row->data[6] == 3)
+	if (row->data[6] == 3) {
+		/* Keep released owner identities for journal folding. */
+		if (row->key[3] != 0)
+			return (0);
+		if (r->tomb_count == r->tomb_capacity) {
+			uint_t cap = r->tomb_capacity == 0 ? 64 :
+			    r->tomb_capacity * 2;
+			uint64_t *tombs = kmem_alloc(cap * 2 *
+			    sizeof (uint64_t), KM_SLEEP);
+			if (r->tombs != NULL) {
+				memcpy(tombs, r->tombs, r->tomb_count * 2 *
+				    sizeof (uint64_t));
+				kmem_free(r->tombs, r->tomb_capacity * 2 *
+				    sizeof (uint64_t));
+			}
+			r->tombs = tombs;
+			r->tomb_capacity = cap;
+		}
+		r->tombs[2 * r->tomb_count] = row->key[1];
+		r->tombs[2 * r->tomb_count + 1] = row->key[2];
+		r->tomb_count++;
 		return (0);
+	}
 	if (r->count == r->capacity) {
 		uint64_t wanted = r->capacity == 0 ? 64 :
 		    (uint64_t)r->capacity * 2;
@@ -1977,9 +2175,13 @@ engine_mowners(engine_mreader_t *r, nvlist_t *nv)
 		kmem_free(versions, (end - at) * 8 * sizeof (uint64_t));
 		at = end;
 	}
-	if (error == 0)
+	if (error == 0) {
 		fnvlist_add_nvlist_array(nv, "owners",
 		    (const nvlist_t * const *)owners, nr);
+		if (r->tomb_count != 0)
+			fnvlist_add_uint64_array(nv, "tombstones", r->tombs,
+			    r->tomb_count * 2);
+	}
 	for (uint_t i = 0; i < nr; i++)
 		fnvlist_free(owners[i]);
 	kmem_free(owners, MAX(1, r->count) * sizeof (*owners));
@@ -1994,6 +2196,13 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 		int error = engine_pages_manifest(spa);
 		if (error != 0)
 			return (error);
+		/* Pages of roots below the floor may already be reused. */
+		if (ub->ub_txg < engine_pages.floor) {
+			(void) printf("PR19262_FLOOR_REFUSED ub=%llu "
+			    "floor=%llu\n", (u_longlong_t)ub->ub_txg,
+			    (u_longlong_t)engine_pages.floor);
+			return (SET_ERROR(ESTALE));
+		}
 	}
 	const uint64_t *d = ub->ub_pr19262;
 	engine_mreader_t *r = kmem_zalloc(sizeof (*r), KM_SLEEP);
@@ -2075,9 +2284,6 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 		    &serial);
 		if (error == 0 && latest < r->generation)
 			error = ECKSUM;
-		for (uint_t i = 0; error == 0 && i < ENGINE_STORE_PAGES; i++)
-			if (bitmap[i] && !reserved[i])
-				error = ECKSUM;
 		for (uint64_t i = 0; error == 0 &&
 		    i < engine_pages.capacity; i++)
 			if (!reserved[i] && zfs_range_tree_contains(r->seen,
@@ -2085,8 +2291,8 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 				error = ECKSUM;
 		if (error == 0) {
 			engine_pages.serial = MAX(engine_pages.serial, serial);
-			for (uint_t i = 0; i < ENGINE_STORE_PAGES; i++)
-				bitmap[i] |= reserved[i];
+			/* Control masks are the allocator; roots only read. */
+			memcpy(bitmap, reserved, ENGINE_STORE_PAGES);
 			memcpy(engine_pages.bits, reserved,
 			    engine_pages.capacity);
 			fnvlist_add_uint64(nv, "page-reservation-generation",
@@ -2113,6 +2319,8 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 	}
 	if (r->rows != NULL)
 		kmem_free(r->rows, r->capacity * sizeof (engine_mrow_t));
+	if (r->tombs != NULL)
+		kmem_free(r->tombs, r->tomb_capacity * 2 * sizeof (uint64_t));
 	zfs_range_tree_vacate(r->seen, NULL, NULL);
 	zfs_range_tree_destroy(r->seen);
 	kmem_free(r, sizeof (*r));

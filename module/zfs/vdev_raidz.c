@@ -2243,10 +2243,40 @@ vdev_raidz_min_nparity(vdev_t *vd)
 	mutex_enter(&vdrz->vd_expand_lock);
 	for (uint64_t i = 0; i < vdrz->vd_parity_epoch_count; i++)
 		min = MIN(min, vdrz->vd_parity_epochs[3 * i + 2]);
+#ifndef _KERNEL
+	/* A private certificate proves every live backing is stronger. */
+	min = MAX(min, vdrz->vd_pr19262_certified);
+#endif
 	mutex_exit(&vdrz->vd_expand_lock);
 
 	return (min);
 }
+
+#ifndef _KERNEL
+#define	PR19262_CONFIG_CERTIFIED "org.openzfs:pr19262_certified_parity"
+
+uint64_t
+pr19262_vdev_certified_parity(vdev_t *vd)
+{
+	if (vd->vdev_ops != &vdev_raidz_ops)
+		return (0);
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	mutex_enter(&vdrz->vd_expand_lock);
+	uint64_t parity = vdrz->vd_pr19262_certified;
+	mutex_exit(&vdrz->vd_expand_lock);
+	return (parity);
+}
+
+void
+pr19262_vdev_certify(vdev_t *vd, uint64_t parity)
+{
+	ASSERT3P(vd->vdev_ops, ==, &vdev_raidz_ops);
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	mutex_enter(&vdrz->vd_expand_lock);
+	vdrz->vd_pr19262_certified = parity;
+	mutex_exit(&vdrz->vd_expand_lock);
+}
+#endif
 
 static int
 vdev_raidz_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
@@ -6737,6 +6767,13 @@ vdev_raidz_init(spa_t *spa, nvlist_t *nv, void **tsd)
 		nparity = 1;
 	}
 
+#ifndef _KERNEL
+	uint64_t certified = 0;
+	if (nvlist_lookup_uint64(nv, PR19262_CONFIG_CERTIFIED,
+	    &certified) == 0 && (certified > VDEV_RAIDZ_MAXPARITY ||
+	    children < certified + 1))
+		return (SET_ERROR(EINVAL));
+#endif
 	vdev_raidz_t *vdrz = kmem_zalloc(sizeof (*vdrz), KM_SLEEP);
 	vdrz->vn_vre.vre_vdev_id = -1;
 	vdrz->vn_vre.vre_offset = UINT64_MAX;
@@ -6759,6 +6796,9 @@ vdev_raidz_init(spa_t *spa, nvlist_t *nv, void **tsd)
 
 	vdrz->vd_parity_epochs_config_present =
 	    nvlist_exists(nv, ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS);
+#ifndef _KERNEL
+	vdrz->vd_pr19262_certified = certified;
+#endif
 	uint64_t *pe_label;
 	unsigned int pe_label_size = 0;
 	if (!raidz_ignore_parity_epochs &&
@@ -6869,6 +6909,11 @@ vdev_raidz_config_generate(vdev_t *vd, nvlist_t *nv)
 		fnvlist_add_uint64_array(nv, ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS,
 		    vdrz->vd_parity_epochs, vdrz->vd_parity_epoch_count * 3);
 	}
+#ifndef _KERNEL
+	if (vdrz->vd_pr19262_certified != 0)
+		fnvlist_add_uint64(nv, PR19262_CONFIG_CERTIFIED,
+		    vdrz->vd_pr19262_certified);
+#endif
 	mutex_exit(&vdrz->vd_expand_lock);
 }
 

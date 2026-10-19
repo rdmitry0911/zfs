@@ -2392,7 +2392,7 @@ retry:
 	if (spa_multihost(spa))
 		mmp_update_uberblock(spa, ub);
 #ifndef _KERNEL
-	pr19262_engine_journal_ub_committed(spa);
+	pr19262_engine_journal_ub_committed(spa, ub);
 #endif
 
 	/*

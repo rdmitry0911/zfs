@@ -382,11 +382,18 @@ pr19262_engine_journal_roll(spa_t *spa)
 }
 
 void
-pr19262_engine_journal_ub_committed(spa_t *spa)
+pr19262_engine_journal_ub_committed(spa_t *spa, const uberblock_t *ub)
 {
 	mutex_enter(&engine.lock);
-	if (engine.spa == spa && engine.persistent)
+	if (engine.spa == spa && engine.persistent) {
 		engine.journal_ready = B_TRUE;
+		if (pr19262_engine_store_ub(ub)) {
+			engine.durable_ub_txg = ub->ub_txg;
+			engine.durable_catalog_txg = ub->ub_pr19262[6];
+			memcpy(engine.durable_desc, ub->ub_pr19262,
+			    sizeof (engine.durable_desc));
+		}
+	}
 	mutex_exit(&engine.lock);
 }
 
@@ -480,6 +487,9 @@ engine_journal_apply(uint64_t *w)
 	    w[29] == 0 || w[29] > w[15] || w[27] <= w[28] ||
 	    w[27] > engine.vd->vdev_children || w[28] == 0 || w[28] > 3)
 		return (EINVAL);
+	/* A released owner's bindings are folded into the catalog. */
+	if (engine_tombstoned(v, w[6]))
+		return (0);
 	engine_owner_t *e = engine_find(v);
 	if (e == NULL) {
 		boolean_t legacy = zfs_range_tree_contains(engine.legacy,
@@ -507,6 +517,12 @@ engine_journal_apply(uint64_t *w)
 	e->journal_touched = B_TRUE;
 	engine.next_incarnation = MAX(engine.next_incarnation, w[6]);
 	engine.sequence = MAX(engine.sequence, MAX(w[15], w[16]));
+	/*
+	 * A binding older than the catalog's current one is already folded
+	 * into M; its backing may have been fenced, reclaimed and reused.
+	 */
+	if (e->current != NULL && w[15] < e->current->generation)
+		return (0);
 	for (engine_version_t *b = e->versions; b != NULL; b = b->next) {
 		if (b->generation != w[15])
 			continue;
