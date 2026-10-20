@@ -55,6 +55,8 @@ typedef struct engine_mbatch {
 	uint64_t generation;
 	uint_t pages;
 	uint_t changes;
+	uint_t deletes;
+	uint_t tombstones;
 } engine_mbatch_t;
 
 typedef struct engine_marena {
@@ -100,6 +102,10 @@ static struct {
 	uint64_t generation;
 	engine_mrow_t *rows;
 	uint_t count;
+	/* Tree height: one leaf level plus the branch levels above it. */
+	uint64_t levels;
+	/* Highest control serial each member holds; stale ones resilver. */
+	uint64_t member_serial[256];
 } engine_pages = { .root = { .p = UINT64_MAX } };
 
 static int engine_pages_grow(engine_mbatch_t *);
@@ -599,6 +605,138 @@ engine_mput(engine_mbatch_t *b, engine_mref_t *root,
 	return (error);
 }
 
+/* A page allocated in this batch that nothing references any more. */
+static void
+engine_mrelease(engine_mbatch_t *b, engine_mnode_t *n)
+{
+	engine_mheader_t *h = engine_mheader(n);
+	if (!n->dirty || h->generation != b->generation)
+		return;
+	uint64_t index;
+	VERIFY(engine_mindex(h->p, &index));
+	VERIFY3P(engine_pages.cache[index], ==, n);
+	mutex_enter(&engine.lock);
+	engine_pages.bits[index] = 0;
+	if (index < ENGINE_STORE_PAGES)
+		engine.bitmap[index] = 0;
+	mutex_exit(&engine.lock);
+	engine_pages.cache[index] = NULL;
+	kmem_free(n, sizeof (*n));
+	VERIFY3U(b->pages, >, 0);
+	b->pages--;
+}
+
+/*
+ * Remove one row along a COW path.  A leaf or branch left empty drops out
+ * of its parent; the root may become empty.  Durable pages abandoned this
+ * way are unreachable and the fence's page collection returns them; pages
+ * of this batch are released at once.
+ */
+static int
+engine_mremove(engine_mbatch_t *b, const engine_mref_t *root,
+    const uint64_t key[4], engine_mchange_t *change)
+{
+	engine_mnode_t *old;
+	int error = engine_mget(b, root, &old);
+	if (error != 0)
+		return (error);
+	engine_mheader_t *h = engine_mheader(old);
+	change->left = *root;
+	change->right.p = UINT64_MAX;
+	change->changed = B_FALSE;
+	if (h->type == ENGINE_M_LEAF) {
+		engine_mrow_t *rows = engine_mpayload(old);
+		uint_t at = 0, count = h->count;
+		while (at < count && engine_mkey_compare(rows[at].key, key) < 0)
+			at++;
+		if (at == count || engine_mkey_compare(rows[at].key, key) != 0)
+			return (0);
+		if (count == 1) {
+			change->left.p = UINT64_MAX;
+			change->changed = B_TRUE;
+			engine_mrelease(b, old);
+			return (0);
+		}
+		engine_mrow_t *copy = kmem_alloc(count * sizeof (*copy),
+		    KM_SLEEP);
+		memcpy(copy, rows, at * sizeof (*copy));
+		memcpy(copy + at, rows + at + 1,
+		    (count - at - 1) * sizeof (*copy));
+		engine_mnode_t *left;
+		error = engine_mcow(b, old, &left);
+		if (error == 0) {
+			engine_mleaf_set(left, copy, count - 1);
+			change->left = engine_mreference(left);
+			change->changed = B_TRUE;
+		}
+		kmem_free(copy, count * sizeof (*copy));
+		return (error);
+	}
+	if (h->type != ENGINE_M_BRANCH || h->level == 0)
+		return (EINVAL);
+	engine_mchild_t *children = engine_mpayload(old);
+	uint_t at = 0, count = h->count;
+	while (at + 1 < count && engine_mkey_compare(key,
+	    children[at].high) > 0)
+		at++;
+	engine_mchange_t child;
+	error = engine_mremove(b, &children[at].ref, key, &child);
+	if (error != 0 || !child.changed)
+		return (error);
+	engine_mchild_t *copy = kmem_alloc(count * sizeof (*copy), KM_SLEEP);
+	memcpy(copy, children, count * sizeof (*copy));
+	uint_t total = count;
+	if (child.left.p == UINT64_MAX) {
+		memmove(copy + at, copy + at + 1,
+		    (count - at - 1) * sizeof (*copy));
+		total--;
+	} else {
+		engine_mnode_t *child_node;
+		error = engine_mget(b, &child.left, &child_node);
+		if (error == 0) {
+			copy[at].ref = child.left;
+			memcpy(copy[at].high, engine_mheader(child_node)->high,
+			    sizeof (copy[at].high));
+		}
+	}
+	if (error == 0 && total == 0) {
+		change->left.p = UINT64_MAX;
+		change->changed = B_TRUE;
+		engine_mrelease(b, old);
+	} else if (error == 0) {
+		engine_mnode_t *left;
+		error = engine_mcow(b, old, &left);
+		if (error == 0)
+			error = engine_mbranch_set(b, left, copy, total);
+		if (error == 0) {
+			change->left = engine_mreference(left);
+			change->changed = B_TRUE;
+		}
+	}
+	kmem_free(copy, count * sizeof (*copy));
+	return (error);
+}
+
+static int
+engine_mdel(engine_mbatch_t *b, engine_mref_t *root, const uint64_t key[4])
+{
+	if (root->p == UINT64_MAX)
+		return (0);
+	engine_mchange_t change;
+	int error = engine_mremove(b, root, key, &change);
+	if (error != 0 || !change.changed)
+		return (error);
+	if (change.left.p == UINT64_MAX) {
+		memset(root, 0, sizeof (*root));
+		root->p = UINT64_MAX;
+	} else {
+		*root = change.left;
+	}
+	b->changes++;
+	b->deletes++;
+	return (0);
+}
+
 static int
 engine_mseal(engine_mbatch_t *b, engine_mref_t *ref)
 {
@@ -784,7 +922,7 @@ engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
 	mutex_exit(&engine.lock);
 	engine_mhash(n, &h->hash);
 	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
-	int error = 0;
+	engine_quorum_t q = { 0 };
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
 		int e = EIO;
@@ -799,9 +937,10 @@ engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
 				e = pr19262_engine_metadata_flush(
 				    engine.vd->vdev_child[c]);
 		}
-		if (e != 0)
-			error = e;
-		else if (c == 0)
+		engine_quorum_add(&q, e);
+		if (e == 0 && a->p == engine.arena)
+			engine_pages.member_serial[c] = serial;
+		if (e == 0 && c == 0)
 			engine_pages_fault(1, generation, c, slot);
 		if (e == 0 && c == 0 && a->p == engine.arena &&
 		    control->pending[1] != 0)
@@ -813,7 +952,7 @@ engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
 	spa_config_exit(spa, SCL_ZIO, FTAG);
 	abd_free(abd);
 	kmem_free(n, sizeof (*n));
-	return (error);
+	return (engine_quorum_result(&q));
 }
 
 static int
@@ -906,6 +1045,13 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 	boolean_t found = B_FALSE;
 	boolean_t conflict = B_FALSE;
 	int error = 0;
+	uint_t children = engine.vd->vdev_children;
+	/* Masks by (slot, member): only the two latest serials are unioned. */
+	uint64_t *serials = kmem_zalloc(2 * children * sizeof (uint64_t),
+	    KM_SLEEP);
+	uint8_t *masks = kmem_zalloc(2 * children * a->pages, KM_SLEEP);
+	boolean_t *absent = kmem_zalloc(children * sizeof (boolean_t),
+	    KM_SLEEP);
 	for (uint_t slot = 0; slot < 2; slot++) {
 		for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
 			uint64_t p = a->p + slot * ENGINE_STORE_PAGE *
@@ -925,9 +1071,10 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 			int e = engine_store_io_at(engine.vd->vdev_child[c],
 			    p, 0, 1, abd, B_FALSE);
 			if (e != 0) {
-				/* Read-only import tolerates absent members. */
-				if (strict && (e != ENXIO ||
-				    spa_writeable(spa)))
+				/* Absent members count against the quorum. */
+				if (e == ENXIO)
+					absent[c] = B_TRUE;
+				else if (strict)
 					error = EIO;
 				continue;
 			}
@@ -968,10 +1115,14 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 				valid &= bits[i] <= 1;
 			if (!valid)
 				continue;
-			for (uint_t i = 0; i < a->pages; i++)
-				bitmap[i] |= bits[i];
 			uint64_t serial = h->high[1] == 0 ?
 			    h->generation : h->high[1];
+			memcpy(masks + (slot * children + c) * a->pages, bits,
+			    a->pages);
+			serials[slot * children + c] = MAX(serial, 1);
+			if (a->p == engine.arena)
+				engine_pages.member_serial[c] =
+				    MAX(engine_pages.member_serial[c], serial);
 			if (control != NULL && serial >= control->serial) {
 				engine_mcontrol_t selected = { .serial = serial,
 				    .codec = h->magic, .floor = h->high[2],
@@ -993,6 +1144,32 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 			found = B_TRUE;
 		}
 	}
+	/*
+	 * A member that missed publications holds older masks; only the two
+	 * latest serials (the current publication and the one before it)
+	 * describe pages that may still be in use.
+	 */
+	uint64_t top = 0;
+	for (uint_t i = 0; i < 2 * children; i++)
+		top = MAX(top, serials[i]);
+	for (uint_t i = 0; i < 2 * children; i++) {
+		if (serials[i] == 0 || serials[i] + 1 < top)
+			continue;
+		for (uint_t j = 0; j < a->pages; j++)
+			bitmap[j] |= masks[i * a->pages + j];
+	}
+	uint_t missing = 0;
+	for (uint_t c = 0; c < children; c++)
+		missing += absent[c];
+	uint_t tolerated = control != NULL ?
+	    MIN(control->certified, VDEV_RAIDZ_MAXPARITY) :
+	    engine_store_tolerated();
+	/* A writable import needs every member beyond the certified loss. */
+	if (strict && spa_writeable(spa) && missing > tolerated)
+		error = EIO;
+	kmem_free(serials, 2 * children * sizeof (uint64_t));
+	kmem_free(masks, 2 * children * a->pages);
+	kmem_free(absent, children * sizeof (boolean_t));
 	abd_free(abd);
 	kmem_free(n, sizeof (*n));
 	if (error != 0)
@@ -1104,7 +1281,56 @@ engine_mref_empty(const engine_mref_t *ref)
 typedef struct engine_mmarker {
 	spa_t *spa;
 	uint8_t *marked;
+	/* Rewrite every reached page on this member (-1: none). */
+	int target;
+	uint64_t written;
+	int write_error;
+	/* Per-member audit of every reached page, when non-NULL. */
+	uint64_t *audit_ok;
+	uint64_t *audit_missing;
 } engine_mmarker_t;
+
+/* Rewrite a reached page on the target member and audit every member. */
+static void
+engine_pages_mark_io(engine_mmarker_t *m, engine_mnode_t *n, uint64_t p,
+    const zio_cksum_t *hash)
+{
+	uint_t children = engine.vd->vdev_children;
+	if (m->target >= 0) {
+		abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
+		int e = engine_store_io_at(engine.vd->vdev_child[m->target], p,
+		    0, 1, abd, B_TRUE);
+		abd_free(abd);
+		if (e != 0)
+			m->write_error = e;
+		else
+			m->written++;
+	}
+	if (m->audit_ok == NULL)
+		return;
+	engine_mnode_t *probe = kmem_zalloc(sizeof (*probe), KM_SLEEP);
+	abd_t *pabd = abd_get_from_buf(probe->data, ENGINE_STORE_PAGE);
+	for (uint_t c = 0; c < children; c++) {
+		boolean_t ok = B_FALSE;
+		if (engine_store_io_at(engine.vd->vdev_child[c], p, 0, 1, pabd,
+		    B_FALSE) == 0) {
+			engine_mheader_t *h = engine_mheader(probe);
+			if (h->magic == ENGINE_M_MAGIC ||
+			    h->magic == BSWAP_64(ENGINE_M_MAGIC)) {
+				zio_cksum_t computed;
+				engine_mhash(probe, &computed);
+				ok = memcmp(&computed, hash,
+				    sizeof (computed)) == 0;
+			}
+		}
+		if (ok)
+			m->audit_ok[c]++;
+		else
+			m->audit_missing[c]++;
+	}
+	abd_free(pabd);
+	kmem_free(probe, sizeof (*probe));
+}
 
 /* Mark every page reachable from a blob chain or a page-tree reference. */
 static int
@@ -1130,6 +1356,7 @@ engine_pages_mark_ref(engine_mmarker_t *m, const engine_mref_t *ref)
 	}
 	engine_mheader_t *h = engine_mheader(n);
 	int error = 0;
+	engine_pages_mark_io(m, n, ref->p, &ref->hash);
 	if (h->type == ENGINE_M_BRANCH) {
 		engine_mchild_t *children = engine_mpayload(n);
 		for (uint_t i = 0; error == 0 && i < h->count; i++)
@@ -1177,7 +1404,7 @@ engine_pages_gc(spa_t *spa, uint64_t *freed)
 	mutex_exit(&engine.lock);
 	if (!durable)
 		return (0);
-	engine_mmarker_t m = { .spa = spa,
+	engine_mmarker_t m = { .spa = spa, .target = -1,
 	    .marked = kmem_zalloc(engine_pages.capacity, KM_SLEEP) };
 	for (engine_marena_t *a = engine_pages.arenas; a != NULL; a = a->next)
 		m.marked[a->first] = m.marked[a->first + 1] = 1;
@@ -1212,6 +1439,165 @@ engine_pages_gc(spa_t *spa, uint64_t *freed)
 		mutex_exit(&engine.lock);
 	}
 	kmem_free(m.marked, engine_pages.capacity);
+	return (error);
+}
+
+/*
+ * Visit every live page (the durable root blob chain, the page tree, the
+ * directory nodes) and the control slots: rewrite them on one member and
+ * audit which members hold a valid copy.  The caller holds store_lock and
+ * the stored catalog is the durable one.
+ */
+static int
+engine_pages_members(spa_t *spa, int target, uint64_t *ok,
+    uint64_t *missing, uint64_t *written)
+{
+	ASSERT(MUTEX_HELD(&engine.store_lock));
+	*written = 0;
+	mutex_enter(&engine.lock);
+	boolean_t durable = engine.stored_desc[0] == ENGINE_STORE_MAGIC &&
+	    memcmp(engine.stored_desc, engine.durable_desc,
+	    sizeof (engine.stored_desc)) == 0;
+	mutex_exit(&engine.lock);
+	if (!durable || engine_pages.capacity == 0)
+		return (EBUSY);
+	uint_t children = engine.vd->vdev_children;
+	uint64_t stripe = ENGINE_STORE_PAGE * children;
+	engine_mmarker_t m = { .spa = spa, .target = target,
+	    .audit_ok = ok, .audit_missing = missing,
+	    .marked = kmem_zalloc(engine_pages.capacity, KM_SLEEP) };
+	engine_mref_t blob = { .p = engine.stored_desc[4] };
+	memcpy(&blob.hash, engine.stored_desc + 8, sizeof (blob.hash));
+	int error = engine_pages_mark_ref(&m, &blob);
+	if (error == 0)
+		error = engine_pages_mark_ref(&m, &engine_pages.root);
+	for (engine_marena_t *a = engine_pages.arenas; error == 0 && a != NULL;
+	    a = a->next) {
+		if (a->pending)
+			continue;
+		engine_mnode_t *dir = engine_pages.cache[a->first + 2];
+		if (dir != NULL && dir->sealed && !dir->dirty &&
+		    engine_pages.directory_pages != NULL &&
+		    zfs_range_tree_contains(engine_pages.directory_pages,
+		    a->p + 2 * stripe, stripe))
+			engine_pages_mark_io(&m, dir, a->p + 2 * stripe,
+			    &engine_mheader(dir)->hash);
+		if (ok == NULL)
+			continue;
+		/* Control slots: the current serial or the one before it. */
+		engine_mnode_t *probe = kmem_zalloc(sizeof (*probe), KM_SLEEP);
+		abd_t *pabd = abd_get_from_buf(probe->data, ENGINE_STORE_PAGE);
+		for (uint_t slot = 0; slot < 2; slot++) {
+			for (uint_t c = 0; c < children; c++) {
+				boolean_t valid = B_FALSE;
+				if (engine_store_io_at(engine.vd->vdev_child[c],
+				    a->p + slot * stripe, 0, 1, pabd,
+				    B_FALSE) == 0) {
+					engine_mheader_t *h =
+					    engine_mheader(probe);
+					zio_cksum_t computed;
+					engine_mhash(probe, &computed);
+					valid = h->magic ==
+					    ENGINE_M_ALLOC_MAGIC &&
+					    memcmp(&computed, &h->hash,
+					    sizeof (computed)) == 0 &&
+					    h->high[1] + 1 >=
+					    engine_pages.control.serial;
+				}
+				if (valid)
+					ok[c]++;
+				else
+					missing[c]++;
+			}
+		}
+		abd_free(pabd);
+		kmem_free(probe, sizeof (*probe));
+	}
+	kmem_free(m.marked, engine_pages.capacity);
+	*written = m.written;
+	return (error != 0 ? error : m.write_error);
+}
+
+static void
+engine_pages_audit_print(spa_t *spa, const char *label, const uint64_t *ok,
+    const uint64_t *missing)
+{
+	(void) spa;
+	for (uint_t c = 0; c < engine.vd->vdev_children; c++)
+		(void) printf("PR19262_RAW_AUDIT label=%s child=%u present=%u "
+		    "ok=%llu missing=%llu serial=%llu current=%llu\n", label,
+		    c, vdev_readable(engine.vd->vdev_child[c]),
+		    (u_longlong_t)ok[c], (u_longlong_t)missing[c],
+		    (u_longlong_t)engine_pages.member_serial[c],
+		    (u_longlong_t)engine_pages.control.serial);
+	(void) fflush(NULL);
+}
+
+/* Rewrite every live page on one member, then refresh its control slots. */
+static int
+engine_pages_resilver(spa_t *spa, uint_t child, uint64_t *pages)
+{
+	int error = engine_pages_members(spa, child, NULL, NULL, pages);
+	if (error == 0) {
+		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+		error = pr19262_engine_metadata_flush(
+		    engine.vd->vdev_child[child]);
+		spa_config_exit(spa, SCL_ZIO, FTAG);
+	}
+	if (error == 0)
+		error = engine_pages_publish_control(spa, engine_pages.floor,
+		    engine_pages.certified);
+	if (error == 0)
+		engine_pages.member_serial[child] = engine_pages.control.serial;
+	return (error);
+}
+
+/*
+ * At a writable import, every present member that missed publications or
+ * holds no valid copy of a live page is brought up to date: the data
+ * below it is repaired by the native resilver, the raw metadata here.
+ */
+static int
+engine_pages_resilver_members(spa_t *spa)
+{
+	ASSERT(MUTEX_HELD(&engine.store_lock));
+	uint_t children = engine.vd->vdev_children;
+	uint64_t *ok = kmem_zalloc(children * sizeof (uint64_t), KM_SLEEP);
+	uint64_t *missing = kmem_zalloc(children * sizeof (uint64_t), KM_SLEEP);
+	uint64_t written;
+	int error = engine_pages_members(spa, -1, ok, missing, &written);
+	if (error == 0)
+		engine_pages_audit_print(spa, "recover", ok, missing);
+	/* Decide on the audit; a resilver republishes the serial for all. */
+	boolean_t *stale = kmem_zalloc(children * sizeof (boolean_t), KM_SLEEP);
+	for (uint_t c = 0; error == 0 && c < children; c++) {
+		vdev_t *vd = engine.vd->vdev_child[c];
+		stale[c] = vdev_readable(vd) && vdev_writeable(vd) &&
+		    (missing[c] != 0 || engine_pages.member_serial[c] <
+		    engine_pages.control.serial);
+	}
+	uint_t resilvered = 0;
+	for (uint_t c = 0; error == 0 && c < children; c++) {
+		if (!stale[c])
+			continue;
+		uint64_t pages = 0;
+		error = engine_pages_resilver(spa, c, &pages);
+		(void) printf("PR19262_RAW_RESILVER child=%u pages=%llu "
+		    "missing_before=%llu error=%d\n", c, (u_longlong_t)pages,
+		    (u_longlong_t)missing[c], error);
+		resilvered++;
+	}
+	if (error == 0 && resilvered != 0) {
+		memset(ok, 0, children * sizeof (uint64_t));
+		memset(missing, 0, children * sizeof (uint64_t));
+		error = engine_pages_members(spa, -1, ok, missing, &written);
+		if (error == 0)
+			engine_pages_audit_print(spa, "resilvered", ok,
+			    missing);
+	}
+	kmem_free(stale, children * sizeof (boolean_t));
+	kmem_free(ok, children * sizeof (uint64_t));
+	kmem_free(missing, children * sizeof (uint64_t));
 	return (error);
 }
 
@@ -1368,6 +1754,7 @@ engine_pages_directory_write(spa_t *spa, engine_marena_t *a,
 		return (error);
 	engine_pages_fault(12, generation, 0, candidate.p);
 	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
+	engine_quorum_t q = { 0 };
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
 		int e = engine_store_io_at(engine.vd->vdev_child[c],
@@ -1375,13 +1762,13 @@ engine_pages_directory_write(spa_t *spa, engine_marena_t *a,
 		if (e == 0)
 			e = pr19262_engine_metadata_flush(
 			    engine.vd->vdev_child[c]);
-		if (e != 0)
-			error = e;
-		else if (c == 0)
+		engine_quorum_add(&q, e);
+		if (e == 0 && c == 0)
 			engine_pages_fault(13, generation, c, candidate.p);
 	}
 	spa_config_exit(spa, SCL_ZIO, FTAG);
 	abd_free(abd);
+	error = engine_quorum_result(&q);
 	if (error == 0)
 		*ref = candidate;
 	return (error);
@@ -1516,6 +1903,7 @@ engine_pages_pending_inspect(spa_t *spa, engine_marena_t *a)
 	engine_mcontrol_t highest = { 0 };
 	boolean_t conflict = B_FALSE;
 	int error = 0;
+	uint_t readable = 0;
 	/* Cold reconcile runs from spa_load with no config lock held. */
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	for (uint_t page = 0; error == 0 && page < 3; page++) {
@@ -1524,8 +1912,14 @@ engine_pages_pending_inspect(spa_t *spa, engine_marena_t *a)
 			uint64_t p = a->p + page * stripe;
 			error = engine_store_io_at(engine.vd->vdev_child[c], p,
 			    0, 1, abd, B_FALSE);
+			if (error == ENXIO) {
+				/* An absent member is inspected on return. */
+				error = 0;
+				continue;
+			}
 			if (error != 0)
 				break;
+			readable++;
 			engine_mheader_t *h = engine_mheader(n);
 			boolean_t swap = h->magic == BSWAP_64(ENGINE_M_MAGIC) ||
 			    h->magic == BSWAP_64(ENGINE_M_ALLOC_MAGIC);
@@ -1645,6 +2039,8 @@ engine_pages_pending_inspect(spa_t *spa, engine_marena_t *a)
 		}
 	}
 	spa_config_exit(spa, SCL_ZIO, FTAG);
+	if (error == 0 && readable == 0)
+		error = ENXIO;
 	/* Arena-local ACTIVE must refer to this operation's verified DIR. */
 	if (conflict)
 		error = ECKSUM;
@@ -1850,6 +2246,62 @@ engine_pages_growth_probe(spa_t *spa, boolean_t advance,
 	return (error);
 }
 
+/* Rows of released journaled owners stay as tombstones until they expire. */
+static boolean_t
+engine_pages_tombstone_needed(const engine_mrow_t *row)
+{
+	if (row->key[3] != 0)
+		return (B_FALSE);
+	engine_tomb_t key = { .v = row->key[1], .incarnation = row->key[2] };
+	mutex_enter(&engine.lock);
+	engine_tomb_t *t = avl_find(&engine.tombstones, &key, NULL);
+	boolean_t needed = t != NULL && !t->expired;
+	mutex_exit(&engine.lock);
+	return (needed);
+}
+
+static uint64_t *
+engine_pages_expired_tombstones(uint_t *count)
+{
+	*count = 0;
+	mutex_enter(&engine.lock);
+	uint_t n = 0;
+	for (engine_tomb_t *t = avl_first(&engine.tombstones); t != NULL;
+	    t = AVL_NEXT(&engine.tombstones, t))
+		n += t->expired;
+	uint64_t *keys = n == 0 ? NULL :
+	    kmem_alloc(n * 2 * sizeof (uint64_t), KM_SLEEP);
+	uint_t at = 0;
+	for (engine_tomb_t *t = avl_first(&engine.tombstones); t != NULL;
+	    t = AVL_NEXT(&engine.tombstones, t)) {
+		if (!t->expired)
+			continue;
+		keys[2 * at] = t->v;
+		keys[2 * at + 1] = t->incarnation;
+		at++;
+	}
+	mutex_exit(&engine.lock);
+	*count = n;
+	return (keys);
+}
+
+/* The stored tree no longer carries these rows. */
+static void
+engine_pages_expire_tombstones(const uint64_t *keys, uint_t count)
+{
+	mutex_enter(&engine.lock);
+	for (uint_t i = 0; i < count; i++) {
+		engine_tomb_t key = { .v = keys[2 * i],
+		    .incarnation = keys[2 * i + 1] };
+		engine_tomb_t *t = avl_find(&engine.tombstones, &key, NULL);
+		if (t != NULL && t->expired) {
+			avl_remove(&engine.tombstones, t);
+			kmem_free(t, sizeof (*t));
+		}
+	}
+	mutex_exit(&engine.lock);
+}
+
 static int
 engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
     uint64_t desc[16])
@@ -1881,13 +2333,31 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		    engine_pages.rows[before].key, rows[after].key));
 		if (order < 0) {
 			engine_mrow_t removed = engine_pages.rows[before++];
-			removed.data[6] = 3;
-			error = engine_mput(b, &tree, &removed);
+			/*
+			 * A released journaled owner leaves a tombstone row
+			 * while a journal segment may still bind it; every
+			 * other dead row is deleted.
+			 */
+			if (engine_pages_tombstone_needed(&removed)) {
+				removed.data[6] = 3;
+				error = engine_mput(b, &tree, &removed);
+				b->tombstones++;
+			} else {
+				error = engine_mdel(b, &tree, removed.key);
+			}
 		} else {
 			if (order == 0)
 				before++;
 			error = engine_mput(b, &tree, &rows[after++]);
 		}
+	}
+	/* Tombstones whose journal segments are gone leave the tree. */
+	uint_t expired = 0;
+	uint64_t *expired_keys = engine_pages_expired_tombstones(&expired);
+	for (uint_t i = 0; error == 0 && i < expired; i++) {
+		uint64_t key[4] = { 1, expired_keys[2 * i],
+		    expired_keys[2 * i + 1], 0 };
+		error = engine_mdel(b, &tree, key);
 	}
 	if (error == 0)
 		error = engine_mseal(b, &tree);
@@ -1949,8 +2419,10 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			engine_pages_fault(2, b->generation, 0, UINT64_MAX);
 	}
 	if (error == 0) {
+		engine_quorum_t q = { 0 };
 		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 		for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
+			int member = 0;
 			for (uint64_t i = 0; i < engine_pages.capacity; i++) {
 				engine_mnode_t *n = engine_pages.cache[i];
 				if (!engine_mdirty(b, n))
@@ -1962,21 +2434,24 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 				    engine.vd->vdev_child[c],
 				    engine_mheader(n)->p, abd, B_TRUE);
 				abd_free(abd);
-				if (e != 0)
-					error = e;
-				else if (c == 0)
+				if (e != 0 && (member == 0 || e != ENXIO))
+					member = e;
+				else if (e == 0 && c == 0)
 					engine_pages_fault(3, b->generation,
 					    c, i);
 			}
 			int e = pr19262_engine_metadata_flush(
 			    engine.vd->vdev_child[c]);
-			if (e != 0)
-				error = e;
-			else if (c == 0)
+			if (e != 0 && (member == 0 || e != ENXIO))
+				member = e;
+			else if (e == 0 && c == 0)
 				engine_pages_fault(4, b->generation, c,
 				    UINT64_MAX);
+			/* A member fails as a whole; the quorum decides. */
+			engine_quorum_add(&q, member);
 		}
 		spa_config_exit(spa, SCL_ZIO, FTAG);
+		error = engine_quorum_result(&q);
 	}
 	if (error == 0) {
 		if (engine_pages.rows != NULL) {
@@ -1987,6 +2462,13 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		engine_pages.rows = rows; rows = NULL;
 		engine_pages.count = count;
 		engine_pages.root = tree;
+		engine_pages.levels = 0;
+		if (tree.p != UINT64_MAX) {
+			engine_mnode_t *top;
+			if (engine_mget(b, &tree, &top) == 0)
+				engine_pages.levels =
+				    engine_mheader(top)->level + 1;
+		}
 		for (uint64_t i = 0; i < engine_pages.capacity; i++) {
 			engine_mnode_t *n = engine_pages.cache[i];
 			if (engine_mdirty(b, n))
@@ -1999,11 +2481,17 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		    engine.total, 7 };
 		memcpy(d + 8, &root.hash, sizeof (root.hash));
 		memcpy(desc, d, sizeof (d));
+		engine_pages_expire_tombstones(expired_keys, expired);
 		(void) printf("PR19262_PAGED_SYNC txg=%llu newpages=%u "
-		    "changes=%u rows=%u root=%llu generation=%llu\n",
-		    (u_longlong_t)ub->ub_txg, b->pages, b->changes, count,
-		    (u_longlong_t)root.p, (u_longlong_t)b->generation);
+		    "changes=%u deletes=%u tombstones=%u expired=%u rows=%u "
+		    "root=%llu generation=%llu levels=%llu\n",
+		    (u_longlong_t)ub->ub_txg, b->pages, b->changes, b->deletes,
+		    b->tombstones, expired, count, (u_longlong_t)root.p,
+		    (u_longlong_t)b->generation,
+		    (u_longlong_t)engine_pages.levels);
 	}
+	if (expired_keys != NULL)
+		kmem_free(expired_keys, expired * 2 * sizeof (uint64_t));
 	if (packed != NULL)
 		kmem_free(packed, size);
 	if (blobs != NULL)
@@ -2026,6 +2514,9 @@ typedef struct engine_mreader {
 	uint64_t *tombs;
 	uint_t tomb_count;
 	uint_t tomb_capacity;
+	/* Dead version rows: none once deletes replace tombstoning. */
+	uint_t dead;
+	uint64_t levels;
 } engine_mreader_t;
 
 static int
@@ -2040,8 +2531,10 @@ engine_mcollect(engine_mreader_t *r, const engine_mrow_t *row)
 	r->have_last = B_TRUE;
 	if (row->data[6] == 3) {
 		/* Keep released owner identities for journal folding. */
-		if (row->key[3] != 0)
+		if (row->key[3] != 0) {
+			r->dead++;
 			return (0);
+		}
 		if (r->tomb_count == r->tomb_capacity) {
 			uint_t cap = r->tomb_capacity == 0 ? 64 :
 			    r->tomb_capacity * 2;
@@ -2095,6 +2588,8 @@ engine_mwalk(engine_mreader_t *r, const engine_mref_t *ref, uint64_t level,
 		return (error);
 	engine_mheader_t *h = engine_mheader(n);
 	zfs_range_tree_add(r->seen, ref->p, stripe);
+	if (level == UINT64_MAX)
+		r->levels = h->level + 1;
 	if ((level != UINT64_MAX && level != h->level) ||
 	    (h->type != ENGINE_M_LEAF && h->type != ENGINE_M_BRANCH)) {
 		error = EINVAL;
@@ -2263,6 +2758,12 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 			error = engine_mwalk(r, &ref, UINT64_MAX, low, high);
 		}
 	}
+	if (error == 0 && allocator)
+		(void) printf("PR19262_PAGES_READ root=%llu rows=%u "
+		    "tombstones=%u dead=%u levels=%llu pages=%llu\n",
+		    (u_longlong_t)ub->ub_txg, r->count, r->tomb_count, r->dead,
+		    (u_longlong_t)r->levels,
+		    (u_longlong_t)(zfs_range_tree_space(r->seen) / stripe));
 	uchar_t *bitmap;
 	uint_t nb;
 	if (error == 0 && (nvlist_lookup_byte_array(nv, "bitmap", &bitmap,
@@ -2300,6 +2801,8 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 		}
 		kmem_free(reserved, engine_pages.capacity);
 	}
+	if (error == 0 && allocator)
+		fnvlist_add_uint64(nv, "page-levels", r->levels);
 	if (error == 0)
 		error = engine_mowners(r, nv);
 	if (error == 0 && allocator)
@@ -2366,6 +2869,9 @@ engine_pages_install(nvlist_t *nv)
 	    &reserved) == 0)
 		engine_pages.generation = MAX(generation, reserved);
 	engine_pages.rows = rows; engine_pages.count = count;
+	uint64_t levels;
+	if (nvlist_lookup_uint64(nv, "page-levels", &levels) == 0)
+		engine_pages.levels = levels;
 	return (0);
 }
 

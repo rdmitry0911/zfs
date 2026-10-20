@@ -116,6 +116,8 @@ pr19262_engine_store_enable(spa_t *spa)
 	engine.journal_segments = engine.journal_tail =
 	    kmem_zalloc(sizeof (engine_j_segment_t), KM_SLEEP);
 	engine.journal_tail->arena = p;
+	engine.journal_tail->index = engine.journal_segment_count = 1;
+	engine.journal_tail->free_after = UINT64_MAX;
 	engine.journal_current = engine.journal_tail;
 	memcpy(engine.journal_tail->epoch, engine.journal_epoch,
 	    sizeof (engine.journal_epoch));
@@ -165,6 +167,12 @@ engine_store_io(vdev_t *vd, uint64_t page, uint64_t pages, abd_t *abd,
 
 #include "vdev_reloc_pages.c"
 
+static uint_t
+engine_store_tolerated(void)
+{
+	return (MIN(engine_pages.certified, VDEV_RAIDZ_MAXPARITY));
+}
+
 static boolean_t
 engine_store_layout(const uint64_t *d)
 {
@@ -211,6 +219,32 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 	uint64_t journal[] = { engine.journal_root, engine.journal_bytes,
 	    engine.journal_root_epoch[0], engine.journal_root_epoch[1] };
 	fnvlist_add_uint64_array(nv, "journal", journal, 4);
+	/*
+	 * This catalog names the current root: cut segments may go at a
+	 * fence whose floor root's catalog is at least this one.  Until then
+	 * they stay quarantined, so that a resume from this catalog cannot
+	 * reuse an extent an older importable root still reads.
+	 */
+	uint_t retired = 0;
+	for (engine_j_segment_t *s = engine.journal_retired; s != NULL;
+	    s = s->next) {
+		if (s->free_after == UINT64_MAX)
+			s->free_after = ub->ub_txg;
+		retired++;
+	}
+	uint64_t *cut = kmem_alloc(MAX(1, retired) * 5 * sizeof (uint64_t),
+	    KM_SLEEP);
+	uint_t at = 0;
+	for (engine_j_segment_t *s = engine.journal_retired; s != NULL;
+	    s = s->next) {
+		cut[at++] = s->arena;
+		cut[at++] = engine.journal_bytes;
+		cut[at++] = s->epoch[0];
+		cut[at++] = s->epoch[1];
+		cut[at++] = s->free_after;
+	}
+	fnvlist_add_uint64_array(nv, "journal-retired", cut, at);
+	kmem_free(cut, MAX(1, retired) * 5 * sizeof (uint64_t));
 	fnvlist_add_uint64_array(nv, "checkpoint",
 	    (uint64_t *)&engine.checkpoint,
 	    sizeof (engine.checkpoint) / sizeof (uint64_t));
@@ -442,6 +476,13 @@ engine_store_clear(void)
 		engine.journal_segments = s->next;
 		kmem_free(s, sizeof (*s));
 	}
+	while (engine.journal_retired != NULL) {
+		engine_j_segment_t *s = engine.journal_retired;
+		engine.journal_retired = s->next;
+		kmem_free(s, sizeof (*s));
+	}
+	engine.journal_segment_count = 0;
+	engine.journal_freed_segments = engine.journal_freed_bytes = 0;
 	engine.journal_tail = NULL;
 	engine.journal_current = NULL;
 	if (engine.journal_pending != NULL) {
@@ -470,6 +511,13 @@ engine_store_clear(void)
 	memset(engine.durable_desc, 0, sizeof (engine.durable_desc));
 	engine.certified = 0;
 	engine.release_thread = NULL;
+	memset(engine.admit, 0, sizeof (engine.admit));
+	engine.admit_parity = engine.admit_reserve = 0;
+	engine.admit_reserve_growth = engine.admit_reserve_legacy = 0;
+	engine.admit_reserve_weak = engine.admit_growth_peak = 0;
+	engine.admit_space_rejections = 0;
+	engine.admit_batch = ENGINE_ADMIT_BATCH;
+	engine.admit_refreshed = UINT64_MAX;
 }
 
 void
@@ -617,9 +665,39 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	engine.journal_extents = zfs_range_tree_create(NULL,
 	    ZFS_RANGE_SEG64, NULL, 0, 0);
 	zfs_range_tree_add(engine.journal_extents, engine.journal_arena, jsize);
+	/* Cut segments stay quarantined until a fence frees them. */
+	uint64_t *cut;
+	uint_t ncut;
+	if (nvlist_lookup_uint64_array(nv, "journal-retired", &cut,
+	    &ncut) == 0) {
+		if (ncut % 5 != 0)
+			return (EINVAL);
+		engine_j_segment_t **link = &engine.journal_retired;
+		for (uint_t i = 0; i < ncut; i += 5) {
+			if (cut[i + 1] != engine.journal_bytes ||
+			    cut[i] % (engine.vd->vdev_children *
+			    ENGINE_STORE_PAGE) != 0 ||
+			    !engine_store_extent(cut[i], jsize) ||
+			    cut[i + 4] == UINT64_MAX || cut[i + 4] > txg)
+				return (EINVAL);
+			zfs_range_tree_remove(engine.free, cut[i], jsize);
+			zfs_range_tree_add(engine.journal_extents, cut[i],
+			    jsize);
+			engine_j_segment_t *s = kmem_zalloc(sizeof (*s),
+			    KM_SLEEP);
+			s->arena = cut[i];
+			s->epoch[0] = cut[i + 2];
+			s->epoch[1] = cut[i + 3];
+			s->free_after = cut[i + 4];
+			*link = s;
+			link = &s->next;
+		}
+	}
 	engine.journal_segments = engine.journal_tail =
 	    kmem_zalloc(sizeof (engine_j_segment_t), KM_SLEEP);
 	engine.journal_tail->arena = engine.journal_arena;
+	engine.journal_tail->index = engine.journal_segment_count = 1;
+	engine.journal_tail->free_after = UINT64_MAX;
 	engine.journal_current = engine.journal_tail;
 	memcpy(engine.journal_tail->epoch, engine.journal_epoch,
 	    sizeof (engine.journal_epoch));
@@ -639,6 +717,8 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 			engine_tomb_t *t = kmem_zalloc(sizeof (*t), KM_SLEEP);
 			t->v = tombs[i];
 			t->incarnation = tombs[i + 1];
+			/* Bound to the tail once the chain is recovered. */
+			t->segment = UINT64_MAX;
 			avl_index_t where;
 			if (avl_find(&engine.tombstones, t, &where) != NULL) {
 				kmem_free(t, sizeof (*t));
@@ -979,6 +1059,10 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 		memcpy(engine.stored_desc, d, sizeof (engine.stored_desc));
 		memcpy(engine.durable_desc, d, sizeof (engine.durable_desc));
 		engine.certified = engine_pages.certified;
+		engine.admit_batch = ENGINE_ADMIT_BATCH;
+		engine.admit_refreshed = UINT64_MAX;
+		vdev_raidz_layout_for_birth(vd, ub->ub_txg + 1, NULL,
+		    &engine.admit_parity);
 		/* Open native space maps even for a read-only SPA. */
 		spa->spa_read_spacemaps = B_TRUE;
 		(void) printf("PR19262_STORE_LOAD pre-MOS txg=%llu "
@@ -1022,6 +1106,29 @@ pr19262_engine_store_recover(spa_t *spa)
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
 	mutex_enter(&engine.store_lock);
 	int error = engine_pages_reconcile(spa, B_TRUE);
+	/* Members that returned after missing writes get the live pages. */
+	if (error == 0)
+		error = engine_pages_resilver_members(spa);
+	mutex_exit(&engine.store_lock);
+	spa_config_exit(spa, SCL_STATE, FTAG);
+	return (error);
+}
+
+/* Audit which members hold every live raw page; private witness. */
+int
+pr19262_engine_raw_audit(spa_t *spa, const char *label, uint64_t *ok,
+    uint64_t *missing)
+{
+	if (!pr19262_engine_persistent(spa))
+		return (ENOTSUP);
+	if (spa_writeable(spa))
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+	mutex_enter(&engine.store_lock);
+	uint64_t written;
+	int error = engine_pages_members(spa, -1, ok, missing, &written);
+	if (error == 0)
+		engine_pages_audit_print(spa, label, ok, missing);
 	mutex_exit(&engine.store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	return (error);

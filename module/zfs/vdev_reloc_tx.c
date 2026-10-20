@@ -23,6 +23,10 @@ typedef struct probe_tx_credit {
 	uint64_t txg;
 	spa_t *spa;
 	probe_tx_budget_t *budget;
+	/* Vector reserved with the engine: pages and frames, by class. */
+	uint_t class;
+	uint64_t m_pages;
+	uint64_t j_frames;
 } probe_tx_credit_t;
 
 typedef struct probe_tx_allocation {
@@ -103,6 +107,34 @@ probe_tx_budget_drop(probe_tx_budget_t *b)
 	kmem_free(b, sizeof (*b));
 }
 
+/*
+ * Catalog rows a transaction may add: one per block it may allocate,
+ * bounded by its holds' block sizes; journal frames: one per log block
+ * plus gang members a synchronous record of that size may need.
+ */
+static void
+probe_tx_vector(dmu_tx_t *tx, uint64_t *rows, uint64_t *frames)
+{
+	*rows = 2;
+	*frames = 1;
+	for (dmu_tx_hold_t *txh = list_head(&tx->tx_holds); txh != NULL;
+	    txh = list_next(&tx->tx_holds, txh)) {
+		uint64_t towrite = zfs_refcount_count(&txh->txh_space_towrite);
+		if (towrite == 0)
+			continue;
+		dnode_t *dn = txh->txh_dnode;
+		if (dn != NULL) {
+			uint64_t block = MAX(dn->dn_datablksz,
+			    SPA_MINBLOCKSIZE);
+			*rows += howmany(towrite, block) +
+			    howmany(towrite, 1ULL << dn->dn_indblkshift) + 1;
+		} else {
+			*rows += howmany(towrite, SPA_MINBLOCKSIZE);
+		}
+		*frames += 4 * howmany(towrite, SPA_OLD_MAXBLOCKSIZE);
+	}
+}
+
 static int
 probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 {
@@ -114,6 +146,20 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 	    (tx->tx_objset != probe_tx.os || probe_tx.os == NULL)))
 		goto out;
 	VERIFY3P(tx->tx_pr19262_physical_credit, ==, NULL);
+	uint_t class = tx->tx_netfree ? PR19262_ADMIT_NETFREE :
+	    PR19262_ADMIT_CLIENT;
+	uint64_t rows = 0, frames = 0, m_pages = 0;
+	if (runtime) {
+		probe_tx_vector(tx, &rows, &frames);
+		m_pages = rows * pr19262_engine_admit_row_pages(spa);
+		/* Physical bytes, pages and frames admitted together. */
+		error = pr19262_engine_admit(spa, class, probe_tx.reserved,
+		    bytes, m_pages, frames);
+		if (error != 0) {
+			probe_tx.rejected++;
+			goto out;
+		}
+	}
 	metaslab_class_t *mc = spa_normal_class(tx->tx_pool->dp_spa);
 	uint64_t total = metaslab_class_get_space(mc);
 	uint64_t allocated = metaslab_class_get_alloc(mc);
@@ -123,9 +169,8 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 	limit = limit > probe_tx.inflight ? limit - probe_tx.inflight : 0;
 	uint64_t protected = tx->tx_netfree ? 0 : probe_tx.emergency;
 	limit = limit > protected ? limit - protected : 0;
-	if (runtime)
-		limit = pr19262_engine_limit(spa, tx->tx_netfree);
-	if (probe_tx.reserved > limit || bytes > limit - probe_tx.reserved) {
+	if (!runtime && (probe_tx.reserved > limit ||
+	    bytes > limit - probe_tx.reserved)) {
 		probe_tx.rejected++;
 		error = ENOSPC;
 		goto out;
@@ -141,6 +186,9 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 	c->txg = tx->tx_txg;
 	c->spa = spa;
 	c->budget = b;
+	c->class = class;
+	c->m_pages = m_pages;
+	c->j_frames = frames;
 	b->open += bytes;
 	b->refs++;
 	tx->tx_pr19262_physical_credit = c;
@@ -164,6 +212,8 @@ probe_tx_unreserve(dmu_tx_t *tx)
 	probe_tx.reserved -= c->bytes;
 	b->refs--;
 	probe_tx_budget_drop(b);
+	pr19262_engine_admit_release(c->spa, c->class, 0, c->m_pages,
+	    c->j_frames);
 	kmem_free(c, sizeof (*c));
 	probe_tx.rolled_back++;
 	tx->tx_pr19262_physical_credit = NULL;
@@ -261,6 +311,9 @@ probe_tx_synced(void *arg, int error)
 	}
 	probe_tx_budget_drop(b);
 	probe_tx.callbacks++;
+	/* The catalog of this txg is stored: its pages and frames return. */
+	pr19262_engine_admit_release(c->spa, c->class, 0, c->m_pages,
+	    c->j_frames);
 	kmem_free(c, sizeof (*c));
 	cv_broadcast(&probe_tx.done);
 	mutex_exit(&probe_tx.lock);
@@ -300,6 +353,13 @@ probe_tx_reserved(void)
 	uint64_t r = probe_tx.reserved;
 	mutex_exit(&probe_tx.lock);
 	return (r);
+}
+
+/* Outstanding unconsumed physical credit, for the engine's own admission. */
+uint64_t
+pr19262_tx_reserved(void)
+{
+	return (probe_tx_reserved());
 }
 
 static void

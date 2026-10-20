@@ -63,6 +63,14 @@ pr19262_engine_census(spa_t *spa, uint64_t parity,
 		c->store_bytes = zfs_range_tree_space(engine.store_extents);
 	if (engine.journal_extents != NULL)
 		c->journal_bytes = zfs_range_tree_space(engine.journal_extents);
+	for (engine_j_segment_t *s = engine.journal_segments; s != NULL;
+	    s = s->next)
+		c->journal_segments++;
+	for (engine_j_segment_t *s = engine.journal_retired; s != NULL;
+	    s = s->next)
+		c->journal_retired++;
+	c->journal_freed_bytes = engine.journal_freed_bytes;
+	c->tombstones = avl_numnodes(&engine.tombstones);
 	c->floor = engine_pages.floor;
 	c->certified = engine.certified;
 	c->durable_txg = engine.durable_ub_txg;
@@ -161,6 +169,11 @@ engine_release_sync(void *arg, dmu_tx_t *tx)
 			kmem_free(b, sizeof (*b));
 		}
 		avl_remove(&engine.owners, e);
+		/* Journal records of this identity may still be replayed. */
+		if (e->journal_touched)
+			engine_tombstone_add(v, e->incarnation,
+			    engine.journal_tail != NULL ?
+			    engine.journal_tail->index : 0);
 		kmem_free(e, sizeof (*e));
 		r->owners++;
 		engine.revision++;
@@ -193,7 +206,7 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 	boolean_t checkpoint = engine.checkpoint.ub_txg != 0;
 	mutex_exit(&engine.lock);
 	int error = 0;
-	uint64_t pages_freed = 0;
+	uint64_t pages_freed = 0, journal_segments = 0, journal_bytes = 0;
 	if (checkpoint)
 		error = EBUSY;
 	else if (ub == 0 || ub < engine_pages.floor || catalog > ub)
@@ -238,6 +251,9 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 		}
 		*floor = engine_pages.floor;
 		mutex_exit(&engine.lock);
+		/* Journal segments folded into this floor root's catalog. */
+		engine_journal_gc(spa, catalog, &journal_segments,
+		    &journal_bytes);
 	}
 	if (error == 0 && getenv("PR19262_ENGINE_FENCE_CUT") != NULL) {
 		/*
@@ -259,9 +275,12 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 	*released = r.owners;
 	(void) printf("PR19262_FENCE floor=%llu catalog=%llu reclaimed=%llu "
 	    "released_owners=%llu released_bytes=%llu pages_freed=%llu "
-	    "error=%d\n", (u_longlong_t)*floor, (u_longlong_t)catalog,
+	    "journal_freed=%llu journal_freed_bytes=%llu error=%d\n",
+	    (u_longlong_t)*floor, (u_longlong_t)catalog,
 	    (u_longlong_t)*reclaimed, (u_longlong_t)r.owners,
-	    (u_longlong_t)r.bytes, (u_longlong_t)pages_freed, error);
+	    (u_longlong_t)r.bytes, (u_longlong_t)pages_freed,
+	    (u_longlong_t)journal_segments, (u_longlong_t)journal_bytes,
+	    error);
 	return (error);
 }
 
@@ -318,6 +337,13 @@ typedef struct engine_convert {
 	uint64_t parity;
 	uint64_t batch;
 	uint64_t pending;
+	/* Vector admitted for this pass, released after its fence. */
+	uint64_t admitted_p;
+	uint64_t admitted_m;
+	uint64_t admitted_j;
+	boolean_t starved;
+	/* Consecutive full passes that copied nothing but saw busy blocks. */
+	uint64_t idle_passes;
 	/* Inside a log chain: an unreadable block is an unwritten tail. */
 	boolean_t zil_chain;
 	pr19262_engine_convert_stats_t *stats;
@@ -391,11 +417,61 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 		    !engine_convert_weak(c, bp, d))
 			continue;
 		st->candidates++;
+		/* Admit this copy's bytes, catalog row and journal frame. */
+		uint64_t psize = DVA_GET_GANG(&bp->blk_dva[d]) ?
+		    vdev_gang_header_psize(engine.vd) : BP_GET_PSIZE(bp);
+		uint64_t asize = vdev_psize_to_asize_txg(engine.vd, psize,
+		    c->birth);
+		uint64_t pages = pr19262_engine_admit_row_pages(spa);
+		if (pr19262_engine_admit(spa, PR19262_ADMIT_CONVERTER,
+		    pr19262_tx_reserved(), asize, pages, 1) != 0) {
+			st->starved++;
+			c->starved = B_TRUE;
+			break;
+		}
+		c->admitted_p += asize;
+		c->admitted_m += pages;
+		c->admitted_j++;
 		void *copy;
 		error = pr19262_engine_copy_begin(spa, bp, d, c->birth, &copy);
 		if (error == EBUSY) {
+			pr19262_engine_info_t info;
+			pr19262_engine_inspect(spa, bp, d, &info);
+			/* An unwritten log tail is rebound, not copied. */
+			if (c->zil_chain && !member && !BP_IS_GANG(bp) &&
+			    !info.ready && info.leases == 0 && !info.copying) {
+				error = pr19262_engine_rebind_unwritten(spa, bp,
+				    d, c->birth);
+				if (error == 0) {
+					st->unwritten++;
+					continue;
+				}
+				if (error != EBUSY)
+					break;
+			}
 			st->busy++;
 			error = 0;
+			/* Name a block that stays busy across whole passes. */
+			if (c->idle_passes >= 2) {
+				(void) printf("PR19262_CONVERT_BUSY v=%llu "
+				    "psize=%llu birth=%llu leases=%llu "
+				    "old_leases=%llu versions=%llu holds=%llu "
+				    "queued=%llu copying=%u ready=%u "
+				    "catalog_txg=%llu type=%u level=%u\n",
+				    (u_longlong_t)DVA_GET_OFFSET(
+				    &bp->blk_dva[d]),
+				    (u_longlong_t)BP_GET_PSIZE(bp),
+				    (u_longlong_t)info.birth,
+				    (u_longlong_t)info.leases,
+				    (u_longlong_t)info.old_leases,
+				    (u_longlong_t)info.versions,
+				    (u_longlong_t)info.holds,
+				    (u_longlong_t)info.queued_writers,
+				    info.copying, info.ready,
+				    (u_longlong_t)info.catalog_txg,
+				    (uint_t)BP_GET_TYPE(bp),
+				    (uint_t)BP_GET_LEVEL(bp));
+			}
 			continue;
 		}
 		if (error == ESTALE) {
@@ -462,8 +538,9 @@ engine_convert_visit(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	    BP_IS_REDACTED(bp))
 		return (0);
 	int error = engine_convert_bp(c, bp);
-	/* A full batch ends this pass; the caller fences before the next. */
-	if (error == 0 && c->batch != 0 && c->pending >= c->batch)
+	/* A full or starved batch ends this pass; the caller fences first. */
+	if (error == 0 && ((c->batch != 0 && c->pending >= c->batch) ||
+	    c->starved))
 		error = ERESTART;
 	return (error);
 }
@@ -566,10 +643,29 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 	    .stats = stats };
 	vdev_raidz_layout_for_birth(engine.vd, birth, NULL, &c.parity);
 	dsl_pool_t *dp = spa->spa_dsl_pool;
+	/*
+	 * The standing reserve already holds the growth of every weaker
+	 * backing and one batch; refuse to start when the pool is so full
+	 * that even the reserve is missing, rather than fail half way.
+	 */
+	pr19262_engine_plan(spa, c.parity, batch);
+	pr19262_engine_admit_report_t admit;
+	pr19262_engine_admit_report(spa, "convert-start", &admit);
+	/* The reserve is the converter's to spend; one batch must fit now. */
+	uint64_t needed = admit.sync_bytes + admit.log_bytes + admit.batch +
+	    admit.growth;
+	if (admit.free < needed) {
+		(void) printf("PR19262_CONVERT_SPACE free=%llu needed=%llu "
+		    "reserve=%llu growth=%llu\n", (u_longlong_t)admit.free,
+		    (u_longlong_t)needed, (u_longlong_t)admit.reserve,
+		    (u_longlong_t)admit.growth);
+		return (ENOSPC);
+	}
 	int error = 0;
 	for (uint64_t pass = 0; pass < max_passes; pass++) {
 		stats->passes++;
 		uint64_t copied = stats->copied, busy = stats->busy;
+		c.starved = B_FALSE;
 		txg_wait_synced(dp, 0);
 		/* Hold the open txg: nothing is freed under the walk. */
 		dmu_tx_t *fence = dmu_tx_create_dd(dp->dp_mos_dir);
@@ -600,15 +696,43 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 				break;
 			}
 		}
+		/* The pass's copies are catalogued or reclaimed: release. */
+		pr19262_engine_admit_release(spa, PR19262_ADMIT_CONVERTER,
+		    c.admitted_p, c.admitted_m, c.admitted_j);
+		c.admitted_p = c.admitted_m = c.admitted_j = 0;
+		if (c.starved && stats->copied == copied) {
+			/* No space for one copy, nothing left to reclaim. */
+			pr19262_engine_admit_report(spa, "convert-starved",
+			    &admit);
+			error = ENOSPC;
+			break;
+		}
 		(void) printf("PR19262_CONVERT_PASS pass=%llu partial=%u "
-		    "visited=%llu copied=%llu busy=%llu stale=%llu\n",
-		    (u_longlong_t)stats->passes, partial,
+		    "visited=%llu copied=%llu busy=%llu stale=%llu "
+		    "starved=%llu\n", (u_longlong_t)stats->passes, partial,
 		    (u_longlong_t)stats->visited, (u_longlong_t)stats->copied,
-		    (u_longlong_t)stats->busy, (u_longlong_t)stats->stale);
+		    (u_longlong_t)stats->busy, (u_longlong_t)stats->stale,
+		    (u_longlong_t)stats->starved);
 		if (!partial && stats->copied == copied && stats->busy == busy)
 			break;
+		/* Busy across many idle passes is a defect, not a wait. */
+		if (!partial && stats->copied == copied)
+			c.idle_passes++;
+		else
+			c.idle_passes = 0;
+		if (c.idle_passes >= 8) {
+			(void) printf("PR19262_CONVERT_STUCK passes=%llu "
+			    "busy=%llu\n", (u_longlong_t)stats->passes,
+			    (u_longlong_t)(stats->busy - busy));
+			error = EBUSY;
+			break;
+		}
 	}
+	if (error != 0)
+		pr19262_engine_admit_release(spa, PR19262_ADMIT_CONVERTER,
+		    c.admitted_p, c.admitted_m, c.admitted_j);
 	if (c.gang != NULL)
 		kmem_free(c.gang, c.gang_capacity * sizeof (*c.gang));
+	pr19262_engine_admit_report(spa, "convert-end", &admit);
 	return (error);
 }

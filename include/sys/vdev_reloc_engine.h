@@ -116,6 +116,10 @@ typedef struct pr19262_engine_info {
 	boolean_t aborted;
 	boolean_t retired;
 	boolean_t journal_touched;
+	uint64_t queued_writers;
+	boolean_t copying;
+	boolean_t ready;
+	uint64_t catalog_txg;
 } pr19262_engine_info_t;
 void pr19262_engine_inspect(spa_t *, const blkptr_t *, int,
     pr19262_engine_info_t *);
@@ -142,6 +146,11 @@ typedef struct pr19262_engine_census {
 	uint64_t free_bytes;
 	uint64_t store_bytes;
 	uint64_t journal_bytes;
+	/* Live chain, cut segments awaiting a fence, bytes returned so far. */
+	uint64_t journal_segments;
+	uint64_t journal_retired;
+	uint64_t journal_freed_bytes;
+	uint64_t tombstones;
 	uint64_t min_parity;
 	uint64_t floor;
 	uint64_t certified;
@@ -164,6 +173,8 @@ typedef struct pr19262_engine_convert_stats {
 	uint64_t new_bytes;
 	uint64_t busy;
 	uint64_t stale;
+	/* Copies refused by admission: the pass fenced and retried. */
+	uint64_t starved;
 	uint64_t fences;
 	uint64_t reclaimed_bytes;
 	uint64_t released_owners;
@@ -180,5 +191,53 @@ int pr19262_engine_certify(spa_t *, uint64_t);
 uint64_t pr19262_engine_floor(spa_t *);
 /* Incarnation of an owner overlapping [V, V + size), or 0 when none. */
 uint64_t pr19262_engine_owner_incarnation(spa_t *, uint64_t, uint64_t);
+/* Vector admission: physical bytes, catalog pages, journal frames. */
+#define	PR19262_ADMIT_CLIENT 0
+#define	PR19262_ADMIT_NETFREE 1
+#define	PR19262_ADMIT_CONVERTER 2
+#define	PR19262_ADMIT_CLASSES 3
+typedef struct engine_admit_class {
+	uint64_t p_bytes;
+	uint64_t m_pages;
+	uint64_t j_frames;
+	uint64_t admitted;
+	uint64_t rejected;
+	uint64_t peak_p;
+	uint64_t peak_m;
+	uint64_t peak_j;
+} engine_admit_class_t;
+typedef struct pr19262_engine_admit_report {
+	uint64_t free;
+	uint64_t protected;
+	uint64_t sync_bytes;
+	uint64_t log_bytes;
+	uint64_t reserve;
+	uint64_t reserve_growth;
+	uint64_t reserve_legacy;
+	uint64_t reserve_weak;
+	uint64_t batch;
+	uint64_t parity;
+	uint64_t growth;
+	uint64_t growth_peak;
+	uint64_t pages_total;
+	uint64_t pages_free;
+	uint64_t frames_total;
+	uint64_t frames_free;
+	uint64_t levels;
+	uint64_t converter_bytes;
+	uint64_t space_rejections;
+	engine_admit_class_t classes[PR19262_ADMIT_CLASSES];
+} pr19262_engine_admit_report_t;
+int pr19262_engine_admit(spa_t *, uint_t, uint64_t, uint64_t, uint64_t,
+    uint64_t);
+void pr19262_engine_admit_release(spa_t *, uint_t, uint64_t, uint64_t,
+    uint64_t);
+uint64_t pr19262_engine_admit_row_pages(spa_t *);
+void pr19262_engine_plan(spa_t *, uint64_t, uint64_t);
+void pr19262_engine_admit_report(spa_t *, const char *,
+    pr19262_engine_admit_report_t *);
+uint64_t pr19262_engine_hidden_dspace(spa_t *);
+/* Per-member count of valid live raw pages (arrays of vdev_children). */
+int pr19262_engine_raw_audit(spa_t *, const char *, uint64_t *, uint64_t *);
 #endif
 #endif

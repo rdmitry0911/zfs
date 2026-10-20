@@ -122,7 +122,7 @@ engine_journal_page(uint64_t kind, uint64_t seq)
 static int
 engine_journal_write(spa_t *spa, uint64_t page, abd_t *abd)
 {
-	int error = 0;
+	engine_quorum_t q = { 0 };
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	for (uint64_t i = 0; i < engine.vd->vdev_children; i++) {
 		vdev_t *vd = engine.vd->vdev_child[i];
@@ -151,8 +151,7 @@ engine_journal_write(spa_t *spa, uint64_t page, abd_t *abd)
 			    (roll_inject &&
 			    (roll % 3 == 2 || roll == 12)) ? EIO :
 			    pr19262_engine_metadata_flush(vd);
-		if (e != 0)
-			error = e;
+		engine_quorum_add(&q, e);
 		if (e == 0 && i == 0 && engine_journal_roll_phase == 2 &&
 		    roll == 10) {
 			(void) printf("PR19262_J_SINGLE_FORWARD root=%llu "
@@ -177,7 +176,7 @@ engine_journal_write(spa_t *spa, uint64_t page, abd_t *abd)
 		}
 	}
 	spa_config_exit(spa, SCL_ZIO, FTAG);
-	return (error);
+	return (engine_quorum_result(&q));
 }
 
 static int
@@ -265,6 +264,8 @@ engine_journal_segment(uint64_t arena, const uint64_t epoch[2],
 	engine_j_segment_t *s = kmem_zalloc(sizeof (*s), KM_SLEEP);
 	s->arena = arena;
 	memcpy(s->epoch, epoch, sizeof (s->epoch));
+	s->index = ++engine.journal_segment_count;
+	s->free_after = UINT64_MAX;
 	zfs_range_tree_remove(engine.free, arena, bytes);
 	zfs_range_tree_add(engine.journal_extents, arena, bytes);
 	if (link) {
@@ -437,7 +438,7 @@ engine_journal_read_head(spa_t *spa, abd_t *selected, boolean_t all_io)
 {
 	abd_t *page = abd_alloc_linear(ENGINE_STORE_PAGE, B_TRUE);
 	int error = ECKSUM;
-	int io_error = 0;
+	engine_quorum_t io = { 0 };
 	boolean_t conflict = B_FALSE;
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	for (uint_t slot = 0; slot < 2; slot++) {
@@ -446,7 +447,8 @@ engine_journal_read_head(spa_t *spa, abd_t *selected, boolean_t all_io)
 			int e = engine_store_io_at(engine.vd->vdev_child[child],
 			    engine.journal_arena, slot, 1, page, B_FALSE);
 			if (e != 0) {
-				io_error = e;
+				if (slot == 0)
+					engine_quorum_add(&io, e);
 				continue;
 			}
 			if (!engine_journal_valid(page, ENGINE_J_HEAD,
@@ -471,7 +473,9 @@ engine_journal_read_head(spa_t *spa, abd_t *selected, boolean_t all_io)
 		if (conflict || w[30] == 0 || w[31] > ENGINE_J_ACTIVE)
 			error = EINVAL;
 	}
-	return (all_io && io_error != 0 ? io_error : error);
+	/* A required read of every member tolerates the certified absences. */
+	int required = engine_quorum_result(&io);
+	return (all_io && required != 0 ? required : error);
 }
 
 static int
@@ -706,9 +710,109 @@ engine_journal_recover(spa_t *spa)
 		mutex_enter(&engine.lock);
 		engine.journal_formatted = engine.journal_ready = B_TRUE;
 		engine.journal_repair = B_TRUE;
+		/*
+		 * Every replayed record is in RAM now; the catalog written
+		 * after the claim barrier lists all of it.  Tombstones loaded
+		 * from the catalog may be bound anywhere up to the tail.
+		 */
+		for (s = engine.journal_segments; s != NULL; s = s->next)
+			s->fold_txg = MAX(s->fold_txg,
+			    spa_last_synced_txg(spa) + 2);
+		for (engine_tomb_t *t = avl_first(&engine.tombstones);
+		    t != NULL; t = AVL_NEXT(&engine.tombstones, t))
+			if (t->segment == UINT64_MAX)
+				t->segment = engine.journal_tail->index;
 		mutex_exit(&engine.lock);
 	}
 	return (error);
+}
+
+/*
+ * A record is folded once a durable catalog lists the version it binds:
+ * the owner must be catalogued (allocation txg) and the next catalog sync
+ * after the binding must have happened (at most two txgs later).
+ */
+static void
+engine_journal_fold(spa_t *spa, uint64_t catalog_txg)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	uint64_t visible = spa_last_synced_txg(spa) + 2;
+	if (catalog_txg != UINT64_MAX)
+		visible = MAX(visible, catalog_txg);
+	if (engine.journal_tail != NULL)
+		engine.journal_tail->fold_txg =
+		    MAX(engine.journal_tail->fold_txg, visible);
+}
+
+/*
+ * Cut folded segments from the chain head once the floor root's catalog
+ * lists every version they bind, so that the next catalog records the new
+ * root; free a cut segment at a later fence whose floor root's catalog
+ * already names that root, so that no importable root can reach it.
+ * Tombstones whose segments are all gone expire.  The caller holds
+ * store_lock; no root can be written meanwhile.
+ */
+static void
+engine_journal_gc(spa_t *spa, uint64_t catalog, uint64_t *segments,
+    uint64_t *bytes)
+{
+	(void) spa;
+	*segments = *bytes = 0;
+	mutex_enter(&engine.journal_lock);
+	mutex_enter(&engine.lock);
+	uint64_t size = engine.journal_bytes * engine.vd->vdev_children;
+	engine_j_segment_t *s;
+	while ((s = engine.journal_segments) != NULL &&
+	    s != engine.journal_tail && s != engine.journal_current &&
+	    s->next != NULL && s->fold_txg <= catalog) {
+		engine.journal_segments = s->next;
+		s->next = NULL;
+		s->free_after = UINT64_MAX;
+		engine_j_segment_t **link = &engine.journal_retired;
+		while (*link != NULL)
+			link = &(*link)->next;
+		*link = s;
+		engine.journal_root = engine.journal_segments->arena;
+		memcpy(engine.journal_root_epoch,
+		    engine.journal_segments->epoch,
+		    sizeof (engine.journal_root_epoch));
+		engine.revision++;
+		(void) printf("PR19262_J_RETIRE index=%llu arena=%llu "
+		    "fold=%llu catalog=%llu root=%llu\n",
+		    (u_longlong_t)s->index, (u_longlong_t)s->arena,
+		    (u_longlong_t)s->fold_txg, (u_longlong_t)catalog,
+		    (u_longlong_t)engine.journal_root);
+	}
+	engine_j_segment_t **link = &engine.journal_retired;
+	while ((s = *link) != NULL) {
+		if (s->free_after == UINT64_MAX || s->free_after > catalog) {
+			link = &s->next;
+			continue;
+		}
+		*link = s->next;
+		VERIFY(zfs_range_tree_contains(engine.journal_extents,
+		    s->arena, size));
+		zfs_range_tree_remove(engine.journal_extents, s->arena, size);
+		zfs_range_tree_verify_not_present(engine.free, s->arena, size);
+		zfs_range_tree_add(engine.free, s->arena, size);
+		engine.journal_freed_segments++;
+		engine.journal_freed_bytes += size;
+		(*segments)++;
+		*bytes += size;
+		engine.revision++;
+		(void) printf("PR19262_J_FREE index=%llu arena=%llu "
+		    "recorded=%llu catalog=%llu\n", (u_longlong_t)s->index,
+		    (u_longlong_t)s->arena, (u_longlong_t)s->free_after,
+		    (u_longlong_t)catalog);
+		kmem_free(s, sizeof (*s));
+	}
+	uint64_t live = engine.journal_segments->index;
+	for (engine_tomb_t *t = avl_first(&engine.tombstones); t != NULL;
+	    t = AVL_NEXT(&engine.tombstones, t))
+		if (t->segment < live)
+			t->expired = B_TRUE;
+	mutex_exit(&engine.lock);
+	mutex_exit(&engine.journal_lock);
 }
 
 static int
@@ -896,6 +1000,7 @@ engine_journal_bind_impl(spa_t *spa, engine_hold_t *h,
 			engine.journal_hash = hash;
 			engine.journal_tail->seq = seq;
 			engine.journal_tail->hash = hash;
+			engine_journal_fold(spa, e->catalog_txg);
 			(void) printf("PR19262_J_BIND seq=%llu v=%llu p=%llu\n",
 			    (u_longlong_t)seq, (u_longlong_t)e->v,
 			    (u_longlong_t)b->p);

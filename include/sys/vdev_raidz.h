@@ -190,6 +190,9 @@ typedef struct vdev_raidz {
 /* Private certified minimum parity of a RAIDZ vdev, kept in its config. */
 extern uint64_t pr19262_vdev_certified_parity(vdev_t *);
 extern void pr19262_vdev_certify(vdev_t *, uint64_t);
+/* Allocation size of psize at the given width and a planned parity. */
+extern uint64_t pr19262_vdev_asize_for_parity(vdev_t *, uint64_t, uint64_t,
+    uint64_t);
 #endif
 extern int vdev_raidz_attach_check(vdev_t *);
 extern boolean_t vdev_raidz_has_parity_epochs(vdev_t *);

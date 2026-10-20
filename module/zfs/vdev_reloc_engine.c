@@ -72,11 +72,16 @@ typedef struct engine_hold {
 	boolean_t write;
 } engine_hold_t;
 
-/* A released owner identity: its journal bindings are folded. */
+/*
+ * A released owner identity: its journal bindings are folded.  It is
+ * needed only while a journal segment up to the recorded index exists.
+ */
 typedef struct engine_tomb {
 	avl_node_t avl;
 	uint64_t v;
 	uint64_t incarnation;
+	uint64_t segment;
+	boolean_t expired;
 } engine_tomb_t;
 
 typedef struct engine_copy {
@@ -97,10 +102,47 @@ typedef struct engine_j_segment {
 	uint64_t phase;
 	uint64_t target;
 	uint64_t target_epoch[2];
+	/* Chain position, catalog txg folding every record, free gate. */
+	uint64_t index;
+	uint64_t fold_txg;
+	uint64_t free_after;
 } engine_j_segment_t;
 
 static int engine_journal_bind_copy(engine_copy_t *);
 static void engine_journal_test_event(spa_t *, const blkptr_t *, int);
+static void engine_journal_fold(spa_t *, uint64_t);
+static uint_t engine_store_tolerated(void);
+/* Default converter batch the standing reserve keeps free. */
+#define	ENGINE_ADMIT_BATCH (8ULL << 20)
+
+/*
+ * Replicated raw metadata: a write or a required read succeeds when at
+ * most the certified parity of members are absent or failing, since any
+ * later import must then still find one copy on a present member.  With
+ * no certificate every member is required, as before.
+ */
+typedef struct engine_quorum {
+	uint_t failures;
+	uint_t absent;
+	int error;
+} engine_quorum_t;
+
+static void
+engine_quorum_add(engine_quorum_t *q, int error)
+{
+	if (error == 0)
+		return;
+	q->failures++;
+	q->absent += error == ENXIO;
+	if (q->error == 0 || error != ENXIO)
+		q->error = error;
+}
+
+static int
+engine_quorum_result(const engine_quorum_t *q)
+{
+	return (q->failures > engine_store_tolerated() ? q->error : 0);
+}
 
 static struct {
 	kmutex_t lock;
@@ -150,6 +192,11 @@ static struct {
 	engine_j_segment_t *journal_tail;
 	engine_j_segment_t *journal_current;
 	engine_j_segment_t *journal_pending;
+	/* Segments cut from the chain head, freed once no root reaches them. */
+	engine_j_segment_t *journal_retired;
+	uint64_t journal_segment_count;
+	uint64_t journal_freed_segments;
+	uint64_t journal_freed_bytes;
 	uint64_t journal_seq;
 	uint64_t journal_serial;
 	zio_cksum_t journal_hash;
@@ -167,6 +214,17 @@ static struct {
 	uint64_t certified;
 	/* The owner-release sync task frees native V through this thread. */
 	void *release_thread;
+	/* Vector admission state and the standing conversion reserve. */
+	engine_admit_class_t admit[PR19262_ADMIT_CLASSES];
+	uint64_t admit_parity;
+	uint64_t admit_batch;
+	uint64_t admit_reserve;
+	uint64_t admit_reserve_growth;
+	uint64_t admit_reserve_legacy;
+	uint64_t admit_reserve_weak;
+	uint64_t admit_refreshed;
+	uint64_t admit_growth_peak;
+	uint64_t admit_space_rejections;
 } engine;
 
 static engine_version_t *
@@ -339,6 +397,26 @@ engine_tombstones_clear(void)
 		kmem_free(t, sizeof (*t));
 }
 
+/* Record a released journaled identity; later segments cannot bind it. */
+static void
+engine_tombstone_add(uint64_t v, uint64_t incarnation, uint64_t segment)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	engine_tomb_t *t = kmem_zalloc(sizeof (*t), KM_SLEEP);
+	t->v = v;
+	t->incarnation = incarnation;
+	t->segment = segment;
+	avl_index_t where;
+	engine_tomb_t *found = avl_find(&engine.tombstones, t, &where);
+	if (found != NULL) {
+		found->segment = MAX(found->segment, segment);
+		found->expired = B_FALSE;
+		kmem_free(t, sizeof (*t));
+		return;
+	}
+	avl_insert(&engine.tombstones, t, where);
+}
+
 static engine_owner_t *
 engine_overlap(uint64_t v, uint64_t size)
 {
@@ -438,6 +516,11 @@ pr19262_engine_start(spa_t *spa)
 	engine.total = vd->vdev_asize;
 	engine.retired_limit = 64ULL << 20;
 	engine.spa = spa;
+	engine.admit_batch = ENGINE_ADMIT_BATCH;
+	engine.admit_refreshed = UINT64_MAX;
+	/* The strongest layout present is the default conversion target. */
+	vdev_raidz_layout_for_birth(vd, spa_last_synced_txg(spa) + 1, NULL,
+	    &engine.admit_parity);
 	mutex_exit(&engine.lock);
 	spa_config_exit(spa, SCL_ALLOC | SCL_FREE, FTAG);
 }
@@ -1145,9 +1228,9 @@ pr19262_engine_dispatch(zio_t *zio)
 	return (0);
 }
 
-int
-pr19262_engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d,
-    uint64_t birth, void **handle)
+static int
+engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d, uint64_t birth,
+    void **handle, boolean_t unwritten)
 {
 	*handle = NULL;
 	if (BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp) || d < 0 ||
@@ -1173,8 +1256,13 @@ pr19262_engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d,
 		mutex_exit(&engine.lock);
 		return (ESTALE);
 	}
-	if (e->copying || !e->current->ready || e->current->writers != 0 ||
-	    e->queued_writers != 0 ||
+	/*
+	 * A block allocated ahead of its write (a log chain's tail) has
+	 * nothing to copy; it may be rebound while nothing writes it, since
+	 * writes dispatched from now on defer behind the copying flag.
+	 */
+	if (e->copying || e->current->ready == unwritten ||
+	    e->current->writers != 0 || e->queued_writers != 0 ||
 	    e->catalog_txg > spa_last_synced_txg(spa)) {
 		mutex_exit(&engine.lock);
 		return (EBUSY);
@@ -1238,7 +1326,9 @@ pr19262_engine_inspect(spa_t *spa, const blkptr_t *bp, int d,
 	    .leases = e->current->leases, .incarnation = e->incarnation,
 	    .holds = e->holds, .journal_seq = e->current->journal_seq,
 	    .aborted = e->aborted, .retired = e->retired,
-	    .journal_touched = e->journal_touched };
+	    .journal_touched = e->journal_touched,
+	    .queued_writers = e->queued_writers, .copying = e->copying,
+	    .ready = e->current->ready, .catalog_txg = e->catalog_txg };
 	for (engine_version_t *b = e->versions; b != NULL; b = b->next) {
 		info->versions++;
 		if (b != e->current)
@@ -1286,6 +1376,9 @@ engine_copy_finish(engine_copy_t *c, int error, boolean_t ready)
 		engine.retired += c->source->size;
 		engine.copied++;
 		engine.revision++;
+		/* The next catalogs list the published version. */
+		if (journal_attempted)
+			engine_journal_fold(engine.spa, e->catalog_txg);
 	} else if (journal_attempted) {
 		/* A prepared record can survive a failed publication. */
 		c->stage->retired = B_TRUE;
@@ -1341,16 +1434,22 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 	/* Flush data before publishing its J binding. */
 	if (error == 0 && engine.persistent) {
 		spa_t *spa = engine.spa;
+		engine_quorum_t q = { 0 };
 		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
-		for (uint64_t i = 0; i < engine.vd->vdev_children; i++) {
-			int e = pr19262_engine_metadata_flush(
-			    engine.vd->vdev_child[i]);
-			if (e != 0)
-				error = e;
-		}
+		for (uint64_t i = 0; i < engine.vd->vdev_children; i++)
+			engine_quorum_add(&q, pr19262_engine_metadata_flush(
+			    engine.vd->vdev_child[i]));
 		spa_config_exit(spa, SCL_ZIO, FTAG);
+		error = engine_quorum_result(&q);
 	}
 	return (engine_copy_finish(c, error, B_TRUE));
+}
+
+int
+pr19262_engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d,
+    uint64_t birth, void **handle)
+{
+	return (engine_copy_begin(spa, bp, d, birth, handle, B_FALSE));
 }
 
 /*
@@ -1363,7 +1462,7 @@ pr19262_engine_rebind_unwritten(spa_t *spa, const blkptr_t *bp, int d,
     uint64_t birth)
 {
 	void *handle;
-	int error = pr19262_engine_copy_begin(spa, bp, d, birth, &handle);
+	int error = engine_copy_begin(spa, bp, d, birth, &handle, B_TRUE);
 	if (error != 0)
 		return (error);
 	return (engine_copy_finish(handle, 0, B_FALSE));
@@ -1467,3 +1566,4 @@ static int engine_journal_recover(spa_t *);
 #include "vdev_reloc_store.c"
 #include "vdev_reloc_journal.c"
 #include "vdev_reloc_convert.c"
+#include "vdev_reloc_admit.c"

@@ -57,6 +57,9 @@
 #include <sys/zfeature.h>
 #include <sys/qat.h>
 #include <sys/zstd/zstd.h>
+#ifndef _KERNEL
+#include <sys/vdev_reloc_engine.h>
+#endif
 
 /*
  * SPA locking
@@ -2118,6 +2121,11 @@ spa_update_dspace(spa_t *spa)
 	    metaslab_class_get_dalloc(spa_dedup_class(spa)) +
 	    ddt_get_dedup_dspace(spa) +
 	    brt_get_dspace(spa);
+#ifndef _KERNEL
+	/* Physical cost the virtual accounting cannot see; AVAIL follows. */
+	uint64_t hidden = pr19262_engine_hidden_dspace(spa);
+	spa->spa_dspace -= MIN(spa->spa_dspace, hidden);
+#endif
 }
 
 /*

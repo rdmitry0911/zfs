@@ -2276,6 +2276,17 @@ pr19262_vdev_certify(vdev_t *vd, uint64_t parity)
 	vdrz->vd_pr19262_certified = parity;
 	mutex_exit(&vdrz->vd_expand_lock);
 }
+
+static uint64_t vdev_raidz_psize_to_asize_width(vdev_t *, uint64_t,
+    uint64_t, uint64_t);
+
+uint64_t
+pr19262_vdev_asize_for_parity(vdev_t *vd, uint64_t psize, uint64_t width,
+    uint64_t parity)
+{
+	ASSERT3P(vd->vdev_ops, ==, &vdev_raidz_ops);
+	return (vdev_raidz_psize_to_asize_width(vd, psize, width, parity));
+}
 #endif
 
 static int
