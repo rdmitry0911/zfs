@@ -135,9 +135,7 @@
 #include <sys/spa.h>
 #include <sys/spa_impl.h>
 #include <sys/spa_checkpoint.h>
-#ifndef _KERNEL
 #include <sys/vdev_reloc_engine.h>
-#endif
 #include <sys/vdev_impl.h>
 #include <sys/zap.h>
 #include <sys/zfeature.h>
@@ -229,12 +227,10 @@ spa_checkpoint_discard_sync_callback(space_map_entry_t *sme, void *arg)
 	 * potentially save ourselves from future headaches.
 	 */
 	boolean_t retained = B_FALSE;
-#ifndef _KERNEL
 	int error = pr19262_engine_checkpoint_discard(vd, sme->sme_offset,
 	    sme->sme_run, &retained);
 	if (error != 0)
 		return (error);
-#endif
 	if (!retained) {
 		mutex_enter(&ms->ms_lock);
 		if (zfs_range_tree_is_empty(ms->ms_freeing))
@@ -519,9 +515,7 @@ spa_checkpoint_sync(void *arg, dmu_tx_t *tx)
 	spa->spa_checkpoint_info.sci_timestamp = checkpoint.ub_timestamp;
 
 	checkpoint.ub_checkpoint_txg = checkpoint.ub_txg;
-#ifndef _KERNEL
 	pr19262_engine_checkpoint(spa, &checkpoint);
-#endif
 	VERIFY0(zap_add(spa->spa_dsl_pool->dp_meta_objset,
 	    DMU_POOL_DIRECTORY_OBJECT, DMU_POOL_ZPOOL_CHECKPOINT,
 	    sizeof (uint64_t), sizeof (uberblock_t) / sizeof (uint64_t),
@@ -609,9 +603,7 @@ spa_checkpoint_discard_sync(void *arg, dmu_tx_t *tx)
 	    DMU_POOL_ZPOOL_CHECKPOINT, tx));
 
 	spa->spa_checkpoint_txg = 0;
-#ifndef _KERNEL
 	pr19262_engine_checkpoint(spa, NULL);
-#endif
 
 	zthr_wakeup(spa->spa_checkpoint_discard_zthr);
 

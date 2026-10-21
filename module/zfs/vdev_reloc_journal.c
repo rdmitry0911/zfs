@@ -10,6 +10,7 @@
 #define	ENGINE_J_WORDS (ENGINE_STORE_PAGE / sizeof (uint64_t))
 #define	ENGINE_J_HASH (ENGINE_J_WORDS - 4)
 
+
 static uint_t engine_journal_fault_stage;
 static uint64_t engine_journal_fault_seq;
 static uint_t engine_journal_roll_fault;
@@ -28,7 +29,7 @@ engine_journal_empty(spa_t *spa, boolean_t all_io)
 		if (w[3] != 0 || w[31] != ENGINE_J_NORMAL ||
 		    memcmp(w + 20, &zero, sizeof (zero)) != 0 ||
 		    w[32] != 0 || w[33] != 0 || w[34] != 0 || w[35] != 0)
-			error = EINVAL;
+			error = ENGINE_EINVAL(8);
 	} else if (error == ECKSUM) {
 		/* No initialized header is expected before formatting. */
 		error = 0;
@@ -49,9 +50,9 @@ static void
 engine_journal_roll_stop(uint_t stage)
 {
 	if (engine_journal_roll_fault == stage) {
-		(void) printf("PR19262_J_ROLL_CRASH stage=%u\n", stage);
-		(void) fflush(NULL);
-		_exit(80 + stage);
+		pr19262_printf("PR19262_J_ROLL_CRASH stage=%u\n", stage);
+		pr19262_flush();
+		pr19262_exit(80 + stage);
 	}
 }
 
@@ -154,25 +155,25 @@ engine_journal_write(spa_t *spa, uint64_t page, abd_t *abd)
 		engine_quorum_add(&q, e);
 		if (e == 0 && i == 0 && engine_journal_roll_phase == 2 &&
 		    roll == 10) {
-			(void) printf("PR19262_J_SINGLE_FORWARD root=%llu "
+			pr19262_printf("PR19262_J_SINGLE_FORWARD root=%llu "
 			    "next=%llu seq=%llu\n",
 			    (u_longlong_t)engine.journal_arena,
 			    (u_longlong_t)w[6], (u_longlong_t)w[3]);
-			(void) fflush(NULL);
-			_exit(90);
+			pr19262_flush();
+			pr19262_exit(90);
 		}
 		if (e == 0 && i == 0 &&
 		    ((roll == 14 && engine_journal_roll_phase == 4) ||
 		    (roll == 15 && engine_journal_roll_phase == 3) ||
 		    (roll == 16 && engine_journal_roll_phase == 1))) {
-			(void) printf("PR19262_J_MEMBER_CUT stage=%u "
+			pr19262_printf("PR19262_J_MEMBER_CUT stage=%u "
 			    "root=%llu next=%llu seq=%llu\n", roll,
 			    (u_longlong_t)engine.journal_root,
 			    (u_longlong_t)(engine.journal_pending != NULL ?
 			    engine.journal_pending->arena : 0),
 			    (u_longlong_t)w[3]);
-			(void) fflush(NULL);
-			_exit(80 + roll);
+			pr19262_flush();
+			pr19262_exit(80 + roll);
 		}
 	}
 	spa_config_exit(spa, SCL_ZIO, FTAG);
@@ -259,7 +260,7 @@ engine_journal_segment(uint64_t arena, const uint64_t epoch[2],
 	if (arena % (ENGINE_STORE_PAGE * engine.vd->vdev_children) != 0 ||
 	    !engine_store_extent(arena, bytes)) {
 		mutex_exit(&engine.lock);
-		return (EINVAL);
+		return (ENGINE_EINVAL(1));
 	}
 	engine_j_segment_t *s = kmem_zalloc(sizeof (*s), KM_SLEEP);
 	s->arena = arena;
@@ -332,7 +333,7 @@ engine_journal_finish_prepare(spa_t *spa)
 		engine.journal_pending = NULL;
 		mutex_exit(&engine.lock);
 		engine_journal_select(next);
-		(void) printf("PR19262_J_FORWARD from=%llu to=%llu seq=%llu\n",
+		pr19262_printf("PR19262_J_FORWARD from=%llu to=%llu seq=%llu\n",
 		    (u_longlong_t)old->arena, (u_longlong_t)arena,
 		    (u_longlong_t)seq);
 	}
@@ -419,7 +420,7 @@ engine_journal_read(spa_t *spa, uint64_t page, uint64_t kind,
 			uint_t key = kind == ENGINE_J_HEAD ? 30 : 3;
 			if (selected[key] == w[key] && memcmp(selected, w,
 			    ENGINE_STORE_PAGE) != 0) {
-				error = EINVAL;
+				error = ENGINE_EINVAL(9);
 				break;
 			}
 			if (selected[key] >= w[key])
@@ -471,7 +472,7 @@ engine_journal_read_head(spa_t *spa, abd_t *selected, boolean_t all_io)
 	if (error == 0) {
 		uint64_t *w = abd_to_buf(selected);
 		if (conflict || w[30] == 0 || w[31] > ENGINE_J_ACTIVE)
-			error = EINVAL;
+			error = ENGINE_EINVAL(10);
 	}
 	/* A required read of every member tolerates the certified absences. */
 	int required = engine_quorum_result(&io);
@@ -483,14 +484,15 @@ engine_journal_apply(uint64_t *w)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
 	uint64_t v = w[7], size = w[8];
+	uint64_t sector = 1ULL << engine.vd->vdev_ashift;
 	if (v >= engine.total || size == 0 || size > engine.total - v ||
-	    !IS_P2ALIGNED(v, ENGINE_STORE_PAGE) ||
-	    !IS_P2ALIGNED(size, ENGINE_STORE_PAGE) || w[6] == 0 ||
+	    !IS_P2ALIGNED(v, sector) ||
+	    !IS_P2ALIGNED(size, sector) || w[6] == 0 ||
 	    w[13] <= w[14] || w[13] > engine.vd->vdev_children ||
 	    w[14] == 0 || w[14] > 3 || w[17] > 1 || w[15] == 0 ||
 	    w[29] == 0 || w[29] > w[15] || w[27] <= w[28] ||
 	    w[27] > engine.vd->vdev_children || w[28] == 0 || w[28] > 3)
-		return (EINVAL);
+		return (ENGINE_EINVAL(2));
 	/* A released owner's bindings are folded into the catalog. */
 	if (engine_tombstoned(v, w[6]))
 		return (0);
@@ -499,7 +501,7 @@ engine_journal_apply(uint64_t *w)
 		boolean_t legacy = zfs_range_tree_contains(engine.legacy,
 		    v, size);
 		if (legacy && (w[9] != 0 || w[24] != v || w[25] != size))
-			return (EINVAL);
+			return (ENGINE_EINVAL(3));
 		e = kmem_zalloc(sizeof (*e), KM_SLEEP);
 		e->v = v; e->size = size; e->incarnation = w[6];
 		e->allocation_txg = w[9]; e->created = w[16];
@@ -512,11 +514,11 @@ engine_journal_apply(uint64_t *w)
 			    w[26], B_TRUE);
 			old->width = w[27]; old->parity = w[28];
 			old->generation = w[29];
-			e->current = old;
+			e->cur = old;
 		}
 	} else if (e->incarnation != w[6] || e->size != size ||
 	    e->allocation_txg != w[9]) {
-		return (EINVAL);
+		return (ENGINE_EINVAL(4));
 	}
 	e->journal_touched = B_TRUE;
 	engine.next_incarnation = MAX(engine.next_incarnation, w[6]);
@@ -525,44 +527,44 @@ engine_journal_apply(uint64_t *w)
 	 * A binding older than the catalog's current one is already folded
 	 * into M; its backing may have been fenced, reclaimed and reused.
 	 */
-	if (e->current != NULL && w[15] < e->current->generation)
+	if (e->cur != NULL && w[15] < e->cur->generation)
 		return (0);
 	for (engine_version_t *b = e->versions; b != NULL; b = b->next) {
 		if (b->generation != w[15])
 			continue;
 		if (b->p != w[10] || b->size != w[11] || b->birth != w[12] ||
 		    b->width != w[13] || b->parity != w[14])
-			return (EINVAL);
+			return (ENGINE_EINVAL(5));
 		b->journal_seq = w[3];
 		b->ready |= w[17];
-		if (b->generation > e->current->generation) {
+		if (b->generation > e->cur->generation) {
 			/* M may already quarantine a failed publication. */
 			if (!b->retired)
-				return (EINVAL);
+				return (ENGINE_EINVAL(6));
 			b->retired = B_FALSE;
 			engine.retired -= b->size;
-			e->current->retired = B_TRUE;
+			e->cur->retired = B_TRUE;
 			if (!e->retired)
-				engine.retired += e->current->size;
-			e->current = b;
+				engine.retired += e->cur->size;
+			e->cur = b;
 			if (e->retired)
 				engine.retired += b->size;
 		}
 		return (0);
 	}
 	if (!engine_store_extent(w[10], w[11]))
-		return (EINVAL);
+		return (ENGINE_EINVAL(7));
 	engine_version_t *b = engine_version_new(e, w[10], w[11], w[12], w[17]);
 	b->width = w[13]; b->parity = w[14]; b->generation = w[15];
 	b->journal_seq = w[3];
 	zfs_range_tree_remove(engine.free, b->p, b->size);
-	if (e->current == NULL || b->generation > e->current->generation) {
-		if (e->current != NULL) {
-			e->current->retired = B_TRUE;
+	if (e->cur == NULL || b->generation > e->cur->generation) {
+		if (e->cur != NULL) {
+			e->cur->retired = B_TRUE;
 			if (!e->retired)
-				engine.retired += e->current->size;
+				engine.retired += e->cur->size;
 		}
-		e->current = b;
+		e->cur = b;
 		if (e->retired)
 			engine.retired += b->size;
 	} else {
@@ -597,7 +599,7 @@ engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 		error = ECKSUM;
 	if (phase == ENGINE_J_NORMAL &&
 	    (target != 0 || bytes != 0 || epoch[0] != 0 || epoch[1] != 0))
-		error = EINVAL;
+		error = ENGINE_EINVAL(11);
 	if (phase != ENGINE_J_NORMAL) {
 		uint64_t size = bytes * engine.vd->vdev_children;
 		uint64_t stripe = ENGINE_STORE_PAGE * engine.vd->vdev_children;
@@ -611,7 +613,7 @@ engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 		    engine.arena < target + size) ||
 		    zfs_range_tree_find_in(engine.journal_extents,
 		    target, size, &found, &span))
-			error = EINVAL;
+			error = ENGINE_EINVAL(12);
 	}
 	uint64_t last = 0;
 	for (uint64_t seq = 1; error == 0 && seq <= capacity; seq++) {
@@ -624,7 +626,7 @@ engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 		}
 		uint64_t *w = abd_to_buf(page);
 		if (w[1] != ENGINE_J_BIND && w[1] != ENGINE_J_FORWARD) {
-			error = EINVAL;
+			error = ENGINE_EINVAL(13);
 			break;
 		}
 		if (w[1] == ENGINE_J_FORWARD && seq > head &&
@@ -642,7 +644,7 @@ engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 			    w[6] != target || w[7] != bytes ||
 			    w[8] != epoch[0] || w[9] != epoch[1] ||
 			    (phase == ENGINE_J_ACTIVE && seq != head)) {
-				error = EINVAL;
+				error = ENGINE_EINVAL(14);
 				break;
 			}
 			error = engine_journal_segment(target, epoch,
@@ -652,7 +654,7 @@ engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 			break;
 		}
 		if (seq == capacity) {
-			error = EINVAL;
+			error = ENGINE_EINVAL(15);
 			break;
 		}
 		mutex_enter(&engine.lock);
@@ -686,7 +688,7 @@ engine_journal_recover_segment(spa_t *spa, engine_j_segment_t **next)
 		engine.journal_seq = last;
 		engine.journal_hash = previous;
 		mutex_exit(&engine.lock);
-		(void) printf("PR19262_J_RECOVER head=%llu prefix=%llu\n",
+		pr19262_printf("PR19262_J_RECOVER head=%llu prefix=%llu\n",
 		    (u_longlong_t)head, (u_longlong_t)last);
 	}
 	abd_free(page);
@@ -777,7 +779,7 @@ engine_journal_gc(spa_t *spa, uint64_t catalog, uint64_t *segments,
 		    engine.journal_segments->epoch,
 		    sizeof (engine.journal_root_epoch));
 		engine.revision++;
-		(void) printf("PR19262_J_RETIRE index=%llu arena=%llu "
+		pr19262_printf("PR19262_J_RETIRE index=%llu arena=%llu "
 		    "fold=%llu catalog=%llu root=%llu\n",
 		    (u_longlong_t)s->index, (u_longlong_t)s->arena,
 		    (u_longlong_t)s->fold_txg, (u_longlong_t)catalog,
@@ -800,7 +802,7 @@ engine_journal_gc(spa_t *spa, uint64_t catalog, uint64_t *segments,
 		(*segments)++;
 		*bytes += size;
 		engine.revision++;
-		(void) printf("PR19262_J_FREE index=%llu arena=%llu "
+		pr19262_printf("PR19262_J_FREE index=%llu arena=%llu "
 		    "recorded=%llu catalog=%llu\n", (u_longlong_t)s->index,
 		    (u_longlong_t)s->arena, (u_longlong_t)s->free_after,
 		    (u_longlong_t)catalog);
@@ -931,7 +933,7 @@ engine_journal_bind_impl(spa_t *spa, engine_hold_t *h,
 			mutex_exit(&engine.lock);
 			break;
 		}
-		engine_version_t *b = staging != NULL ? staging : e->current;
+		engine_version_t *b = staging != NULL ? staging : e->cur;
 		ASSERT(staging == NULL || (h->count == 1 && e->copying));
 		if (b->journal_seq != 0) {
 			mutex_exit(&engine.lock);
@@ -977,10 +979,10 @@ engine_journal_bind_impl(spa_t *spa, engine_hold_t *h,
 		abd_free(page);
 		if (error == 0 && seq == engine_journal_fault_seq &&
 		    engine_journal_fault_stage == 3) {
-			(void) printf("PR19262_J_CRASH_AFTER_BIND seq=%llu\n",
+			pr19262_printf("PR19262_J_CRASH_AFTER_BIND seq=%llu\n",
 			    (u_longlong_t)seq);
-			(void) fflush(NULL);
-			_exit(78);
+			pr19262_flush();
+			pr19262_exit(78);
 		}
 		if (error == 0) {
 			error = engine_journal_head(spa, seq, &hash,
@@ -988,10 +990,10 @@ engine_journal_bind_impl(spa_t *spa, engine_hold_t *h,
 		}
 		if (error == 0 && seq == engine_journal_fault_seq &&
 		    engine_journal_fault_stage == 6) {
-			(void) printf("PR19262_J_CRASH_AFTER_HEAD seq=%llu\n",
+			pr19262_printf("PR19262_J_CRASH_AFTER_HEAD seq=%llu\n",
 			    (u_longlong_t)seq);
-			(void) fflush(NULL);
-			_exit(79);
+			pr19262_flush();
+			pr19262_exit(79);
 		}
 		mutex_enter(&engine.lock);
 		b->leases--;
@@ -1001,9 +1003,11 @@ engine_journal_bind_impl(spa_t *spa, engine_hold_t *h,
 			engine.journal_tail->seq = seq;
 			engine.journal_tail->hash = hash;
 			engine_journal_fold(spa, e->catalog_txg);
-			(void) printf("PR19262_J_BIND seq=%llu v=%llu p=%llu\n",
-			    (u_longlong_t)seq, (u_longlong_t)e->v,
-			    (u_longlong_t)b->p);
+			pr19262_printf("PR19262_J_BIND seq=%llu v=%llu p=%llu "
+			    "arena=%llu\n", (u_longlong_t)seq,
+			    (u_longlong_t)e->v,
+			    (u_longlong_t)b->p,
+			    (u_longlong_t)engine.journal_arena);
 		}
 		mutex_exit(&engine.lock);
 	}
@@ -1037,7 +1041,9 @@ pr19262_engine_journal_bind(spa_t *spa, const blkptr_t *bp)
 		return (0);
 	engine_hold_t *h = pr19262_engine_hold(spa, bp, NULL, B_FALSE, B_FALSE);
 	engine_journal_test_event(spa, bp, 2);
-	int error = engine_journal_bind_hold(spa, h);
+	/* A block on native vdevs only (a separate log) needs no binding. */
+	int error = h == NULL && pr19262_engine_bp_foreign(spa, bp) ? 0 :
+	    engine_journal_bind_hold(spa, h);
 	pr19262_engine_rele(h);
 	return (error);
 }
@@ -1064,7 +1070,7 @@ engine_journal_collect(spa_t *spa, const blkptr_t *bp, void *arg)
 	engine_hold_t *h = pr19262_engine_hold(spa, bp, job->hold,
 	    B_TRUE, B_TRUE);
 	if (h == NULL)
-		return (ENOENT);
+		return (pr19262_engine_bp_foreign(spa, bp) ? 0 : ENOENT);
 	if (h->error != 0) {
 		int error = h->error;
 		pr19262_engine_rele(h);
@@ -1092,11 +1098,15 @@ static void
 engine_journal_worker(void *arg)
 {
 	engine_j_job_t *job = arg;
-	int error = job->hold == NULL ? ENOENT : job->hold->error;
-	if (error == 0 && BP_IS_GANG(&job->bp))
+	/* A log block on a native vdev (separate log) has nothing to bind. */
+	boolean_t foreign = job->hold == NULL &&
+	    pr19262_engine_bp_foreign(job->spa, &job->bp);
+	int error = foreign ? 0 :
+	    job->hold == NULL ? ENOENT : job->hold->error;
+	if (error == 0 && !foreign && BP_IS_GANG(&job->bp))
 		error = pr19262_zio_walk_gang(job->spa, &job->bp, job->hold,
 		    engine_journal_collect, job);
-	if (error == 0)
+	if (error == 0 && !foreign)
 		error = engine_journal_bind_hold(job->spa, job->hold);
 	uint64_t dependencies = 0;
 	while (job->deps != NULL) {
@@ -1109,7 +1119,7 @@ engine_journal_worker(void *arg)
 		dependencies++;
 	}
 	if (BP_IS_GANG(&job->bp))
-		(void) printf("PR19262_J_GANG dependencies=%llu error=%d\n",
+		pr19262_printf("PR19262_J_GANG dependencies=%llu error=%d\n",
 		    (u_longlong_t)dependencies, error);
 	job->gate->io_error = error;
 	pr19262_engine_rele(job->hold);
@@ -1149,7 +1159,7 @@ pr19262_engine_journal_claim(spa_t *spa, uint64_t txg)
 		mutex_exit(&engine.lock);
 		return (EOVERFLOW);
 	}
-	engine_owner_t **pending = kmem_alloc(capacity * sizeof (*pending),
+	engine_owner_t **pending = pr19262_alloc(capacity * sizeof (*pending),
 	    KM_SLEEP);
 	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
 	    e = AVL_NEXT(&engine.owners, e)) {
@@ -1159,9 +1169,9 @@ pr19262_engine_journal_claim(spa_t *spa, uint64_t txg)
 		pending[count++] = e;
 	}
 	mutex_exit(&engine.lock);
-	boolean_t trace = getenv("PR19262_J_CLAIM_TRACE") != NULL;
+	boolean_t trace = pr19262_env("PR19262_J_CLAIM_TRACE") != NULL;
 	if (trace)
-		(void) printf("PR19262_J_CLAIM_BEGIN owners=%llu txg=%llu "
+		pr19262_printf("PR19262_J_CLAIM_BEGIN owners=%llu txg=%llu "
 		    "sync_on=%d\n", (u_longlong_t)count, (u_longlong_t)txg,
 		    spa->spa_sync_on);
 	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
@@ -1188,7 +1198,8 @@ pr19262_engine_journal_claim(spa_t *spa, uint64_t txg)
 		spa->spa_claim_max_txg = MAX(spa->spa_claim_max_txg,
 		    e->allocation_txg);
 		if (trace)
-			(void) printf("PR19262_J_CLAIM_NATIVE v=%llu size=%llu "
+			pr19262_printf("PR19262_J_CLAIM_NATIVE v=%llu "
+			    "size=%llu "
 			    "txg=%llu native_free=0\n", (u_longlong_t)e->v,
 			    (u_longlong_t)e->size, (u_longlong_t)txg);
 	}
@@ -1210,7 +1221,7 @@ pr19262_engine_journal_claim(spa_t *spa, uint64_t txg)
 	mutex_exit(&engine.lock);
 	kmem_free(pending, capacity * sizeof (*pending));
 	if (trace)
-		(void) printf("PR19262_J_CLAIM_END owners=%llu error=%d "
+		pr19262_printf("PR19262_J_CLAIM_END owners=%llu error=%d "
 		    "sync_on=%d\n", (u_longlong_t)count, error,
 		    spa->spa_sync_on);
 	return (error);

@@ -23,10 +23,8 @@
 #include <sys/dmu_tx.h>
 #include <sys/space_map.h>
 #include <sys/metaslab_impl.h>
-#ifndef _KERNEL
 #include <sys/vdev_reloc_probe.h>
 #include <sys/vdev_reloc_engine.h>
-#endif
 #include <sys/vdev_impl.h>
 #include <sys/vdev_draid.h>
 #include <sys/zio.h>
@@ -4926,7 +4924,6 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t max_size,
 
 	*engine_blocked = B_FALSE;
 	*alloc_error = 0;
-#ifndef _KERNEL
 	pr19262_engine_alloc_result_t result = pr19262_engine_alloc(
 	    msp->ms_group->mg_vd->vdev_spa, msp->ms_group->mg_vd, rt,
 	    msp->ms_start, size, max_size, txg, &start, actual_size);
@@ -4938,7 +4935,6 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t max_size,
 		*actual_size = 0;
 		start = -1ULL;
 	} else if (result == PR19262_ALLOC_INACTIVE)
-#endif
 		start = mc->mc_ops->msop_alloc(msp, size, max_size, txg,
 		    actual_size);
 	if (start != -1ULL) {
@@ -5096,10 +5092,8 @@ metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
 	uint8_t *excluded = NULL;
 	boolean_t engine_blocked_group = B_FALSE;
 	*alloc_error = 0;
-#ifndef _KERNEL
 	if (pr19262_engine_active(mg->mg_vd->vdev_spa))
 		excluded = kmem_zalloc(mg->mg_vd->vdev_ms_count, KM_SLEEP);
-#endif
 
 	uint64_t activation_weight = METASLAB_WEIGHT_PRIMARY;
 	for (int i = 0; i < d; i++) {
@@ -5481,10 +5475,8 @@ metaslab_alloc_dva_range(spa_t *spa, metaslab_class_t *mc, uint64_t psize,
 	boolean_t unhealthy = B_FALSE;
 
 	ASSERT(!DVA_IS_VALID(&dva[d]));
-#ifndef _KERNEL
 	if (pr19262_tx_fail_dva(spa, d))
 		return (SET_ERROR(ENOSPC));
-#endif
 
 	/*
 	 * For testing, make some blocks above a certain size be gang blocks.
@@ -5587,10 +5579,8 @@ top:
 			DVA_SET_GANG(&dva[d],
 			    ((flags & METASLAB_GANG_HEADER) ? 1 : 0));
 			DVA_SET_ASIZE(&dva[d], asize);
-#ifndef _KERNEL
 			/* V/P was reserved before native bookkeeping. */
 			pr19262_tx_allocated(spa, mc, vd, offset, asize, txg);
-#endif
 			return (0);
 		}
 next:
@@ -5643,10 +5633,8 @@ metaslab_free_concrete(vdev_t *vd, uint64_t offset, uint64_t asize,
 	ASSERT(vdev_is_concrete(vd));
 	ASSERT3U(spa_config_held(spa, SCL_ALL, RW_READER), !=, 0);
 	VERIFY3U(m, <, vd->vdev_ms_count);
-#ifndef _KERNEL
 	if (pr19262_engine_retire(vd, offset, asize, checkpoint))
 		return;
-#endif
 
 	msp = vd->vdev_ms[m];
 
@@ -5915,7 +5903,6 @@ metaslab_unalloc_dva_impl(spa_t *spa, const dva_t *dva, uint64_t txg,
 	msp = vd->vdev_ms[offset >> vd->vdev_ms_shift];
 
 	mutex_enter(&msp->ms_lock);
-#ifndef _KERNEL
 	/*
 	 * Mark the exact allocation aborted before publishing native-free V.
 	 * Outstanding holds/leases retain its owner as a picker exclusion.
@@ -5927,7 +5914,6 @@ metaslab_unalloc_dva_impl(spa_t *spa, const dva_t *dva, uint64_t txg,
 		}
 		pr19262_tx_unallocated(spa, vd, offset, size, txg);
 	}
-#endif
 	zfs_range_tree_remove(msp->ms_allocating[txg & TXG_MASK],
 	    offset, size);
 	msp->ms_allocating_total -= size;
@@ -6151,11 +6137,9 @@ metaslab_claim_dva(spa_t *spa, const dva_t *dva, uint64_t birth, uint64_t txg)
 	if (DVA_GET_GANG(dva))
 		size = vdev_gang_header_asize(vd, birth);
 
-#ifndef _KERNEL
 	if (txg != 0 && pr19262_engine_journal_claimed(spa, vd,
 	    offset, size, birth, txg))
 		return (0);
-#endif
 	return (metaslab_claim_impl(vd, offset, size, txg));
 }
 
@@ -6324,7 +6308,6 @@ metaslab_claim(spa_t *spa, const blkptr_t *bp, uint64_t txg)
 		 * First do a dry run to make sure all DVAs are claimable,
 		 * so we don't have to unwind from partial failures below.
 		 */
-#ifndef _KERNEL
 		if (pr19262_engine_persistent(spa)) {
 			/* J reserved some V extents before ZIL traversal. */
 			spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
@@ -6343,7 +6326,6 @@ metaslab_claim(spa_t *spa, const blkptr_t *bp, uint64_t txg)
 			}
 			spa_config_exit(spa, SCL_ALLOC, FTAG);
 		} else
-#endif
 		{
 			error = metaslab_claim(spa, bp, 0);
 		}
@@ -6702,7 +6684,5 @@ ZFS_MODULE_PARAM(zfs_metaslab, metaslab_, trace_max_entries, U64, ZMOD_RW,
 	"Maximum entries for metaslab allocation tracing");
 #endif
 
-#ifndef _KERNEL
 #include "vdev_reloc_space.c"
 #include "vdev_reloc_engine.c"
-#endif

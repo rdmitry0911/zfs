@@ -936,6 +936,10 @@ tests = ['redacted_compressed', 'redacted_contents', 'redacted_deleted',
     'redacted_size', 'redacted_volume']
 tags = ['functional', 'redacted_send']
 
+[tests/functional/pr19262]
+tests = ['pr19262_online_pos', 'pr19262_degraded_pos']
+tags = ['functional', 'pr19262']
+
 [tests/functional/raidz]
 tests = ['raidz_001_neg', 'raidz_002_pos', 'raidz_dedup_overrun',
     'raidz_expand_001_pos',

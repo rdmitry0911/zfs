@@ -6,6 +6,7 @@
  * Recovery-floor arguments below are supplied assumptions, not disk proofs.
  */
 #include <sys/vdev_reloc_probe.h>
+#include <sys/vdev_reloc_engine.h>
 
 #define	PROBE_ENTRIES	64
 #define	PROBE_BACKINGS	4
@@ -26,7 +27,7 @@ typedef struct probe_entry {
 	boolean_t live;
 	boolean_t copying;
 	boolean_t fresh;
-	uint_t current;
+	uint_t cur;
 	uint_t count;
 	probe_backing_t backing[PROBE_BACKINGS];
 	pr19262_backing_desc_t prepared;
@@ -41,15 +42,17 @@ typedef struct probe_handle {
 static kmutex_t probe_lock;
 static probe_entry_t probe_entries[PROBE_ENTRIES];
 static uint_t probe_count;
+#ifndef _KERNEL
 static boolean_t probe_capture_done;
+#endif
 static boolean_t probe_block_new_holds;
 
 void
 pr19262_reloc_init(void)
 {
 	mutex_init(&probe_lock, NULL, MUTEX_DEFAULT, NULL);
-	const char *p = getenv("PR19262_PROBE_MAP");
-	if (getenv("PR19262_LIFETIME") == NULL || p == NULL)
+	const char *p = pr19262_env("PR19262_PROBE_MAP");
+	if (pr19262_env("PR19262_LIFETIME") == NULL || p == NULL)
 		return;
 	while (*p != '\0') {
 		u_longlong_t src, birth, dst, newbirth, oldsize, newsize;
@@ -114,7 +117,8 @@ pr19262_reloc_hold(spa_t *spa, const blkptr_t *bp)
 		h->entry = e;
 		h->incarnation = e->incarnation;
 		e->handles++;
-		const char *capture = getenv("PR19262_CAPTURE_BP");
+#ifndef _KERNEL
+		const char *capture = pr19262_env("PR19262_CAPTURE_BP");
 		if (capture != NULL && !probe_capture_done) {
 			FILE *f = fopen(capture, "wb");
 			VERIFY3P(f, !=, NULL);
@@ -122,6 +126,7 @@ pr19262_reloc_hold(spa_t *spa, const blkptr_t *bp)
 			VERIFY0(fclose(f));
 			probe_capture_done = B_TRUE;
 		}
+#endif
 		break;
 	}
 	mutex_exit(&probe_lock);
@@ -171,7 +176,7 @@ pr19262_reloc_fresh_write(zio_t *zio)
 	probe_handle_t *h = zio->io_logical != NULL ?
 	    zio->io_logical->io_pr19262_hold : NULL;
 	return (h != NULL && h->entry->fresh &&
-	    getenv("PR19262_SPACE_TEST") != NULL);
+	    pr19262_env("PR19262_SPACE_TEST") != NULL);
 }
 
 int
@@ -190,7 +195,7 @@ pr19262_reloc_resolve(zio_t *zio, pr19262_backing_desc_t *desc)
 		return (ESTALE);
 	}
 	if (h->leased == NULL) {
-		h->leased = &e->backing[e->current];
+		h->leased = &e->backing[e->cur];
 		VERIFY(!h->leased->reclaimed);
 		h->leased->readers++;
 	}
@@ -199,6 +204,8 @@ pr19262_reloc_resolve(zio_t *zio, pr19262_backing_desc_t *desc)
 	return (0);
 }
 
+#ifndef _KERNEL
+/* The rest of this file is the userspace feasibility harness. */
 static int
 probe_copy_begin(probe_entry_t *e)
 {
@@ -242,8 +249,8 @@ probe_publish(probe_entry_t *e, pr19262_backing_desc_t desc,
 	else if (e->count == PROBE_BACKINGS)
 		error = ENOSPC;
 	else {
-		e->current = e->count++;
-		e->backing[e->current].desc = desc;
+		e->cur = e->count++;
+		e->backing[e->cur].desc = desc;
 		e->copying = B_FALSE;
 	}
 	mutex_exit(&probe_lock);
@@ -255,7 +262,7 @@ probe_reclaim(probe_entry_t *e, uint_t index, boolean_t recovery_floor)
 {
 	int error = 0;
 	mutex_enter(&probe_lock);
-	if (index >= e->count || (e->live && index == e->current) ||
+	if (index >= e->count || (e->live && index == e->cur) ||
 	    e->backing[index].reclaimed)
 		error = EINVAL;
 	else if (!recovery_floor)
@@ -283,7 +290,7 @@ probe_reuse(probe_entry_t *e)
 			e->incarnation++;
 			e->live = B_TRUE;
 			e->count = 1;
-			e->current = 0;
+			e->cur = 0;
 			e->backing[0] = (probe_backing_t) {
 				.desc = e->prepared };
 		}
@@ -297,7 +304,7 @@ static void
 probe_gate(const char *name)
 {
 	char path[1024];
-	const char *dir = getenv("PR19262_LIFETIME_GATES");
+	const char *dir = pr19262_env("PR19262_LIFETIME_GATES");
 	VERIFY3P(dir, !=, NULL);
 	(void) snprintf(path, sizeof (path), "%s/%s.ready", dir, name);
 	FILE *f = fopen(path, "w");
@@ -334,7 +341,7 @@ probe_save_abd(abd_t *abd, uint64_t size, const char *path)
 static int
 probe_space_test(spa_t *spa, const char *output, const blkptr_t *bp)
 {
-	const char *guid = getenv("PR19262_SPACE_RW_GUID");
+	const char *guid = pr19262_env("PR19262_SPACE_RW_GUID");
 	VERIFY3P(guid, !=, NULL);
 	VERIFY3U(strtoull(guid, NULL, 10), ==, spa_guid(spa));
 	VERIFY(!spa_writeable(spa));
@@ -418,7 +425,7 @@ probe_space_test(spa_t *spa, const char *output, const blkptr_t *bp)
 		pair.physical_offset, n->birth, asize };
 	mutex_exit(&probe_lock);
 	void *buf = kmem_alloc(size, KM_SLEEP);
-	FILE *f = fopen(getenv("PR19262_SPACE_INPUT"), "rb");
+	FILE *f = fopen(pr19262_env("PR19262_SPACE_INPUT"), "rb");
 	VERIFY3P(f, !=, NULL);
 	VERIFY3U(fread(buf, size, 1, f), ==, 1);
 	VERIFY0(fclose(f));
@@ -465,7 +472,7 @@ probe_space_test(spa_t *spa, const char *output, const blkptr_t *bp)
 	VERIFY3S(metaslab_claim_impl(vd, e->offset,
 	    e->backing[0].desc.asize, 0), ==, ENOENT);
 	spa_config_exit(spa, SCL_ALL, FTAG);
-	(void) fprintf(stderr, "PR19262_SPACE_PASS %llu %llu %llu "
+	pr19262_printf("PR19262_SPACE_PASS %llu %llu %llu "
 	    "%llu %llu %llu\n", (u_longlong_t)v0, (u_longlong_t)p0,
 	    (u_longlong_t)pair.virtual_offset,
 	    (u_longlong_t)pair.physical_offset,
@@ -505,7 +512,7 @@ probe_fixture_write(spa_t *spa, vdev_t *vd, uint64_t txg, blkptr_t *bp,
 static int
 probe_copy_test(spa_t *spa, const char *output, const blkptr_t *bp)
 {
-	const char *guid = getenv("PR19262_SPACE_RW_GUID");
+	const char *guid = pr19262_env("PR19262_SPACE_RW_GUID");
 	VERIFY3P(guid, !=, NULL);
 	VERIFY3U(strtoull(guid, NULL, 10), ==, spa_guid(spa));
 	VERIFY(!spa_writeable(spa));
@@ -590,7 +597,7 @@ probe_copy_test(spa_t *spa, const char *output, const blkptr_t *bp)
 		pair.physical_offset, birth, loan_asize };
 	mutex_exit(&probe_lock);
 	void *buf = kmem_alloc(loan_size, KM_SLEEP);
-	FILE *f = fopen(getenv("PR19262_SPACE_INPUT"), "rb");
+	FILE *f = fopen(pr19262_env("PR19262_SPACE_INPUT"), "rb");
 	VERIFY3P(f, !=, NULL);
 	VERIFY3U(fread(buf, loan_size, 1, f), ==, 1);
 	VERIFY0(fclose(f));
@@ -632,7 +639,7 @@ probe_copy_test(spa_t *spa, const char *output, const blkptr_t *bp)
 	mutex_enter(&probe_lock);
 	e->live = B_FALSE;
 	mutex_exit(&probe_lock);
-	VERIFY0(probe_reclaim(e, e->current, B_TRUE));
+	VERIFY0(probe_reclaim(e, e->cur, B_TRUE));
 	VERIFY0(pr19262_space_stage_free(space, &stage, B_TRUE));
 	VERIFY3S(pr19262_space_stage_free(space, &stage, B_TRUE), ==, EINVAL);
 	VERIFY3U(pr19262_space_available(space, B_FALSE), ==, v0);
@@ -640,7 +647,7 @@ probe_copy_test(spa_t *spa, const char *output, const blkptr_t *bp)
 	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
 	VERIFY3S(metaslab_claim_impl(vd, e->offset, old_asize, 0), ==, ENOENT);
 	spa_config_exit(spa, SCL_ALL, FTAG);
-	(void) fprintf(stderr, "PR19262_COPY_PASS %llu %llu %llu "
+	pr19262_printf("PR19262_COPY_PASS %llu %llu %llu "
 	    "%llu %llu %llu %llu\n", (u_longlong_t)v0, (u_longlong_t)p0,
 	    (u_longlong_t)e->offset, (u_longlong_t)stage.offset,
 	    (u_longlong_t)old_asize, (u_longlong_t)target_size,
@@ -657,16 +664,16 @@ probe_copy_test(spa_t *spa, const char *output, const blkptr_t *bp)
 int
 pr19262_reloc_test(spa_t *spa, const char *output)
 {
-	const char *file = getenv("PR19262_LIFETIME_BP");
+	const char *file = pr19262_env("PR19262_LIFETIME_BP");
 	VERIFY3P(file, !=, NULL);
 	FILE *f = fopen(file, "rb");
 	VERIFY3P(f, !=, NULL);
 	blkptr_t bp;
 	VERIFY3U(fread(&bp, sizeof (bp), 1, f), ==, 1);
 	VERIFY0(fclose(f));
-	if (getenv("PR19262_COPY_TEST") != NULL)
+	if (pr19262_env("PR19262_COPY_TEST") != NULL)
 		return (probe_copy_test(spa, output, &bp));
-	if (getenv("PR19262_SPACE_TEST") != NULL)
+	if (pr19262_env("PR19262_SPACE_TEST") != NULL)
 		return (probe_space_test(spa, output, &bp));
 	uint64_t size = BP_GET_PSIZE(&bp);
 	abd_t *abd = abd_alloc_for_io(size, B_FALSE);
@@ -677,7 +684,7 @@ pr19262_reloc_test(spa_t *spa, const char *output)
 	VERIFY3U(e->handles, ==, 1);
 	VERIFY3P(h->leased, ==, NULL);
 	void *scan_queue = NULL;
-	boolean_t scan_test = getenv("PR19262_SCAN_LIFETIME_TEST") != NULL;
+	boolean_t scan_test = pr19262_env("PR19262_SCAN_LIFETIME_TEST") != NULL;
 	if (scan_test) {
 		scan_queue = pr19262_scan_probe_create(spa, &bp);
 		pr19262_scan_probe_insert(scan_queue, &bp);
@@ -732,7 +739,7 @@ pr19262_reloc_test(spa_t *spa, const char *output)
 	pr19262_backing_desc_t leased;
 	VERIFY0(pr19262_reloc_resolve(queued, &leased));
 	VERIFY3U(leased.offset, ==, e->prepared.offset);
-	const char *next = getenv("PR19262_LIFETIME_NEXT");
+	const char *next = pr19262_env("PR19262_LIFETIME_NEXT");
 	u_longlong_t off, birth, asize;
 	VERIFY3P(next, !=, NULL);
 	VERIFY3S(sscanf(next, "%llx,%llu,%llx", &off, &birth,
@@ -767,12 +774,13 @@ pr19262_reloc_test(spa_t *spa, const char *output)
 	VERIFY0(probe_reclaim(e, 2, B_TRUE));
 	VERIFY0(probe_reuse(e));
 	VERIFY3U(e->incarnation, ==, incarnation + 1);
-	(void) fprintf(stderr, "PR19262_LIFETIME_PASS "
+	pr19262_printf("PR19262_LIFETIME_PASS "
 	    "queued_no_P_pin leased_reclaim_blocked stale_cancelled "
 	    "incarnation_drained writer_exclusion floor_required\n");
 	if (scan_test)
-		(void) fprintf(stderr, "PR19262_SCAN_LIFETIME_PASS "
+		pr19262_printf("PR19262_SCAN_LIFETIME_PASS "
 		    "duplicate_cancel_destroy transfer_dispatch final_free\n");
 	abd_free(abd);
 	return (0);
 }
+#endif

@@ -63,9 +63,7 @@
 #include <sys/metaslab_impl.h>
 #include <sys/mmp.h>
 #include <sys/uberblock_impl.h>
-#ifndef _KERNEL
 #include <sys/vdev_reloc_engine.h>
-#endif
 #include <sys/txg.h>
 #include <sys/avl.h>
 #include <sys/bpobj.h>
@@ -2472,9 +2470,7 @@ spa_unload(spa_t *spa)
 
 	spa->spa_raidz_expand = NULL;
 	spa->spa_checkpoint_txg = 0;
-#ifndef _KERNEL
 	pr19262_engine_store_unload(spa);
-#endif
 
 	spa_config_exit(spa, SCL_ALL, spa);
 }
@@ -5015,12 +5011,10 @@ spa_ld_select_uberblock(spa_t *spa, spa_import_type_t type)
 		for (nvpair_t *nvp = nvlist_next_nvpair(spa->spa_label_features,
 		    NULL); nvp != NULL;
 		    nvp = nvlist_next_nvpair(spa->spa_label_features, nvp)) {
-#ifndef _KERNEL
 			if (pr19262_engine_store_ub(ub) &&
 			    strcmp(nvpair_name(nvp),
 			    PR19262_ENGINE_LABEL_FEATURE) == 0)
 				continue;
-#endif
 			if (!zfeature_is_supported(nvpair_name(nvp))) {
 				fnvlist_add_string(unsup_feat,
 				    nvpair_name(nvp), "");
@@ -5227,9 +5221,7 @@ spa_ld_trusted_config(spa_t *spa, spa_import_type_t type,
 	vdev_free(rvd);
 	spa->spa_root_vdev = mrvd;
 	rvd = mrvd;
-#ifndef _KERNEL
 	pr19262_engine_store_rebind(spa);
-#endif
 	spa_config_exit(spa, SCL_ALL, FTAG);
 
 	/*
@@ -5910,7 +5902,6 @@ spa_ld_verify_pool_data(spa_t *spa)
 	return (0);
 }
 
-#ifndef _KERNEL
 static int
 spa_ld_claim_reloc_blocks(spa_t *spa)
 {
@@ -5927,7 +5918,6 @@ spa_ld_claim_reloc_blocks(spa_t *spa)
 	spa->spa_claiming = claiming;
 	return (error);
 }
-#endif
 
 static int
 spa_ld_claim_log_blocks(spa_t *spa)
@@ -6020,19 +6010,13 @@ spa_ld_read_checkpoint_txg(spa_t *spa)
 	    sizeof (uberblock_t) / sizeof (uint64_t), &checkpoint);
 
 	if (error == ENOENT) {
-#ifndef _KERNEL
 		return (pr19262_engine_checkpoint_validate(spa, NULL));
-#else
-		return (0);
-#endif
 	}
 	if (error != 0)
 		return (error);
-#ifndef _KERNEL
 	error = pr19262_engine_checkpoint_validate(spa, &checkpoint);
 	if (error != 0)
 		return (error);
-#endif
 	ASSERT3U(checkpoint.ub_txg, !=, 0);
 	ASSERT3U(checkpoint.ub_checkpoint_txg, !=, 0);
 	ASSERT3U(checkpoint.ub_timestamp, !=, 0);
@@ -6121,11 +6105,9 @@ spa_ld_mos_init(spa_t *spa, spa_import_type_t type,
 	 * blkptr. This blkptr points to the latest version of the MOS and will
 	 * allow us to read its contents.
 	 */
-#ifndef _KERNEL
 	error = pr19262_engine_store_load(spa, &spa->spa_uberblock);
 	if (error != 0)
 		return (error);
-#endif
 	error = spa_ld_open_rootbp(spa);
 	if (error != 0)
 		return (error);
@@ -6159,12 +6141,10 @@ spa_ld_checkpoint_rewind(spa_t *spa)
 	ASSERT3U(checkpoint.ub_txg, <, spa->spa_uberblock.ub_txg);
 	ASSERT3U(checkpoint.ub_txg, ==, checkpoint.ub_checkpoint_txg);
 
-#ifndef _KERNEL
 	/* Preactivation checkpoints need the same durable timeline fence. */
 	if (spa_writeable(spa) && (pr19262_engine_store_ub(&checkpoint) ||
 	    pr19262_engine_persistent(spa)))
 		return (SET_ERROR(ENOTSUP));
-#endif
 
 	/*
 	 * We need to update the txg and timestamp of the checkpointed
@@ -6471,7 +6451,6 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 
 		ASSERT(spa->spa_load_state != SPA_LOAD_TRYIMPORT);
 
-#ifndef _KERNEL
 		/* Raw arena recovery needs the trusted, writeable vdev tree. */
 		error = pr19262_engine_store_recover(spa);
 		if (error != 0) {
@@ -6483,7 +6462,6 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 		error = spa_ld_claim_reloc_blocks(spa);
 		if (error != 0)
 			goto fail;
-#endif
 
 		/*
 		 * Before we do any zio_write's, complete the raidz expansion

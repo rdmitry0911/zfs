@@ -6,6 +6,13 @@
 #define	ENGINE_STORE_PAGES (ENGINE_STORE_BYTES / ENGINE_STORE_PAGE)
 #define	ENGINE_JOURNAL_BYTES (1ULL << 20)
 
+/* Refuse a root or record with a numbered reason, visible in the log. */
+#define	ENGINE_REFUSE(reason) do { \
+	pr19262_printf("PR19262_STORE_REFUSED reason=%d line=%d\n", \
+	    (reason), __LINE__); \
+	return (EINVAL); \
+} while (0)
+
 static uint64_t engine_store_crash_txg;
 static void (*engine_store_test_hook)(spa_t *, int);
 
@@ -79,8 +86,8 @@ pr19262_engine_store_enable(spa_t *spa)
 	mutex_enter(&engine.lock);
 	VERIFY3P(spa, ==, engine.spa);
 	VERIFY(!engine.persistent);
-	/* The raw arena covers whole physical rows on every child. */
-	VERIFY3U(engine.vd->vdev_ashift, ==, 12);
+	/* Raw pages are whole sectors: ashift up to the page size. */
+	VERIFY0(ENGINE_STORE_PAGE % (1ULL << engine.vd->vdev_ashift));
 	uint64_t p = UINT64_MAX;
 	zfs_range_tree_walk(engine.free, engine_store_pick, &p);
 	VERIFY3U(p, !=, UINT64_MAX);
@@ -147,7 +154,7 @@ engine_store_io_at(vdev_t *vd, uint64_t arena, uint64_t page,
 	if (!vdev_readable(vd) || (write && !vdev_writeable(vd)))
 		return (ENXIO);
 	if (offset > vd->vdev_psize || bytes > vd->vdev_psize - offset)
-		return (EINVAL);
+		ENGINE_REFUSE(1);
 	zio_flag_t flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY;
 	zio_t *zio = write ? zio_write_phys(NULL, vd, offset, bytes,
 	    abd, ZIO_CHECKSUM_OFF, NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
@@ -270,14 +277,15 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 		fnvlist_add_uint64_array(row, "V", identity, 8);
 		uint_t count = 1;
 		for (engine_version_t *b = e->versions; b != NULL; b = b->next)
-			count += b != e->current && b->retired;
-		uint64_t *versions = kmem_alloc(count * 8 * sizeof (uint64_t),
+			count += b != e->cur && b->retired;
+		uint64_t *versions = pr19262_alloc(
+		    count * 8 * sizeof (uint64_t),
 		    KM_SLEEP);
 		uint_t j = 0;
-		engine_version_t *b = e->current;
+		engine_version_t *b = e->cur;
 		for (;;) {
-			if (b == e->current || b->retired) {
-				if (b != e->current && b->retired_txg == 0)
+			if (b == e->cur || b->retired) {
+				if (b != e->cur && b->retired_txg == 0)
 					b->retired_txg = ub->ub_txg;
 				uint64_t values[] = { b->p, b->size, b->birth,
 				    b->width, b->parity, b->ready, b->retired,
@@ -286,8 +294,8 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 				j += 8;
 			}
 			/* Current first, then all other retired versions. */
-			b = b == e->current ? e->versions : b->next;
-			if (b == e->current)
+			b = b == e->cur ? e->versions : b->next;
+			if (b == e->cur)
 				b = b->next;
 			if (b == NULL)
 				break;
@@ -339,8 +347,8 @@ engine_store_sync(spa_t *spa, uberblock_t *ub)
 			mutex_exit(&engine.lock);
 			memcpy(ub->ub_pr19262, desc, sizeof (desc));
 			if (engine_store_crash_txg == ub->ub_txg) {
-				(void) fflush(NULL);
-				_exit(77);
+				pr19262_flush();
+				pr19262_exit(77);
 			}
 		}
 		return (error);
@@ -405,14 +413,14 @@ engine_store_sync(spa_t *spa, uberblock_t *ub)
 		memcpy(engine.stored_desc, desc, sizeof (desc));
 		mutex_exit(&engine.lock);
 		memcpy(ub->ub_pr19262, desc, sizeof (desc));
-		(void) printf("PR19262_STORE_SYNC txg=%llu page=%llu "
+		pr19262_printf("PR19262_STORE_SYNC txg=%llu page=%llu "
 		    "pages=%llu bytes=%llu arena=%llu\n",
 		    (u_longlong_t)ub->ub_txg,
 		    (u_longlong_t)first, (u_longlong_t)pages,
 		    (u_longlong_t)size, (u_longlong_t)engine.arena);
 		if (engine_store_crash_txg == ub->ub_txg) {
-			(void) fflush(NULL);
-			_exit(77);
+			pr19262_flush();
+			pr19262_exit(77);
 		}
 	}
 	return (error);
@@ -535,16 +543,22 @@ void
 pr19262_engine_store_rebind(spa_t *spa)
 {
 	mutex_enter(&engine.lock);
-	if (engine.spa == spa)
-		engine.vd = spa->spa_root_vdev->vdev_child[0];
+	if (engine.spa == spa) {
+		/* The config was reloaded: find the target by its guid. */
+		engine.vd = engine_target_vdev(spa, engine.vd_guid);
+		VERIFY3P(engine.vd, !=, NULL);
+		engine.foreign_normal = engine_foreign_normal(spa, engine.vd);
+	}
 	mutex_exit(&engine.lock);
 }
 
 static boolean_t
 engine_store_extent(uint64_t p, uint64_t size)
 {
-	return (size != 0 && IS_P2ALIGNED(p, ENGINE_STORE_PAGE) &&
-	    IS_P2ALIGNED(size, ENGINE_STORE_PAGE) && p < engine.total &&
+	/* Backing extents are sector-aligned; arenas are checked by callers. */
+	uint64_t sector = 1ULL << engine.vd->vdev_ashift;
+	return (size != 0 && IS_P2ALIGNED(p, sector) &&
+	    IS_P2ALIGNED(size, sector) && p < engine.total &&
 	    size <= engine.total - p &&
 	    zfs_range_tree_contains(engine.free, p, size));
 }
@@ -559,11 +573,12 @@ engine_store_validate_virtual(void)
 	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
 	    e = AVL_NEXT(&engine.owners, e)) {
 		uint64_t start, size;
-		if (!IS_P2ALIGNED(e->v, ENGINE_STORE_PAGE) ||
-		    !IS_P2ALIGNED(e->size, ENGINE_STORE_PAGE) ||
+		uint64_t sector = 1ULL << engine.vd->vdev_ashift;
+		if (!IS_P2ALIGNED(e->v, sector) ||
+		    !IS_P2ALIGNED(e->size, sector) ||
 		    zfs_range_tree_find_in(seen, e->v, e->size,
 		    &start, &size)) {
-			error = EINVAL;
+			error = ENGINE_EINVAL(102);
 			break;
 		}
 		zfs_range_tree_add(seen, e->v, e->size);
@@ -590,38 +605,39 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	    nvlist_lookup_uint64_array(nv, "legacy", &legacy, &nl) != 0 ||
 	    nvlist_lookup_nvlist_array(nv, "owners", &rows, &nr) != 0 ||
 	    nvlist_lookup_byte_array(nv, "bitmap", &bitmap, &nb) != 0)
-		return (EINVAL);
+		ENGINE_REFUSE(2);
 	if (nvlist_lookup_uint64_array(nv, "journal", &journal, &nj) != 0 ||
 	    nj != 4 || journal[1] != ENGINE_JOURNAL_BYTES ||
 	    journal[0] >= engine.total ||
 	    journal[1] * engine.vd->vdev_children >
 	    engine.total - journal[0] ||
 	    journal[0] % (engine.vd->vdev_children * ENGINE_STORE_PAGE) != 0)
-		return (EINVAL);
+		ENGINE_REFUSE(3);
 	if (nvlist_lookup_uint64_array(nv, "checkpoint", &checkpoint,
 	    &nc) != 0 ||
 	    nc != sizeof (engine.checkpoint) / sizeof (uint64_t))
-		return (EINVAL);
+		ENGINE_REFUSE(4);
 	memcpy(&engine.checkpoint, checkpoint, sizeof (engine.checkpoint));
 	if (engine.checkpoint.ub_txg != 0 &&
 	    (engine.checkpoint.ub_checkpoint_txg != engine.checkpoint.ub_txg ||
 	    engine.checkpoint.ub_txg > ub->ub_txg ||
 	    !pr19262_engine_store_ub(&engine.checkpoint)))
-		return (EINVAL);
+		ENGINE_REFUSE(5);
 	if (txg != ub->ub_pr19262[6] || pool != spa_guid(spa) ||
 	    top != engine.vd->vdev_guid || nm != 16 || ng != 6 || ns != 3 ||
 	    memcmp(mos, &ub->ub_rootbp, sizeof (blkptr_t)) != 0 ||
 	    g[0] != engine.total || g[1] != engine.vd->vdev_ms_shift ||
-	    g[2] != 12 || g[3] != engine.vd->vdev_children ||
+	    g[2] != engine.vd->vdev_ashift ||
+	    g[3] != engine.vd->vdev_children ||
 	    g[4] != engine.arena || g[5] != engine.arena_bytes ||
 	    nb != ENGINE_STORE_PAGES || nl % 2 != 0 ||
 	    nr > (engine.store_codec >= 6 ? engine_pages_row_limit() : 50000))
-		return (EINVAL);
+		ENGINE_REFUSE(6);
 	for (uint64_t i = 0; i < ENGINE_STORE_PAGES; i++)
 		if (bitmap[i] > 1 || (ub->ub_pr19262[15] == 5 &&
 		    i >= ub->ub_pr19262[4] &&
 		    i < ub->ub_pr19262[4] + ub->ub_pr19262[5] && !bitmap[i]))
-			return (EINVAL);
+			ENGINE_REFUSE(7);
 	boolean_t at_floor = engine.store_codec >= 6 &&
 	    engine_pages.floor != 0 && ub->ub_txg == engine_pages.floor;
 	uint64_t dropped = 0;
@@ -647,7 +663,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		uint64_t bytes = a->pages * ENGINE_STORE_PAGE *
 		    engine.vd->vdev_children;
 		if (!engine_store_extent(a->p, bytes))
-			return (EINVAL);
+			ENGINE_REFUSE(8);
 		zfs_range_tree_remove(engine.free, a->p, bytes);
 		zfs_range_tree_add(engine.store_extents, a->p, bytes);
 	}
@@ -660,7 +676,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	    sizeof (engine.journal_epoch));
 	uint64_t jsize = engine.journal_bytes * engine.vd->vdev_children;
 	if (!engine_store_extent(engine.journal_arena, jsize))
-		return (EINVAL);
+		ENGINE_REFUSE(9);
 	zfs_range_tree_remove(engine.free, engine.journal_arena, jsize);
 	engine.journal_extents = zfs_range_tree_create(NULL,
 	    ZFS_RANGE_SEG64, NULL, 0, 0);
@@ -671,7 +687,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	if (nvlist_lookup_uint64_array(nv, "journal-retired", &cut,
 	    &ncut) == 0) {
 		if (ncut % 5 != 0)
-			return (EINVAL);
+			ENGINE_REFUSE(10);
 		engine_j_segment_t **link = &engine.journal_retired;
 		for (uint_t i = 0; i < ncut; i += 5) {
 			if (cut[i + 1] != engine.journal_bytes ||
@@ -679,7 +695,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 			    ENGINE_STORE_PAGE) != 0 ||
 			    !engine_store_extent(cut[i], jsize) ||
 			    cut[i + 4] == UINT64_MAX || cut[i + 4] > txg)
-				return (EINVAL);
+				ENGINE_REFUSE(11);
 			zfs_range_tree_remove(engine.free, cut[i], jsize);
 			zfs_range_tree_add(engine.journal_extents, cut[i],
 			    jsize);
@@ -703,7 +719,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	    sizeof (engine.journal_epoch));
 	for (uint_t i = 0; i < nl; i += 2) {
 		if (!engine_store_extent(legacy[i], legacy[i + 1]))
-			return (EINVAL);
+			ENGINE_REFUSE(12);
 		zfs_range_tree_remove(engine.free, legacy[i], legacy[i + 1]);
 		zfs_range_tree_add(engine.legacy, legacy[i], legacy[i + 1]);
 	}
@@ -712,7 +728,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	uint_t nt;
 	if (nvlist_lookup_uint64_array(nv, "tombstones", &tombs, &nt) == 0) {
 		if (nt % 2 != 0)
-			return (EINVAL);
+			ENGINE_REFUSE(13);
 		for (uint_t i = 0; i < nt; i += 2) {
 			engine_tomb_t *t = kmem_zalloc(sizeof (*t), KM_SLEEP);
 			t->v = tombs[i];
@@ -722,7 +738,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 			avl_index_t where;
 			if (avl_find(&engine.tombstones, t, &where) != NULL) {
 				kmem_free(t, sizeof (*t));
-				return (EINVAL);
+				ENGINE_REFUSE(14);
 			}
 			avl_insert(&engine.tombstones, t, where);
 		}
@@ -731,7 +747,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	engine.unusable = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
 	    NULL, 0, 0);
 	if (engine.vd->vdev_ms_shift == 0)
-		return (EINVAL);
+		ENGINE_REFUSE(15);
 	uint64_t covered = P2ALIGN_TYPED(engine.total,
 	    1ULL << engine.vd->vdev_ms_shift, uint64_t);
 	if (covered < engine.total) {
@@ -751,7 +767,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		    v[0] >= engine.total || v[1] == 0 ||
 		    v[1] > engine.total - v[0] || engine_find(v[0]) != NULL ||
 		    v[7] > txg || v[3] > engine.next_incarnation)
-			return (EINVAL);
+			ENGINE_REFUSE(16);
 		engine_owner_t *e = kmem_zalloc(sizeof (*e), KM_SLEEP);
 		e->v = v[0]; e->size = v[1]; e->allocation_txg = v[2];
 		e->incarnation = v[3]; e->created = v[4];
@@ -767,7 +783,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 			    p[j + 4] == 0 || p[j + 4] > 3 ||
 			    p[j + 5] > 1 || p[j + 6] > 1 ||
 			    (j != 0 && p[j + 6] != 1))
-				return (EINVAL);
+				ENGINE_REFUSE(17);
 			/*
 			 * The floor root itself was fenced: every retired
 			 * version older than its current binding was returned
@@ -778,7 +794,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 				continue;
 			}
 			if (!engine_store_extent(p[j], p[j + 1]))
-				return (EINVAL);
+				ENGINE_REFUSE(18);
 			engine_version_t *b = engine_version_new(e, p[j],
 			    p[j + 1], p[j + 2], B_TRUE);
 			b->width = p[j + 3]; b->parity = p[j + 4];
@@ -787,14 +803,14 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 			if (j != 0)
 				b->retired_txg = txg;
 			if (j == 0)
-				e->current = b;
+				e->cur = b;
 			zfs_range_tree_remove(engine.free, b->p, b->size);
 			if (b->retired || (e->retired && j == 0))
 				engine.retired += b->size;
 		}
 	}
 	if (dropped != 0)
-		(void) printf("PR19262_FLOOR_DROP root=%llu catalog=%llu "
+		pr19262_printf("PR19262_FLOOR_DROP root=%llu catalog=%llu "
 		    "floor=%llu versions=%llu\n", (u_longlong_t)ub->ub_txg,
 		    (u_longlong_t)txg, (u_longlong_t)engine_pages.floor,
 		    (u_longlong_t)dropped);
@@ -819,19 +835,19 @@ engine_root_add(void *arg, const uberblock_t *ub)
 		return (0);
 	if (!pr19262_engine_store_ub(ub) || !engine_store_layout(d) ||
 	    d[1] != engine.vd->vdev_guid || d[2] != engine.arena ||
-	    d[3] != engine.arena_bytes || d[12] != 12 ||
+	    d[3] != engine.arena_bytes || d[12] != engine.vd->vdev_ashift ||
 	    d[13] != engine.vd->vdev_children || d[14] != engine.total ||
 	    d[6] == 0 ||
 	    d[6] > ub->ub_txg ||
 	    (d[6] != ub->ub_txg && (ub->ub_checkpoint_txg == 0 ||
 	    d[6] > ub->ub_checkpoint_txg)))
-		return (EINVAL);
+		ENGINE_REFUSE(19);
 	for (uint_t i = 0; i < g->count; i++) {
 		if (memcmp(g->roots[i].ub_pr19262, d,
 		    sizeof (ub->ub_pr19262)) != 0)
 			continue;
 		return (memcmp(&g->roots[i].ub_rootbp, &ub->ub_rootbp,
-		    sizeof (ub->ub_rootbp)) == 0 ? 0 : EINVAL);
+		    sizeof (ub->ub_rootbp)) == 0 ? 0 : ENGINE_EINVAL(199));
 	}
 	if (g->count == g->capacity) {
 		uint64_t wanted = g->capacity == 0 ? 64 :
@@ -842,7 +858,7 @@ engine_root_add(void *arg, const uberblock_t *ub)
 		uint_t capacity = MIN(wanted, limit);
 		if (capacity == g->capacity)
 			return (EOVERFLOW);
-		uberblock_t *roots = kmem_alloc(capacity *
+		uberblock_t *roots = pr19262_alloc(capacity *
 		    sizeof (*roots), KM_SLEEP);
 		if (g->roots != NULL) {
 			memcpy(roots, g->roots, g->count * sizeof (*roots));
@@ -893,7 +909,7 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 	    nc != sizeof (uberblock_t) / sizeof (uint64_t) || txg != d[6] ||
 	    pool != spa_guid(g->spa) || top != d[1] ||
 	    memcmp(mos, &ub->ub_rootbp, sizeof (blkptr_t)) != 0) {
-		error = EINVAL;
+		error = ENGINE_EINVAL(103);
 	} else {
 		uberblock_t pin;
 		memcpy(&pin, checkpoint, sizeof (pin));
@@ -901,7 +917,7 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 			if (uberblock_verify(&pin) != 0 || pin.ub_txg > txg ||
 			    pin.ub_checkpoint_txg != pin.ub_txg ||
 			    pin.ub_pr19262[6] >= d[6])
-				error = EINVAL;
+				error = ENGINE_EINVAL(104);
 			else
 				error = engine_root_add(g, &pin);
 		}
@@ -912,7 +928,7 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 				    engine.vd->vdev_children,
 				    d[5] * ENGINE_STORE_PAGE *
 				    engine.vd->vdev_children);
-			(void) printf("PR19262_M_PIN catalog=%llu first=%llu "
+			pr19262_printf("PR19262_M_PIN catalog=%llu first=%llu "
 			    "pages=%llu cp=%llu cp_catalog=%llu\n",
 			    (u_longlong_t)d[6],
 			    (u_longlong_t)d[4], (u_longlong_t)d[5],
@@ -986,16 +1002,18 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	if (!pr19262_engine_store_ub(ub))
 		return (0);
 	const uint64_t *d = ub->ub_pr19262;
-	vdev_t *root = spa->spa_root_vdev;
-	if (root->vdev_children != 1 || engine.spa != NULL)
+	if (engine.spa != NULL)
 		return (ENOTSUP);
-	vdev_t *vd = root->vdev_child[0];
+	/* The trailer names the translated vdev; others stay native. */
+	vdev_t *vd = engine_target_vdev(spa, d[1]);
+	if (vd == NULL)
+		return (ENOTSUP);
 	/* Older M bitmaps cannot allocate over newer still-selectable roots. */
 	if ((spa->spa_mode & SPA_MODE_WRITE) &&
 	    ub->ub_txg < spa->spa_load_latest_ub_txg)
 		return (ENOTSUP);
 	if (vd->vdev_ops != &vdev_raidz_ops || d[1] != vd->vdev_guid ||
-	    d[3] != ENGINE_STORE_BYTES || d[12] != 12 ||
+	    d[3] != ENGINE_STORE_BYTES || d[12] != vd->vdev_ashift ||
 	    d[13] != vd->vdev_children || d[14] != vd->vdev_asize ||
 	    d[6] > ub->ub_txg ||
 	    (d[6] != ub->ub_txg && (ub->ub_checkpoint_txg == 0 ||
@@ -1004,8 +1022,10 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	    d[2] >= vd->vdev_asize ||
 	    d[3] * d[13] > vd->vdev_asize - d[2] ||
 	    d[2] % (vd->vdev_children * ENGINE_STORE_PAGE) != 0)
-		return (EINVAL);
+		ENGINE_REFUSE(20);
 	engine.vd = vd;
+	engine.vd_guid = vd->vdev_guid;
+	engine.foreign_normal = engine_foreign_normal(spa, vd);
 	engine.total = vd->vdev_asize;
 	engine.arena = d[2]; engine.arena_bytes = d[3];
 	engine.store_codec = d[15];
@@ -1036,7 +1056,7 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	mutex_enter(&engine.lock);
 	/* Roots below the durable floor may reference reused backing. */
 	if (error == 0 && d[15] >= 6 && ub->ub_txg < engine_pages.floor) {
-		(void) printf("PR19262_FLOOR_REFUSED ub=%llu floor=%llu\n",
+		pr19262_printf("PR19262_FLOOR_REFUSED ub=%llu floor=%llu\n",
 		    (u_longlong_t)ub->ub_txg,
 		    (u_longlong_t)engine_pages.floor);
 		error = SET_ERROR(ESTALE);
@@ -1044,7 +1064,7 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	/* The label certificate is published after the control record. */
 	if (error == 0 && d[15] >= 6 &&
 	    pr19262_vdev_certified_parity(vd) > engine_pages.certified)
-		error = SET_ERROR(EINVAL);
+		error = ENGINE_EINVAL(101);
 	if (error == 0)
 		error = engine_store_decode(spa, ub, nv);
 	if (error == 0 && d[15] >= 6)
@@ -1065,7 +1085,7 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 		    &engine.admit_parity);
 		/* Open native space maps even for a read-only SPA. */
 		spa->spa_read_spacemaps = B_TRUE;
-		(void) printf("PR19262_STORE_LOAD pre-MOS txg=%llu "
+		pr19262_printf("PR19262_STORE_LOAD pre-MOS txg=%llu "
 		    "owners=%llu catalog=%llu\n", (u_longlong_t)ub->ub_txg,
 		    (u_longlong_t)avl_numnodes(&engine.owners),
 		    (u_longlong_t)d[6]);
@@ -1085,10 +1105,11 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	if (error != 0)
 		pr19262_engine_store_unload(spa);
 	if (error == 0 &&
-	    getenv("PR19262_ENGINE_BOOTSTRAP_NO_LABEL_EPOCHS") != NULL) {
+	    pr19262_env("PR19262_ENGINE_BOOTSTRAP_NO_LABEL_EPOCHS") != NULL) {
 		/* Read MOS through stored layout descriptors. */
 		vdev_raidz_parity_epochs_install(vd, NULL, 0);
-		(void) printf("PR19262_STORE_BOOTSTRAP without-label-epochs\n");
+		pr19262_printf("PR19262_STORE_BOOTSTRAP "
+		    "without-label-epochs\n");
 	}
 	return (error);
 }

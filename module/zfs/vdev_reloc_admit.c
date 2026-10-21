@@ -102,7 +102,7 @@ engine_admit_refresh(void)
 	if (engine.admit_parity != 0) {
 		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
 		    e = AVL_NEXT(&engine.owners, e)) {
-			engine_version_t *b = e->current;
+			engine_version_t *b = e->cur;
 			if (b == NULL || e->retired || e->aborted ||
 			    b->parity >= engine.admit_parity)
 				continue;
@@ -123,6 +123,29 @@ engine_admit_refresh(void)
 	engine.admit_reserve_weak = weak;
 	engine.admit_reserve = growth + legacy + engine.admit_batch;
 	engine.admit_refreshed = engine.revision;
+}
+
+/* Free space of the other normal-class top-level vdevs (native). */
+static uint64_t
+engine_admit_foreign_free(spa_t *spa)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	if (!engine.foreign_normal)
+		return (0);
+	vdev_t *root = spa->spa_root_vdev;
+	uint64_t total = 0;
+	for (uint64_t c = 0; c < root->vdev_children; c++) {
+		vdev_t *vd = root->vdev_child[c];
+		if (vd == engine.vd || vd->vdev_islog || vd->vdev_mg == NULL ||
+		    vd->vdev_mg->mg_class != spa_normal_class(spa))
+			continue;
+		mutex_enter(&vd->vdev_stat_lock);
+		uint64_t space = vd->vdev_stat.vs_space;
+		uint64_t alloc = vd->vdev_stat.vs_alloc;
+		mutex_exit(&vd->vdev_stat_lock);
+		total += space > alloc ? space - alloc : 0;
+	}
+	return (total);
 }
 
 static uint64_t
@@ -191,9 +214,33 @@ pr19262_engine_admit(spa_t *spa, uint_t class, uint64_t reserved,
 	uint64_t protected = engine_admit_protected(class) + growth;
 	uint64_t need = reserved + p_bytes +
 	    engine.admit[PR19262_ADMIT_CONVERTER].p_bytes;
+	/*
+	 * Client data may also land on other normal-class vdevs, which the
+	 * allocation guard steers it to once the target reaches its reserve.
+	 */
+	uint64_t foreign = class == PR19262_ADMIT_CONVERTER ? 0 :
+	    engine_admit_foreign_free(spa);
+	uint64_t available = (free > protected ? free - protected : 0) +
+	    foreign;
 	boolean_t blocked = class == PR19262_ADMIT_CLIENT &&
 	    engine.retired >= engine.retired_limit;
-	if (blocked || free < protected || need > free - protected) {
+	if (blocked || (free < protected && foreign == 0) ||
+	    need > available) {
+		/*
+		 * The reservations of transactions still open or syncing
+		 * (reserved, worst-case sizes) are released when their txg
+		 * syncs.  A request that fits once they are gone restarts,
+		 * as the native accounting does, so that DMU_TX_WAIT waits
+		 * for a sync instead of failing.  The converter admits whole
+		 * batches and is told ENOSPC, as before.
+		 */
+		if (!blocked && class != PR19262_ADMIT_CONVERTER &&
+		    reserved != 0 && free >= protected &&
+		    need - reserved <= available) {
+			engine.admit_restarts++;
+			mutex_exit(&engine.lock);
+			return (ERESTART);
+		}
 		c->rejected++;
 		if (!blocked)
 			engine.admit_space_rejections++;
@@ -264,20 +311,25 @@ pr19262_engine_admit_report(spa_t *spa, const char *label,
 	out->levels = engine_pages.levels;
 	out->converter_bytes = engine.admit[PR19262_ADMIT_CONVERTER].p_bytes;
 	out->space_rejections = engine.admit_space_rejections;
+	out->restarts = engine.admit_restarts;
 	for (uint_t c = 0; c < PR19262_ADMIT_CLASSES; c++)
 		out->classes[c] = engine.admit[c];
 	out->protected = ENGINE_ADMIT_SYNC_BYTES + ENGINE_ADMIT_LOG_BYTES +
 	    engine.admit_reserve + out->growth;
+	out->foreign = engine_admit_foreign_free(spa);
+	out->guarded = engine.alloc_guarded;
 	mutex_exit(&engine.lock);
-	(void) printf("PR19262_ADMIT label=%s free=%llu protected=%llu "
+	pr19262_printf("PR19262_ADMIT label=%s free=%llu protected=%llu "
+	    "foreign=%llu guarded=%llu "
 	    "sync=%llu log=%llu reserve=%llu reserve_growth=%llu "
 	    "reserve_legacy=%llu reserve_weak=%llu batch=%llu parity=%llu "
 	    "growth=%llu growth_peak=%llu pages_total=%llu pages_free=%llu "
 	    "frames_total=%llu frames_free=%llu levels=%llu "
 	    "converter_bytes=%llu space_rejections=%llu "
 	    "client=%llu/%llu/%llu/%llu netfree=%llu/%llu "
-	    "converter=%llu/%llu/%llu/%llu\n", label,
+	    "converter=%llu/%llu/%llu/%llu restarts=%llu\n", label,
 	    (u_longlong_t)out->free, (u_longlong_t)out->protected,
+	    (u_longlong_t)out->foreign, (u_longlong_t)out->guarded,
 	    (u_longlong_t)out->sync_bytes, (u_longlong_t)out->log_bytes,
 	    (u_longlong_t)out->reserve, (u_longlong_t)out->reserve_growth,
 	    (u_longlong_t)out->reserve_legacy,
@@ -297,8 +349,9 @@ pr19262_engine_admit_report(spa_t *spa, const char *label,
 	    (u_longlong_t)out->classes[2].admitted,
 	    (u_longlong_t)out->classes[2].rejected,
 	    (u_longlong_t)out->classes[2].peak_m,
-	    (u_longlong_t)out->classes[2].peak_j);
-	(void) fflush(NULL);
+	    (u_longlong_t)out->classes[2].peak_j,
+	    (u_longlong_t)out->restarts);
+	pr19262_flush();
 }
 
 /*

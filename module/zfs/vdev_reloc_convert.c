@@ -38,7 +38,7 @@ pr19262_engine_census(spa_t *spa, uint64_t parity,
 		c->retired_owners += e->retired;
 		for (engine_version_t *b = e->versions; b != NULL;
 		    b = b->next) {
-			if (b == e->current && !e->retired && !e->aborted) {
+			if (b == e->cur && !e->retired && !e->aborted) {
 				c->current_versions++;
 				c->current_bytes += b->size;
 				c->min_parity = MIN(c->min_parity, b->parity);
@@ -161,7 +161,7 @@ engine_release_sync(void *arg, dmu_tx_t *tx)
 			zfs_range_tree_verify_not_present(engine.free, b->p,
 			    b->size);
 			zfs_range_tree_add(engine.free, b->p, b->size);
-			if (b->retired || b == e->current) {
+			if (b->retired || b == e->cur) {
 				VERIFY3U(engine.retired, >=, b->size);
 				engine.retired -= b->size;
 			}
@@ -210,7 +210,7 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 	if (checkpoint)
 		error = EBUSY;
 	else if (ub == 0 || ub < engine_pages.floor || catalog > ub)
-		error = EINVAL;
+		error = ENGINE_EINVAL(101);
 	else if (ub != engine_pages.floor || engine_pages.gc_relaxed) {
 		/* Dead catalog pages go with the floor into both slots. */
 		error = engine_pages_gc(spa, &pages_freed);
@@ -225,9 +225,9 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 			engine_version_t *b = e->versions;
 			while (b != NULL) {
 				engine_version_t *next = b->next;
-				if (e->current != NULL && b != e->current &&
+				if (e->cur != NULL && b != e->cur &&
 				    b->retired &&
-				    b->generation < e->current->generation &&
+				    b->generation < e->cur->generation &&
 				    b->retired_txg != 0 &&
 				    b->retired_txg <= catalog &&
 				    b->leases == 0 && b->writers == 0) {
@@ -255,15 +255,15 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 		engine_journal_gc(spa, catalog, &journal_segments,
 		    &journal_bytes);
 	}
-	if (error == 0 && getenv("PR19262_ENGINE_FENCE_CUT") != NULL) {
+	if (error == 0 && pr19262_env("PR19262_ENGINE_FENCE_CUT") != NULL) {
 		/*
 		 * Crash with the floor durable and no later root: the store
 		 * lock still blocks every uberblock write at this point.
 		 */
-		(void) printf("PR19262_FENCE_CUT floor=%llu reclaimed=%llu\n",
+		pr19262_printf("PR19262_FENCE_CUT floor=%llu reclaimed=%llu\n",
 		    (u_longlong_t)*floor, (u_longlong_t)*reclaimed);
-		(void) fflush(NULL);
-		_exit(0);
+		pr19262_flush();
+		pr19262_exit(0);
 	}
 	mutex_exit(&engine.store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
@@ -273,7 +273,7 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 	error = dsl_sync_task(spa_name(spa), NULL, engine_release_sync, &r,
 	    0, ZFS_SPACE_CHECK_NONE);
 	*released = r.owners;
-	(void) printf("PR19262_FENCE floor=%llu catalog=%llu reclaimed=%llu "
+	pr19262_printf("PR19262_FENCE floor=%llu catalog=%llu reclaimed=%llu "
 	    "released_owners=%llu released_bytes=%llu pages_freed=%llu "
 	    "journal_freed=%llu journal_freed_bytes=%llu error=%d\n",
 	    (u_longlong_t)*floor, (u_longlong_t)catalog,
@@ -324,7 +324,7 @@ pr19262_engine_certify(spa_t *spa, uint64_t parity)
 	vdev_config_dirty(engine.vd);
 	spa_config_exit(spa, SCL_CONFIG, FTAG);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
-	(void) printf("PR19262_CERTIFIED parity=%llu floor=%llu "
+	pr19262_printf("PR19262_CERTIFIED parity=%llu floor=%llu "
 	    "current=%llu bytes=%llu\n", (u_longlong_t)parity,
 	    (u_longlong_t)c.floor, (u_longlong_t)c.current_versions,
 	    (u_longlong_t)c.current_bytes);
@@ -360,7 +360,7 @@ engine_convert_collect(spa_t *spa, const blkptr_t *bp, void *arg)
 	if (c->gang_count == c->gang_capacity) {
 		uint_t capacity = c->gang_capacity == 0 ? 16 :
 		    c->gang_capacity * 2;
-		blkptr_t *gang = kmem_alloc(capacity * sizeof (*gang),
+		blkptr_t *gang = pr19262_alloc(capacity * sizeof (*gang),
 		    KM_SLEEP);
 		if (c->gang != NULL) {
 			memcpy(gang, c->gang, c->gang_count * sizeof (*gang));
@@ -379,8 +379,8 @@ engine_convert_weak(engine_convert_t *c, const blkptr_t *bp, int d)
 	boolean_t weak = B_FALSE;
 	mutex_enter(&engine.lock);
 	engine_owner_t *e = engine_find(DVA_GET_OFFSET(&bp->blk_dva[d]));
-	if (e != NULL && !e->retired && !e->aborted && e->current != NULL)
-		weak = e->current->parity < c->parity;
+	if (e != NULL && !e->retired && !e->aborted && e->cur != NULL)
+		weak = e->cur->parity < c->parity;
 	mutex_exit(&engine.lock);
 	return (weak);
 }
@@ -453,7 +453,7 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 			error = 0;
 			/* Name a block that stays busy across whole passes. */
 			if (c->idle_passes >= 2) {
-				(void) printf("PR19262_CONVERT_BUSY v=%llu "
+				pr19262_printf("PR19262_CONVERT_BUSY v=%llu "
 				    "psize=%llu birth=%llu leases=%llu "
 				    "old_leases=%llu versions=%llu holds=%llu "
 				    "queued=%llu copying=%u ready=%u "
@@ -655,7 +655,7 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 	uint64_t needed = admit.sync_bytes + admit.log_bytes + admit.batch +
 	    admit.growth;
 	if (admit.free < needed) {
-		(void) printf("PR19262_CONVERT_SPACE free=%llu needed=%llu "
+		pr19262_printf("PR19262_CONVERT_SPACE free=%llu needed=%llu "
 		    "reserve=%llu growth=%llu\n", (u_longlong_t)admit.free,
 		    (u_longlong_t)needed, (u_longlong_t)admit.reserve,
 		    (u_longlong_t)admit.growth);
@@ -671,9 +671,10 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		dmu_tx_t *fence = dmu_tx_create_dd(dp->dp_mos_dir);
 		VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
 		c.pending = 0;
+		/* Encrypted datasets need no key: only BPs matter. */
 		error = traverse_pool(spa, 0,
-		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
-		    engine_convert_visit, &c);
+		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
+		    TRAVERSE_NO_DECRYPT, engine_convert_visit, &c);
 		boolean_t partial = error == ERESTART;
 		if (partial)
 			error = 0;
@@ -707,7 +708,7 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 			error = ENOSPC;
 			break;
 		}
-		(void) printf("PR19262_CONVERT_PASS pass=%llu partial=%u "
+		pr19262_printf("PR19262_CONVERT_PASS pass=%llu partial=%u "
 		    "visited=%llu copied=%llu busy=%llu stale=%llu "
 		    "starved=%llu\n", (u_longlong_t)stats->passes, partial,
 		    (u_longlong_t)stats->visited, (u_longlong_t)stats->copied,
@@ -721,7 +722,7 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		else
 			c.idle_passes = 0;
 		if (c.idle_passes >= 8) {
-			(void) printf("PR19262_CONVERT_STUCK passes=%llu "
+			pr19262_printf("PR19262_CONVERT_STUCK passes=%llu "
 			    "busy=%llu\n", (u_longlong_t)stats->passes,
 			    (u_longlong_t)(stats->busy - busy));
 			error = EBUSY;
@@ -736,3 +737,126 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 	pr19262_engine_admit_report(spa, "convert-end", &admit);
 	return (error);
 }
+
+/*
+ * Append a full-width epoch of the given parity to the target vdev through
+ * a sync task (open-context check, syncing-context check and store), then
+ * wait until the epoch's first txg is synced, so that every later write
+ * is laid out by it.  Idempotent for the last epoch of that parity.
+ */
+#define	ENGINE_EPOCH_ENTRIES 48
+
+typedef struct engine_epoch_task {
+	uint64_t vdev;
+	uint64_t parity;
+	uint64_t birth;
+	uint64_t nent;
+	uint64_t table[3 * (ENGINE_EPOCH_ENTRIES + 1)];
+} engine_epoch_task_t;
+
+static uint64_t
+engine_epoch_table(vdev_t *vd, uint64_t parity, uint64_t start,
+    uint64_t *table)
+{
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	mutex_enter(&vdrz->vd_expand_lock);
+	uint64_t n = vdrz->vd_parity_epoch_count;
+	if (n > ENGINE_EPOCH_ENTRIES)
+		n = 0;
+	if (n != 0)
+		memcpy(table, vdrz->vd_parity_epochs,
+		    n * 3 * sizeof (uint64_t));
+	mutex_exit(&vdrz->vd_expand_lock);
+	if (n == 0) {
+		table[0] = 0;
+		table[1] = vdrz->vd_physical_width;
+		table[2] = vdrz->vd_nparity;
+		n = 1;
+	}
+	table[3 * n] = MAX(start, table[3 * (n - 1)] + 1);
+	table[3 * n + 1] = vdrz->vd_physical_width;
+	table[3 * n + 2] = parity;
+	return (n + 1);
+}
+
+static int
+engine_epoch_check(void *arg, dmu_tx_t *tx)
+{
+	engine_epoch_task_t *t = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	boolean_t lock = !dmu_tx_is_syncing(tx);
+	if (lock && !spa_config_tryenter(spa, SCL_CONFIG, FTAG, RW_READER))
+		return (SET_ERROR(EBUSY));
+	vdev_t *vd = vdev_lookup_top(spa, t->vdev);
+	int error;
+	if (vd == NULL || vd->vdev_ops != &vdev_raidz_ops) {
+		error = SET_ERROR(ENOENT);
+	} else if (lock) {
+		uint64_t n = engine_epoch_table(vd, t->parity, 0, t->table);
+		error = vdev_raidz_parity_epochs_set_check(vd, t->table, n,
+		    NULL);
+	} else {
+		uint64_t n = engine_epoch_table(vd, t->parity,
+		    dmu_tx_get_txg(tx) + TXG_CONCURRENT_STATES, t->table);
+		error = vdev_raidz_parity_epochs_set_check_tx(vd, t->table, n,
+		    tx, NULL);
+	}
+	if (lock)
+		spa_config_exit(spa, SCL_CONFIG, FTAG);
+	return (error);
+}
+
+static void
+engine_epoch_sync(void *arg, dmu_tx_t *tx)
+{
+	engine_epoch_task_t *t = arg;
+	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
+	vdev_t *vd = vdev_lookup_top(spa, t->vdev);
+	t->nent = engine_epoch_table(vd, t->parity,
+	    dmu_tx_get_txg(tx) + TXG_CONCURRENT_STATES, t->table);
+	VERIFY0(vdev_raidz_parity_epochs_set(vd, t->table, t->nent, tx));
+	t->birth = t->table[3 * (t->nent - 1)];
+	spa_history_log_internal(spa, "pr19262 epoch", tx,
+	    "vdev=%llu parity=%llu birth=%llu", (u_longlong_t)t->vdev,
+	    (u_longlong_t)t->parity, (u_longlong_t)t->birth);
+}
+
+int
+pr19262_engine_epoch(spa_t *spa, uint64_t parity, uint64_t *birth)
+{
+	vdev_t *vd = pr19262_engine_vdev(spa);
+	if (vd == NULL || parity < 1 || parity > VDEV_RAIDZ_MAXPARITY ||
+	    vd->vdev_children < parity + 1)
+		return (SET_ERROR(EINVAL));
+	vdev_raidz_t *vdrz = vd->vdev_tsd;
+	mutex_enter(&vdrz->vd_expand_lock);
+	uint64_t n = vdrz->vd_parity_epoch_count;
+	const uint64_t *last = n != 0 ?
+	    vdrz->vd_parity_epochs + 3 * (n - 1) : NULL;
+	uint64_t last_start = last != NULL ? last[0] : 0;
+	uint64_t last_parity = last != NULL ? last[2] : vdrz->vd_nparity;
+	mutex_exit(&vdrz->vd_expand_lock);
+	if (last_parity == parity &&
+	    last_start <= spa_last_synced_txg(spa) + 1) {
+		*birth = last_start;
+		pr19262_engine_plan(spa, parity, 0);
+		return (0);
+	}
+	engine_epoch_task_t *t = kmem_zalloc(sizeof (*t), KM_SLEEP);
+	t->vdev = vd->vdev_id;
+	t->parity = parity;
+	int error = dsl_sync_task(spa_name(spa), engine_epoch_check,
+	    engine_epoch_sync, t, 5, ZFS_SPACE_CHECK_NORMAL);
+	if (error == 0) {
+		*birth = t->birth;
+		while (spa_last_synced_txg(spa) + 1 < t->birth)
+			txg_wait_synced(spa_get_dsl(spa),
+			    spa_last_synced_txg(spa) + 1);
+		txg_wait_synced(spa_get_dsl(spa), 0);
+		pr19262_engine_plan(spa, parity, 0);
+	}
+	kmem_free(t, sizeof (*t));
+	return (error);
+}
+
+#include "vdev_reloc_kernel.c"

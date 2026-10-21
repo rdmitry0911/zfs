@@ -172,10 +172,8 @@ struct uberblock {
 	uint64_t	ub_checkpoint_txg;
 
 	uint64_t	ub_raidz_reflow_info;
-#ifndef _KERNEL
 	/* Private disposable-VM experiment, not a supported disk ABI. */
 	uint64_t	ub_pr19262[16];
-#endif
 };
 
 #ifdef	__cplusplus

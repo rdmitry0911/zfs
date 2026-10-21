@@ -281,14 +281,10 @@ typedef enum {
  * carries three DVAs.
  * The two layouts share the same leading SCAN_IO_COMMON_FIELDS.
  */
-#ifndef _KERNEL
 #include <sys/vdev_reloc_probe.h>
 #include <sys/vdev_reloc_engine.h>
 #define	SCAN_IO_PROBE_FIELDS	void *sio_pr19262_hold; \
 	void *sio_pr19262_owner_hold;
-#else
-#define	SCAN_IO_PROBE_FIELDS
-#endif
 
 #define	SCAN_IO_COMMON_FIELDS						\
 	SCAN_IO_PROBE_FIELDS						\
@@ -420,10 +416,8 @@ static kmem_cache_t *sio_cache_ext[SPA_DVAS_PER_BP];
 static void
 sio_free(scan_io_t *sio)
 {
-#ifndef _KERNEL
 	pr19262_reloc_rele(sio->sio_pr19262_hold);
 	pr19262_engine_rele(sio->sio_pr19262_owner_hold);
-#endif
 	kmem_cache_t **cache = sio->sio_ext ? sio_cache_ext :
 	    sio_cache_compact;
 
@@ -445,10 +439,8 @@ sio_alloc(unsigned short nr_dvas, boolean_t ext)
 	ASSERT(!ext || nr_dvas < SPA_DVAS_PER_BP);
 
 	sio = kmem_cache_alloc(cache[nr_dvas - 1], KM_SLEEP);
-#ifndef _KERNEL
 	sio->sio_pr19262_hold = NULL;
 	sio->sio_pr19262_owner_hold = NULL;
-#endif
 	sio->sio_ext = ext;
 	return (sio);
 }
@@ -4952,12 +4944,10 @@ scan_io_queue_insert(dsl_scan_io_queue_t *queue, const blkptr_t *bp, int dva_i,
 	ASSERT(MUTEX_HELD(&queue->q_vd->vdev_scan_io_queue_lock));
 
 	bp2sio(bp, sio, dva_i);
-#ifndef _KERNEL
 	sio->sio_pr19262_hold = pr19262_reloc_hold(
 	    queue->q_vd->vdev_spa, bp);
 	sio->sio_pr19262_owner_hold = pr19262_engine_hold(
 	    queue->q_vd->vdev_spa, bp, NULL, B_TRUE, B_FALSE);
-#endif
 	sio->sio_flags = zio_flags;
 	sio->sio_zb = *zb;
 
@@ -5169,7 +5159,6 @@ scan_exec_io(dsl_pool_t *dp, const blkptr_t *bp, int zio_flags,
 
 	ASSERT(pio != NULL);
 	count_block_issued(spa, bp, queue == NULL);
-#ifndef _KERNEL
 	if (sio != NULL && sio->sio_pr19262_owner_hold != NULL) {
 		zio_nowait(pr19262_engine_read_bound(pio, spa, bp, data,
 		    size, dsl_scan_scrub_done, queue, ZIO_PRIORITY_SCRUB,
@@ -5182,7 +5171,6 @@ scan_exec_io(dsl_pool_t *dp, const blkptr_t *bp, int zio_flags,
 		    zio_flags, zb, &sio->sio_pr19262_hold));
 		return;
 	}
-#endif
 	zio_nowait(zio_read(pio, spa, bp, data, size, dsl_scan_scrub_done,
 	    queue, ZIO_PRIORITY_SCRUB, zio_flags, zb));
 }
@@ -5503,7 +5491,6 @@ dsl_scan_freed(spa_t *spa, const blkptr_t *bp)
 		dsl_scan_freed_dva(spa, bp, i);
 }
 
-#ifndef _KERNEL
 /* Drive the actual sorted-queue implementation in a readonly userspace spa. */
 void
 pr19262_scan_probe_insert(void *arg, const blkptr_t *bp)
@@ -5519,10 +5506,8 @@ pr19262_scan_probe_insert(void *arg, const blkptr_t *bp)
 void *
 pr19262_scan_probe_create(spa_t *spa, const blkptr_t *bp)
 {
+	/* The queue follows DVA 0; ditto copies may sit on other vdevs. */
 	VERIFY3U(BP_GET_NDVAS(bp), >, 0);
-	for (int d = 1; d < BP_GET_NDVAS(bp); d++)
-		VERIFY3U(DVA_GET_VDEV(&bp->blk_dva[d]), ==,
-		    DVA_GET_VDEV(&bp->blk_dva[0]));
 	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
 	vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(&bp->blk_dva[0]));
 	VERIFY3P(vd, !=, NULL);
@@ -5584,7 +5569,6 @@ pr19262_scan_probe_issue(void *arg)
 	pr19262_scan_probe_destroy(q);
 	return (error);
 }
-#endif
 
 /*
  * Check if a vdev needs resilvering (non-empty DTL), if so, and resilver has

@@ -44,6 +44,7 @@ typedef struct engine_mchild {
 #define	ENGINE_M_ROWS (ENGINE_M_PAYLOAD / sizeof (engine_mrow_t))
 #define	ENGINE_M_CHILDREN (ENGINE_M_PAYLOAD / sizeof (engine_mchild_t))
 
+
 typedef struct engine_mnode {
 	uint64_t data[ENGINE_STORE_PAGE / sizeof (uint64_t)];
 	boolean_t dirty;
@@ -124,18 +125,18 @@ engine_pages_add_arena(uint64_t p, uint64_t pages)
 	    p % stripe != 0 || p >= engine.total ||
 	    pages > (engine.total - p) / stripe ||
 	    engine_pages.capacity > engine.total / stripe - pages)
-		return (EINVAL);
+		return (ENGINE_EINVAL(1));
 	for (engine_marena_t *a = engine_pages.arenas; a != NULL;
 	    a = a->next)
 		if (p < a->p + a->pages * stripe &&
 		    a->p < p + pages * stripe)
-			return (EINVAL);
+			return (ENGINE_EINVAL(2));
 	uint64_t old = engine_pages.capacity, count = old + pages;
 	if (count > SIZE_MAX / sizeof (engine_mnode_t *))
 		return (EOVERFLOW);
-	engine_mnode_t **cache = kmem_zalloc(count * sizeof (*cache),
+	engine_mnode_t **cache = pr19262_zalloc(count * sizeof (*cache),
 	    KM_SLEEP);
-	uint8_t *bits = kmem_zalloc(count, KM_SLEEP);
+	uint8_t *bits = pr19262_zalloc(count, KM_SLEEP);
 	bits[old] = bits[old + 1] = 1;
 	if (old != 0) {
 		memcpy(cache, engine_pages.cache, old * sizeof (*cache));
@@ -236,7 +237,7 @@ engine_mio(vdev_t *vd, uint64_t p, abd_t *abd, boolean_t write)
 {
 	uint64_t index;
 	if (!engine_mindex(p, &index))
-		return (EINVAL);
+		return (ENGINE_EINVAL(3));
 	return (engine_store_io_at(vd, p, 0, 1, abd, write));
 }
 
@@ -271,7 +272,7 @@ engine_mread_ref(spa_t *spa, const engine_mref_t *ref,
 	if (ref->p % stripe != 0 || ref->p >= engine.total ||
 	    stripe > engine.total - ref->p ||
 	    (!bootstrap && !engine_mindex(ref->p, &index)))
-		return (EINVAL);
+		return (ENGINE_EINVAL(4));
 	engine_mnode_t *n = kmem_zalloc(sizeof (*n), KM_SLEEP);
 	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
 	int error = ECKSUM;
@@ -341,7 +342,7 @@ engine_mget(engine_mbatch_t *b, const engine_mref_t *ref,
 {
 	uint64_t index;
 	if (!engine_mindex(ref->p, &index))
-		return (EINVAL);
+		return (ENGINE_EINVAL(5));
 	engine_mnode_t *n = engine_pages.cache[index];
 	if (n == NULL) {
 		int error = engine_mread(b->spa, ref, &n);
@@ -475,7 +476,8 @@ engine_minsert(engine_mbatch_t *b, const engine_mref_t *root,
 		    engine_mkey_compare(rows[at].key, row->key) == 0;
 		if (replace && memcmp(&rows[at], row, sizeof (*row)) == 0)
 			return (0);
-		engine_mrow_t *copy = kmem_alloc((count + 1) * sizeof (*copy),
+		engine_mrow_t *copy = pr19262_alloc(
+		    (count + 1) * sizeof (*copy),
 		    KM_SLEEP);
 		memcpy(copy, rows, at * sizeof (*copy));
 		copy[at] = *row;
@@ -501,7 +503,7 @@ engine_minsert(engine_mbatch_t *b, const engine_mref_t *root,
 		return (error);
 	}
 	if (h->type != ENGINE_M_BRANCH || h->level == 0)
-		return (EINVAL);
+		return (ENGINE_EINVAL(6));
 	engine_mchild_t *children = engine_mpayload(old);
 	uint_t at = 0, count = h->count;
 	while (at + 1 < count && engine_mkey_compare(row->key,
@@ -511,7 +513,7 @@ engine_minsert(engine_mbatch_t *b, const engine_mref_t *root,
 	error = engine_minsert(b, &children[at].ref, row, &child);
 	if (error != 0 || !child.changed)
 		return (error);
-	engine_mchild_t *copy = kmem_alloc((count + 1) * sizeof (*copy),
+	engine_mchild_t *copy = pr19262_alloc((count + 1) * sizeof (*copy),
 	    KM_SLEEP);
 	memcpy(copy, children, count * sizeof (*copy));
 	engine_mnode_t *child_node;
@@ -657,7 +659,7 @@ engine_mremove(engine_mbatch_t *b, const engine_mref_t *root,
 			engine_mrelease(b, old);
 			return (0);
 		}
-		engine_mrow_t *copy = kmem_alloc(count * sizeof (*copy),
+		engine_mrow_t *copy = pr19262_alloc(count * sizeof (*copy),
 		    KM_SLEEP);
 		memcpy(copy, rows, at * sizeof (*copy));
 		memcpy(copy + at, rows + at + 1,
@@ -673,7 +675,7 @@ engine_mremove(engine_mbatch_t *b, const engine_mref_t *root,
 		return (error);
 	}
 	if (h->type != ENGINE_M_BRANCH || h->level == 0)
-		return (EINVAL);
+		return (ENGINE_EINVAL(7));
 	engine_mchild_t *children = engine_mpayload(old);
 	uint_t at = 0, count = h->count;
 	while (at + 1 < count && engine_mkey_compare(key,
@@ -814,7 +816,7 @@ engine_mrows(nvlist_t *nv, engine_mrow_t **out, uint_t *count)
 	nvlist_t **owners;
 	uint_t nr;
 	if (nvlist_lookup_nvlist_array(nv, "owners", &owners, &nr) != 0)
-		return (EINVAL);
+		return (ENGINE_EINVAL(8));
 	uint_t total = 0;
 	for (uint_t i = 0; i < nr; i++) {
 		uint64_t *p;
@@ -822,10 +824,10 @@ engine_mrows(nvlist_t *nv, engine_mrow_t **out, uint_t *count)
 		if (nvlist_lookup_uint64_array(owners[i], "P", &p, &np) != 0 ||
 		    np == 0 || np % 8 != 0 ||
 		    np / 8 > engine_pages_row_limit() - total)
-			return (EINVAL);
+			return (ENGINE_EINVAL(9));
 		total += np / 8;
 	}
-	engine_mrow_t *rows = kmem_zalloc(MAX(1, total) * sizeof (*rows),
+	engine_mrow_t *rows = pr19262_zalloc(MAX(1, total) * sizeof (*rows),
 	    KM_SLEEP);
 	uint_t at = 0;
 	int error = 0;
@@ -835,7 +837,7 @@ engine_mrows(nvlist_t *nv, engine_mrow_t **out, uint_t *count)
 		if (nvlist_lookup_uint64_array(owners[i], "V", &v, &nv) != 0 ||
 		    nvlist_lookup_uint64_array(owners[i], "P", &p, &np) != 0 ||
 		    nv != 8) {
-			error = EINVAL;
+			error = ENGINE_EINVAL(19);
 			break;
 		}
 		for (uint_t j = 0; j < np; j += 8) {
@@ -851,7 +853,7 @@ engine_mrows(nvlist_t *nv, engine_mrow_t **out, uint_t *count)
 		for (uint_t i = 1; i < total; i++)
 			if (engine_mkey_compare(rows[i - 1].key,
 			    rows[i].key) >= 0)
-				error = EINVAL;
+				error = ENGINE_EINVAL(20);
 	}
 	if (error != 0) {
 		kmem_free(rows, MAX(1, total) * sizeof (*rows));
@@ -865,31 +867,32 @@ static void
 engine_pages_fault(uint_t stage, uint64_t generation, uint_t child,
     uint64_t page)
 {
-	const char *fault = getenv("PR19262_M_PAGE_FAULT");
-	if (fault == NULL || strtoull(fault, NULL, 0) != stage)
+	const char *fault = pr19262_env("PR19262_M_PAGE_FAULT");
+	if (fault == NULL || pr19262_strtoull(fault, NULL, 0) != stage)
 		return;
-	(void) printf("PR19262_M_PAGE_CUT stage=%u generation=%llu "
+	pr19262_printf("PR19262_M_PAGE_CUT stage=%u generation=%llu "
 	    "child=%u page=%llu\n", stage, (u_longlong_t)generation,
 	    child, (u_longlong_t)page);
-	(void) fflush(NULL);
-	_exit(120 + stage);
+	pr19262_flush();
+	pr19262_exit(120 + stage);
 }
 
 static boolean_t
 engine_pages_active_error(engine_marena_t *a, uint_t child, uint_t slot,
     const char *phase, uint64_t serial)
 {
-	const char *fault = getenv("PR19262_M_ACTIVE_ERROR");
-	const char *member = getenv("PR19262_M_ACTIVE_ERROR_CHILD");
-	const char *selected = getenv("PR19262_M_ACTIVE_ERROR_SLOT");
+	const char *fault = pr19262_env("PR19262_M_ACTIVE_ERROR");
+	const char *member = pr19262_env("PR19262_M_ACTIVE_ERROR_CHILD");
+	const char *selected = pr19262_env("PR19262_M_ACTIVE_ERROR_SLOT");
 	if (engine_m_active_error_injected || !engine_pages.publishing_active ||
 	    a->p != engine.arena || fault == NULL ||
 	    strcmp(fault, phase) != 0 ||
-	    child != (member == NULL ? 0 : strtoull(member, NULL, 10)) ||
-	    (selected != NULL && slot != strtoull(selected, NULL, 10)))
+	    child != (member == NULL ? 0 :
+	    pr19262_strtoull(member, NULL, 10)) ||
+	    (selected != NULL && slot != pr19262_strtoull(selected, NULL, 10)))
 		return (B_FALSE);
 	engine_m_active_error_injected = B_TRUE;
-	(void) printf("PR19262_M_ACTIVE_ERROR phase=%s child=%u slot=%u "
+	pr19262_printf("PR19262_M_ACTIVE_ERROR phase=%s child=%u slot=%u "
 	    "serial=%llu\n", phase, child, slot, (u_longlong_t)serial);
 	return (B_TRUE);
 }
@@ -1047,9 +1050,9 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 	int error = 0;
 	uint_t children = engine.vd->vdev_children;
 	/* Masks by (slot, member): only the two latest serials are unioned. */
-	uint64_t *serials = kmem_zalloc(2 * children * sizeof (uint64_t),
+	uint64_t *serials = pr19262_zalloc(2 * children * sizeof (uint64_t),
 	    KM_SLEEP);
-	uint8_t *masks = kmem_zalloc(2 * children * a->pages, KM_SLEEP);
+	uint8_t *masks = pr19262_zalloc(2 * children * a->pages, KM_SLEEP);
 	boolean_t *absent = kmem_zalloc(children * sizeof (boolean_t),
 	    KM_SLEEP);
 	for (uint_t slot = 0; slot < 2; slot++) {
@@ -1057,12 +1060,12 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 			uint64_t p = a->p + slot * ENGINE_STORE_PAGE *
 			    engine.vd->vdev_children;
 			const char *hidden =
-			    getenv("PR19262_M_A_FIRST_READ_EIO");
+			    pr19262_env("PR19262_M_A_FIRST_READ_EIO");
 			if (!engine_m_read_injected && a->p == engine.arena &&
 			    hidden != NULL && c == 0 &&
-			    slot == strtoull(hidden, NULL, 10)) {
+			    slot == pr19262_strtoull(hidden, NULL, 10)) {
 				engine_m_read_injected = B_TRUE;
-				(void) printf("PR19262_M_A_READ_EIO child=0 "
+				pr19262_printf("PR19262_M_A_READ_EIO child=0 "
 				    "slot=%u\n", slot);
 				if (strict)
 					error = EIO;
@@ -1207,8 +1210,8 @@ engine_pages_control_check(spa_t *spa, boolean_t strict)
 	while (a != NULL && a->p != engine.arena)
 		a = a->next;
 	if (a == NULL)
-		return (EINVAL);
-	uint8_t *bits = kmem_zalloc(a->pages, KM_SLEEP);
+		return (ENGINE_EINVAL(10));
+	uint8_t *bits = pr19262_zalloc(a->pages, KM_SLEEP);
 	uint64_t generation = 0, serial = 0;
 	engine_mcontrol_t control = { 0 };
 	int error = engine_pages_reservations_arena(spa, a, bits,
@@ -1241,7 +1244,7 @@ engine_pages_control_repair(spa_t *spa, const engine_mcontrol_t *proposed)
 	    a = a->next) {
 		if (a->pending && !a->formatted)
 			continue;
-		uint8_t *bits = kmem_zalloc(a->pages, KM_SLEEP);
+		uint8_t *bits = pr19262_zalloc(a->pages, KM_SLEEP);
 		engine_mcontrol_t *selected = a->p == engine.arena ?
 		    &control : NULL;
 		int error = engine_pages_reservations_arena(spa, a, bits,
@@ -1340,7 +1343,7 @@ engine_pages_mark_ref(engine_mmarker_t *m, const engine_mref_t *ref)
 	if (ref->p == UINT64_MAX || engine_mref_empty(ref))
 		return (0);
 	if (!engine_mindex(ref->p, &index))
-		return (EINVAL);
+		return (ENGINE_EINVAL(11));
 	if (m->marked[index])
 		return (0);
 	m->marked[index] = 1;
@@ -1405,7 +1408,7 @@ engine_pages_gc(spa_t *spa, uint64_t *freed)
 	if (!durable)
 		return (0);
 	engine_mmarker_t m = { .spa = spa, .target = -1,
-	    .marked = kmem_zalloc(engine_pages.capacity, KM_SLEEP) };
+	    .marked = pr19262_zalloc(engine_pages.capacity, KM_SLEEP) };
 	for (engine_marena_t *a = engine_pages.arenas; a != NULL; a = a->next)
 		m.marked[a->first] = m.marked[a->first + 1] = 1;
 	if (engine_pages.directory_pages != NULL)
@@ -1465,7 +1468,7 @@ engine_pages_members(spa_t *spa, int target, uint64_t *ok,
 	uint64_t stripe = ENGINE_STORE_PAGE * children;
 	engine_mmarker_t m = { .spa = spa, .target = target,
 	    .audit_ok = ok, .audit_missing = missing,
-	    .marked = kmem_zalloc(engine_pages.capacity, KM_SLEEP) };
+	    .marked = pr19262_zalloc(engine_pages.capacity, KM_SLEEP) };
 	engine_mref_t blob = { .p = engine.stored_desc[4] };
 	memcpy(&blob.hash, engine.stored_desc + 8, sizeof (blob.hash));
 	int error = engine_pages_mark_ref(&m, &blob);
@@ -1524,13 +1527,13 @@ engine_pages_audit_print(spa_t *spa, const char *label, const uint64_t *ok,
 {
 	(void) spa;
 	for (uint_t c = 0; c < engine.vd->vdev_children; c++)
-		(void) printf("PR19262_RAW_AUDIT label=%s child=%u present=%u "
+		pr19262_printf("PR19262_RAW_AUDIT label=%s child=%u present=%u "
 		    "ok=%llu missing=%llu serial=%llu current=%llu\n", label,
 		    c, vdev_readable(engine.vd->vdev_child[c]),
 		    (u_longlong_t)ok[c], (u_longlong_t)missing[c],
 		    (u_longlong_t)engine_pages.member_serial[c],
 		    (u_longlong_t)engine_pages.control.serial);
-	(void) fflush(NULL);
+	pr19262_flush();
 }
 
 /* Rewrite every live page on one member, then refresh its control slots. */
@@ -1582,7 +1585,7 @@ engine_pages_resilver_members(spa_t *spa)
 			continue;
 		uint64_t pages = 0;
 		error = engine_pages_resilver(spa, c, &pages);
-		(void) printf("PR19262_RAW_RESILVER child=%u pages=%llu "
+		pr19262_printf("PR19262_RAW_RESILVER child=%u pages=%llu "
 		    "missing_before=%llu error=%d\n", c, (u_longlong_t)pages,
 		    (u_longlong_t)missing[c], error);
 		resilvered++;
@@ -1608,7 +1611,7 @@ engine_pages_manifest(spa_t *spa)
 	if (engine_pages.directory_pages != NULL)
 		return (0);
 	engine_marena_t *initial = engine_pages.arenas;
-	uint8_t *bits = kmem_zalloc(initial->pages, KM_SLEEP);
+	uint8_t *bits = pr19262_zalloc(initial->pages, KM_SLEEP);
 	uint64_t generation = 0;
 	uint64_t serial = 0;
 	engine_mcontrol_t control = { 0 };
@@ -1633,7 +1636,7 @@ engine_pages_manifest(spa_t *spa)
 		if (ref.generation == 0 || ref.generation > generation ||
 		    zfs_range_tree_contains(engine_pages.directory_pages,
 		    ref.p, stripe))
-			return (EINVAL);
+			return (ENGINE_EINVAL(12));
 		engine_mnode_t *n;
 		error = engine_mread_ref(spa, &ref, &n, B_TRUE);
 		if (error != 0)
@@ -1643,7 +1646,7 @@ engine_pages_manifest(spa_t *spa)
 		if (h->type != ENGINE_M_DIRECTORY ||
 		    data[0] >= ref.p || ref.p - data[0] != 2 * stripe ||
 		    (data[2] == 0 && data[3] == 0)) {
-			error = EINVAL;
+			error = ENGINE_EINVAL(21);
 		} else {
 			error = engine_pages_add_arena(data[0], data[1]);
 			if (error == 0) {
@@ -1662,7 +1665,7 @@ engine_pages_manifest(spa_t *spa)
 			memcpy(&ref, data + 4, sizeof (ref));
 			if (!engine_mref_empty(&ref) &&
 			    ref.generation > previous)
-				error = EINVAL;
+				error = ENGINE_EINVAL(22);
 		}
 		kmem_free(n, sizeof (*n));
 		if (error != 0)
@@ -1671,7 +1674,7 @@ engine_pages_manifest(spa_t *spa)
 	if (engine_pages.pending[1] != 0) {
 		if (engine_pages.pending[2] == 0 &&
 		    engine_pages.pending[3] == 0)
-			return (EINVAL);
+			return (ENGINE_EINVAL(13));
 		error = engine_pages_add_arena(engine_pages.pending[0],
 		    engine_pages.pending[1]);
 		if (error != 0)
@@ -1683,7 +1686,7 @@ engine_pages_manifest(spa_t *spa)
 	} else {
 		uint64_t empty[4] = { 0 };
 		if (memcmp(engine_pages.pending, empty, sizeof (empty)) != 0)
-			return (EINVAL);
+			return (ENGINE_EINVAL(14));
 	}
 	return (0);
 }
@@ -1720,7 +1723,8 @@ engine_pages_directory_write(spa_t *spa, engine_marena_t *a,
 		    &engine_pages.directory, sizeof (engine_pages.directory));
 		candidate.p = h->p;
 		candidate.generation = generation;
-		boolean_t swap = getenv("PR19262_M_DIRECTORY_BYTESWAP") != NULL;
+		boolean_t swap =
+		    pr19262_env("PR19262_M_DIRECTORY_BYTESWAP") != NULL;
 		if (swap) {
 			byteswap_uint64_array(engine_mpayload(n), h->count);
 			byteswap_uint64_array(h, sizeof (*h));
@@ -1815,7 +1819,7 @@ engine_pages_finish(spa_t *spa, engine_marena_t *a, uint64_t generation)
 	memset(engine_pages.pending, 0, sizeof (engine_pages.pending));
 	a->pending = B_FALSE;
 	engine_pages_fault(14, generation, 0, a->p);
-	(void) printf("PR19262_M_GROW p=%llu pages=%llu capacity=%llu "
+	pr19262_printf("PR19262_M_GROW p=%llu pages=%llu capacity=%llu "
 	    "generation=%llu serial=%llu\n", (u_longlong_t)a->p,
 	    (u_longlong_t)a->pages, (u_longlong_t)engine_pages.capacity,
 	    (u_longlong_t)generation, (u_longlong_t)engine_pages.serial);
@@ -1866,7 +1870,7 @@ engine_pages_remove_pending(engine_marena_t *a)
 	VERIFY3U(a->first + a->pages, ==, engine_pages.capacity);
 	uint64_t count = a->first;
 	engine_mnode_t **cache = kmem_alloc(count * sizeof (*cache), KM_SLEEP);
-	uint8_t *bits = kmem_alloc(count, KM_SLEEP);
+	uint8_t *bits = pr19262_alloc(count, KM_SLEEP);
 	memcpy(cache, engine_pages.cache, count * sizeof (*cache));
 	memcpy(bits, engine_pages.bits, count);
 	for (uint64_t i = count; i < engine_pages.capacity; i++)
@@ -1893,7 +1897,7 @@ engine_pages_pending_inspect(spa_t *spa, engine_marena_t *a)
 	engine_mnode_t *wire = kmem_zalloc(sizeof (*wire), KM_SLEEP);
 	engine_mnode_t *directory = NULL;
 	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
-	uint8_t *bits = kmem_zalloc(a->pages, KM_SLEEP);
+	uint8_t *bits = pr19262_zalloc(a->pages, KM_SLEEP);
 	bits[0] = bits[1] = 1;
 	uint64_t stripe = ENGINE_STORE_PAGE * engine.vd->vdev_children;
 	boolean_t formatted = B_FALSE;
@@ -2076,7 +2080,7 @@ engine_pages_reconcile(spa_t *spa, boolean_t write)
 		return (0);
 	engine_marena_t *a = engine_pages.arenas;
 	if (!a->pending || a->p != engine_pages.pending[0])
-		return (EINVAL);
+		return (ENGINE_EINVAL(15));
 	if (write) {
 		int error = engine_pages_pending_inspect(spa, a);
 		if (error != 0)
@@ -2192,7 +2196,7 @@ engine_pages_growth_probe(spa_t *spa, boolean_t advance,
 	out->certified = engine_pages.certified;
 	uint64_t count = engine_pages.directory_pages == NULL ? 0 :
 	    zfs_range_tree_numsegs(engine_pages.directory_pages);
-	engine_munion_t u = { .ranges = kmem_zalloc(MAX(1, count) * 16,
+	engine_munion_t u = { .ranges = pr19262_zalloc(MAX(1, count) * 16,
 	    KM_SLEEP) };
 	if (engine_pages.directory_pages != NULL) {
 		out->directory_bytes =
@@ -2203,7 +2207,7 @@ engine_pages_growth_probe(spa_t *spa, boolean_t advance,
 	engine_pages_probe_hash(u.ranges, MAX(1, u.at) * 8,
 	    out->directory_hash);
 	kmem_free(u.ranges, MAX(1, count) * 16);
-	uint8_t *bits = kmem_alloc(engine_pages.capacity, KM_SLEEP);
+	uint8_t *bits = pr19262_alloc(engine_pages.capacity, KM_SLEEP);
 	mutex_enter(&engine.lock);
 	memcpy(bits, engine_pages.bits, engine_pages.capacity);
 	mutex_exit(&engine.lock);
@@ -2220,7 +2224,7 @@ engine_pages_growth_probe(spa_t *spa, boolean_t advance,
 		pages += a->pages;
 	}
 	uint64_t size = arenas * 16 + pages, at = 0;
-	uint8_t *canonical = kmem_alloc(size, KM_SLEEP);
+	uint8_t *canonical = pr19262_alloc(size, KM_SLEEP);
 	engine_marena_t *previous = NULL;
 	for (uint64_t i = 0; i < arenas; i++) {
 		engine_marena_t *next = NULL;
@@ -2270,7 +2274,7 @@ engine_pages_expired_tombstones(uint_t *count)
 	    t = AVL_NEXT(&engine.tombstones, t))
 		n += t->expired;
 	uint64_t *keys = n == 0 ? NULL :
-	    kmem_alloc(n * 2 * sizeof (uint64_t), KM_SLEEP);
+	    pr19262_alloc(n * 2 * sizeof (uint64_t), KM_SLEEP);
 	uint_t at = 0;
 	for (engine_tomb_t *t = avl_first(&engine.tombstones); t != NULL;
 	    t = AVL_NEXT(&engine.tombstones, t)) {
@@ -2393,7 +2397,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		error = nvlist_pack(nv, &packed, &size, NV_ENCODE_XDR,
 		    KM_SLEEP);
 		if (error == 0 && howmany(size, ENGINE_M_PAYLOAD) != nb)
-			error = EINVAL;
+			error = ENGINE_EINVAL(23);
 	}
 	if (error == 0) {
 		engine_mref_t next = { .p = UINT64_MAX };
@@ -2482,7 +2486,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		memcpy(d + 8, &root.hash, sizeof (root.hash));
 		memcpy(desc, d, sizeof (d));
 		engine_pages_expire_tombstones(expired_keys, expired);
-		(void) printf("PR19262_PAGED_SYNC txg=%llu newpages=%u "
+		pr19262_printf("PR19262_PAGED_SYNC txg=%llu newpages=%u "
 		    "changes=%u deletes=%u tombstones=%u expired=%u rows=%u "
 		    "root=%llu generation=%llu levels=%llu\n",
 		    (u_longlong_t)ub->ub_txg, b->pages, b->changes, b->deletes,
@@ -2526,7 +2530,7 @@ engine_mcollect(engine_mreader_t *r, const engine_mrow_t *row)
 	    row->key[2] != row->data[3] || row->data[6] > 3 ||
 	    (row->key[3] != 0 && row->key[3] != row->data[15]) ||
 	    (r->have_last && engine_mkey_compare(r->last, row->key) >= 0))
-		return (EINVAL);
+		return (ENGINE_EINVAL(16));
 	memcpy(r->last, row->key, sizeof (r->last));
 	r->have_last = B_TRUE;
 	if (row->data[6] == 3) {
@@ -2538,7 +2542,7 @@ engine_mcollect(engine_mreader_t *r, const engine_mrow_t *row)
 		if (r->tomb_count == r->tomb_capacity) {
 			uint_t cap = r->tomb_capacity == 0 ? 64 :
 			    r->tomb_capacity * 2;
-			uint64_t *tombs = kmem_alloc(cap * 2 *
+			uint64_t *tombs = pr19262_alloc(cap * 2 *
 			    sizeof (uint64_t), KM_SLEEP);
 			if (r->tombs != NULL) {
 				memcpy(tombs, r->tombs, r->tomb_count * 2 *
@@ -2560,7 +2564,7 @@ engine_mcollect(engine_mreader_t *r, const engine_mrow_t *row)
 		uint_t cap = MIN(wanted, engine_pages_row_limit());
 		if (cap == r->capacity)
 			return (EOVERFLOW);
-		engine_mrow_t *rows = kmem_alloc(cap * sizeof (*rows),
+		engine_mrow_t *rows = pr19262_alloc(cap * sizeof (*rows),
 		    KM_SLEEP);
 		if (r->rows != NULL) {
 			memcpy(rows, r->rows, r->count * sizeof (*rows));
@@ -2581,7 +2585,7 @@ engine_mwalk(engine_mreader_t *r, const engine_mref_t *ref, uint64_t level,
 	if (ref->generation == 0 || ref->generation > r->generation ||
 	    !engine_mindex(ref->p, &index) ||
 	    zfs_range_tree_contains(r->seen, ref->p, stripe))
-		return (EINVAL);
+		return (ENGINE_EINVAL(17));
 	engine_mnode_t *n;
 	int error = engine_mread(r->spa, ref, &n);
 	if (error != 0)
@@ -2592,12 +2596,12 @@ engine_mwalk(engine_mreader_t *r, const engine_mref_t *ref, uint64_t level,
 		r->levels = h->level + 1;
 	if ((level != UINT64_MAX && level != h->level) ||
 	    (h->type != ENGINE_M_LEAF && h->type != ENGINE_M_BRANCH)) {
-		error = EINVAL;
+		error = ENGINE_EINVAL(24);
 	} else if (h->type == ENGINE_M_LEAF) {
 		engine_mrow_t *rows = engine_mpayload(n);
 		if (engine_mkey_compare(rows[0].key, h->low) != 0 ||
 		    engine_mkey_compare(rows[h->count - 1].key, h->high) != 0)
-			error = EINVAL;
+			error = ENGINE_EINVAL(25);
 		for (uint_t i = 0; error == 0 && i < h->count; i++)
 			error = engine_mcollect(r, &rows[i]);
 	} else {
@@ -2606,7 +2610,7 @@ engine_mwalk(engine_mreader_t *r, const engine_mref_t *ref, uint64_t level,
 		for (uint_t i = 0; error == 0 && i < h->count; i++) {
 			uint64_t clow[4] = { 0 }, chigh[4] = { 0 };
 			if (children[i].ref.generation > h->generation)
-				error = EINVAL;
+				error = ENGINE_EINVAL(26);
 			else
 				error = engine_mwalk(r, &children[i].ref,
 				    h->level - 1, clow, chigh);
@@ -2618,12 +2622,12 @@ engine_mwalk(engine_mreader_t *r, const engine_mref_t *ref, uint64_t level,
 				bad |= i != 0 && engine_mkey_compare(previous,
 				    clow) >= 0;
 				if (bad)
-					error = EINVAL;
+					error = ENGINE_EINVAL(27);
 			}
 			memcpy(previous, chigh, sizeof (previous));
 		}
 		if (error == 0 && engine_mkey_compare(previous, h->high) != 0)
-			error = EINVAL;
+			error = ENGINE_EINVAL(28);
 	}
 	memcpy(low, h->low, sizeof (h->low));
 	memcpy(high, h->high, sizeof (h->high));
@@ -2634,35 +2638,35 @@ engine_mwalk(engine_mreader_t *r, const engine_mref_t *ref, uint64_t level,
 static int
 engine_mowners(engine_mreader_t *r, nvlist_t *nv)
 {
-	nvlist_t **owners = kmem_alloc(MAX(1, r->count) * sizeof (*owners),
+	nvlist_t **owners = pr19262_alloc(MAX(1, r->count) * sizeof (*owners),
 	    KM_SLEEP);
 	uint_t nr = 0, at = 0;
 	int error = 0;
 	while (at < r->count && error == 0) {
 		uint_t end = at + 1;
-		engine_mrow_t *current = &r->rows[at];
-		if (current->key[3] != 0) {
-			error = EINVAL;
+		engine_mrow_t *row_cur = &r->rows[at];
+		if (row_cur->key[3] != 0) {
+			error = ENGINE_EINVAL(29);
 			break;
 		}
 		while (end < r->count &&
-		    r->rows[end].key[1] == current->key[1] &&
-		    r->rows[end].key[2] == current->key[2])
+		    r->rows[end].key[1] == row_cur->key[1] &&
+		    r->rows[end].key[2] == row_cur->key[2])
 			end++;
 		uint64_t *versions = kmem_alloc((end - at) * 8 *
 		    sizeof (uint64_t), KM_SLEEP);
 		for (uint_t i = at; i < end; i++) {
-			if (memcmp(current->data, r->rows[i].data,
+			if (memcmp(row_cur->data, r->rows[i].data,
 			    8 * sizeof (uint64_t)) != 0 ||
 			    (i != at && r->rows[i].data[14] != 1))
-				error = EINVAL;
+				error = ENGINE_EINVAL(30);
 			memcpy(versions + (i - at) * 8, r->rows[i].data + 8,
 			    8 * sizeof (uint64_t));
 		}
 		if (error == 0) {
 			owners[nr] = fnvlist_alloc();
 			fnvlist_add_uint64_array(owners[nr], "V",
-			    current->data, 8);
+			    row_cur->data, 8);
 			fnvlist_add_uint64_array(owners[nr], "P", versions,
 			    (end - at) * 8);
 			nr++;
@@ -2693,7 +2697,7 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 			return (error);
 		/* Pages of roots below the floor may already be reused. */
 		if (ub->ub_txg < engine_pages.floor) {
-			(void) printf("PR19262_FLOOR_REFUSED ub=%llu "
+			pr19262_printf("PR19262_FLOOR_REFUSED ub=%llu "
 			    "floor=%llu\n", (u_longlong_t)ub->ub_txg,
 			    (u_longlong_t)engine_pages.floor);
 			return (SET_ERROR(ESTALE));
@@ -2713,7 +2717,7 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 		uint64_t index;
 		if (!engine_mindex(ref.p, &index) ||
 		    zfs_range_tree_contains(r->seen, ref.p, stripe)) {
-			error = EINVAL;
+			error = ENGINE_EINVAL(31);
 			break;
 		}
 		engine_mnode_t *n;
@@ -2727,20 +2731,20 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 		    h->generation != r->generation ||
 		    h->low[0] != offset || h->high[0] != d[7] ||
 		    offset > d[7] || h->count > d[7] - offset)
-			error = EINVAL;
+			error = ENGINE_EINVAL(32);
 		else {
 			zfs_range_tree_add(r->seen, ref.p, stripe);
 			memcpy(packed + offset, engine_mpayload(n), h->count);
 			offset += h->count;
 			memcpy(&ref, h->reserved, sizeof (ref));
 			if (ref.p != UINT64_MAX && ref.generation == 0)
-				error = EINVAL;
+				error = ENGINE_EINVAL(33);
 		}
 		kmem_free(n, sizeof (*n));
 	}
 	nvlist_t *nv = NULL;
 	if (error == 0 && offset != d[7])
-		error = EINVAL;
+		error = ENGINE_EINVAL(34);
 	if (error == 0)
 		error = nvlist_unpack(packed, d[7], &nv, KM_SLEEP);
 	kmem_free(packed, d[7]);
@@ -2750,7 +2754,7 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 	    nvlist_lookup_uint64_array(nv, "page-tree", &tree, &nt) != 0 ||
 	    nt != 6 || nvlist_lookup_uint64(nv, "page-generation",
 	    &generation) != 0 || generation != r->generation))
-		error = EINVAL;
+		error = ENGINE_EINVAL(35);
 	if (error == 0) {
 		memcpy(&ref, tree, sizeof (ref));
 		if (ref.p != UINT64_MAX) {
@@ -2759,7 +2763,7 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 		}
 	}
 	if (error == 0 && allocator)
-		(void) printf("PR19262_PAGES_READ root=%llu rows=%u "
+		pr19262_printf("PR19262_PAGES_READ root=%llu rows=%u "
 		    "tombstones=%u dead=%u levels=%llu pages=%llu\n",
 		    (u_longlong_t)ub->ub_txg, r->count, r->tomb_count, r->dead,
 		    (u_longlong_t)r->levels,
@@ -2768,16 +2772,16 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 	uint_t nb;
 	if (error == 0 && (nvlist_lookup_byte_array(nv, "bitmap", &bitmap,
 	    &nb) != 0 || nb != ENGINE_STORE_PAGES))
-		error = EINVAL;
+		error = ENGINE_EINVAL(36);
 	for (uint_t i = 0; error == 0 && i < ENGINE_STORE_PAGES; i++)
 		if (bitmap[i] > 1 ||
 		    (zfs_range_tree_contains(r->seen,
 		    engine.arena + i * stripe, stripe) && !bitmap[i]))
-			error = EINVAL;
+			error = ENGINE_EINVAL(37);
 	if (error == 0 && (!bitmap[0] || !bitmap[1]))
-		error = EINVAL;
+		error = ENGINE_EINVAL(38);
 	if (error == 0 && allocator) {
-		uint8_t *reserved = kmem_zalloc(engine_pages.capacity,
+		uint8_t *reserved = pr19262_zalloc(engine_pages.capacity,
 		    KM_SLEEP);
 		uint64_t latest = 0;
 		uint64_t serial = 0;
@@ -2841,7 +2845,7 @@ engine_pages_read(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 			return (error);
 		/* Nothing has been admitted to the physical allocator yet. */
 		engine_pages_clear();
-		(void) printf("PR19262_M_CONTROL_RETRY attempt=%u\n",
+		pr19262_printf("PR19262_M_CONTROL_RETRY attempt=%u\n",
 		    attempt + 1);
 	}
 	return (EAGAIN);
@@ -2855,7 +2859,7 @@ engine_pages_install(nvlist_t *nv)
 	if (nvlist_lookup_uint64_array(nv, "page-tree", &tree, &nt) != 0 ||
 	    nt != 6 || nvlist_lookup_uint64(nv, "page-generation",
 	    &generation) != 0)
-		return (EINVAL);
+		return (ENGINE_EINVAL(18));
 	engine_mrow_t *rows;
 	int error = engine_mrows(nv, &rows, &count);
 	if (error != 0)

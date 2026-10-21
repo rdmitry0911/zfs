@@ -19,6 +19,7 @@
 #include <sys/zfs_context.h>
 #include <sys/spa.h>
 #include <sys/vdev_file.h>
+#include <sys/vdev_reloc_engine.h>
 #include <sys/vdev_impl.h>
 #include <sys/zio.h>
 #include <sys/fs/zfs.h>
@@ -146,17 +147,15 @@ vdev_file_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	ASSERT3S(vd->vdev_path[0], ==, '/');
 
 	int open_mode = vdev_file_open_mode(spa_mode(vd->vdev_spa));
-#ifndef _KERNEL
 	/* Private exported-file-fixture data-write test, scoped to one GUID. */
-	const char *probe_guid = getenv("PR19262_SPACE_RW_GUID");
-	if (probe_guid != NULL && getenv("PR19262_SPACE_TEST") != NULL &&
-	    strtoull(probe_guid, NULL, 10) == spa_guid(vd->vdev_spa))
+	const char *probe_guid = pr19262_env("PR19262_SPACE_RW_GUID");
+	if (probe_guid != NULL && pr19262_env("PR19262_SPACE_TEST") != NULL &&
+	    pr19262_strtoull(probe_guid, NULL, 10) == spa_guid(vd->vdev_spa))
 		open_mode = O_RDWR | O_LARGEFILE;
 	if (probe_guid != NULL)
-		(void) fprintf(stderr, "PR19262_SPACE_OPEN %llu %s %d\n",
+		pr19262_printf("PR19262_SPACE_OPEN %llu %s %d\n",
 		    (u_longlong_t)spa_guid(vd->vdev_spa), vd->vdev_path,
 		    open_mode);
-#endif
 	error = zfs_file_open(vd->vdev_path, open_mode, 0, cr, &fp);
 
 	if (error) {
@@ -239,11 +238,9 @@ vdev_file_io_strategy(void *arg)
 		abd_return_buf(zio->io_abd, buf, size);
 	}
 	zio->io_error = err;
-#ifndef _KERNEL
-	if (err != 0 && getenv("PR19262_SPACE_TEST") != NULL)
-		(void) fprintf(stderr, "PR19262_SPACE_FILE_ERROR %s %d\n",
+	if (err != 0 && pr19262_env("PR19262_SPACE_TEST") != NULL)
+		pr19262_printf("PR19262_SPACE_FILE_ERROR %s %d\n",
 		    zio->io_vd->vdev_path, err);
-#endif
 	if (resid != 0 && zio->io_error == 0)
 		zio->io_error = SET_ERROR(ENOSPC);
 

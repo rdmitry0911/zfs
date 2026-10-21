@@ -46,10 +46,8 @@
 #include <sys/dsl_crypt.h>
 #include <cityhash.h>
 
-#ifndef _KERNEL
 #include "vdev_reloc_probe.c"
 #include <sys/vdev_reloc_engine.h>
-#endif
 
 /*
  * ==========================================================================
@@ -191,10 +189,8 @@ zio_kstats_update(kstat_t *ksp, int rw)
 void
 zio_init(void)
 {
-#ifndef _KERNEL
 	pr19262_reloc_init();
 	pr19262_engine_init();
-#endif
 	size_t c;
 
 	zio_cache = kmem_cache_create("zio_cache",
@@ -296,10 +292,8 @@ zio_init(void)
 void
 zio_fini(void)
 {
-#ifndef _KERNEL
 	pr19262_reloc_fini();
 	pr19262_engine_fini();
-#endif
 	size_t n = SPA_MAXBLOCKSIZE >> SPA_MINBLOCKSHIFT;
 
 #if defined(ZFS_DEBUG) && !defined(_KERNEL)
@@ -1060,13 +1054,11 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 	}
 
 	taskq_init_ent(&zio->io_tqent);
-#ifndef _KERNEL
 	if (pio != NULL)
 		zio->io_pr19262_backing_birth = pio->io_pr19262_backing_birth;
 	zio->io_pr19262_owner_hold = pr19262_engine_hold(spa, bp,
 	    pio != NULL ? pio->io_pr19262_owner_hold : NULL,
 	    type == ZIO_TYPE_READ, (flags & ZIO_FLAG_GANG_CHILD) != 0);
-#endif
 
 	return (zio);
 }
@@ -1074,11 +1066,9 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 void
 zio_destroy(zio_t *zio)
 {
-#ifndef _KERNEL
 	pr19262_engine_io_rele(zio);
 	pr19262_reloc_rele(zio->io_pr19262_hold);
 	pr19262_engine_rele(zio->io_pr19262_owner_hold);
-#endif
 	ASSERT3P(zio->io_batch, ==, NULL);
 	ASSERT3P(zio->io_child_batch, ==, NULL);
 	ASSERT3P(zio->io_exec_next, ==, NULL);
@@ -1382,12 +1372,10 @@ zio_read_impl(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 	    ZIO_STAGE_OPEN, (flags & ZIO_FLAG_DDT_CHILD) ?
 	    ZIO_DDT_CHILD_READ_PIPELINE : ZIO_READ_PIPELINE);
 
-#ifndef _KERNEL
 	zio->io_pr19262_physical = physical;
 	if (!physical && zio->io_logical == zio)
 		zio->io_pr19262_hold = bound_hold != NULL ?
 		    bound_hold : pr19262_reloc_hold(spa, bp);
-#endif
 
 	return (zio);
 }
@@ -1401,7 +1389,6 @@ zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 	    priority, flags, zb, NULL, B_FALSE));
 }
 
-#ifndef _KERNEL
 int
 pr19262_engine_metadata_flush(vdev_t *vd)
 {
@@ -1484,7 +1471,6 @@ pr19262_read_physical(spa_t *spa, const blkptr_t *bp, abd_t *data,
 	VERIFY3P(zio->io_pr19262_hold, ==, NULL);
 	return (zio);
 }
-#endif
 
 zio_t *
 zio_write(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp,
@@ -1536,12 +1522,10 @@ zio_rewrite_impl(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp,
 	    ZIO_TYPE_WRITE, priority, flags | ZIO_FLAG_IO_REWRITE, NULL, 0, zb,
 	    ZIO_STAGE_OPEN, ZIO_REWRITE_PIPELINE);
 
-#ifndef _KERNEL
 	zio->io_pr19262_physical = physical;
-	if (!physical && getenv("PR19262_SPACE_TEST") != NULL &&
+	if (!physical && pr19262_env("PR19262_SPACE_TEST") != NULL &&
 	    zio->io_logical == zio)
 		zio->io_pr19262_hold = pr19262_reloc_hold(spa, bp);
-#endif
 	return (zio);
 }
 
@@ -1554,7 +1538,6 @@ zio_rewrite(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp, abd_t *data,
 	    priority, flags, zb, B_FALSE));
 }
 
-#ifndef _KERNEL
 zio_t *
 pr19262_write_physical(spa_t *spa, uint64_t txg, blkptr_t *bp, abd_t *data,
     uint64_t size)
@@ -1565,7 +1548,6 @@ pr19262_write_physical(spa_t *spa, uint64_t txg, blkptr_t *bp, abd_t *data,
 	VERIFY3P(zio->io_pr19262_hold, ==, NULL);
 	return (zio);
 }
-#endif
 
 void
 zio_write_override(zio_t *zio, blkptr_t *bp, int copies, int gang_copies,
@@ -3569,7 +3551,6 @@ zio_gang_assemble(zio_t *zio)
 	return (zio);
 }
 
-#ifndef _KERNEL
 static int
 pr19262_zio_visit_gang(zio_t *zio, zio_gang_node_t *gn, const blkptr_t *bp)
 {
@@ -3605,7 +3586,6 @@ pr19262_zio_walk_gang(spa_t *spa, const blkptr_t *bp, void *hold,
 	zio->io_pr19262_gang_visit_arg = arg;
 	return (zio_wait(zio));
 }
-#endif
 
 static zio_t *
 zio_gang_issue(zio_t *zio)
@@ -3619,7 +3599,6 @@ zio_gang_issue(zio_t *zio)
 	ASSERT(BP_IS_GANG(bp) && zio->io_gang_leader == zio);
 	ASSERT(zio->io_child_type > ZIO_CHILD_GANG);
 
-#ifndef _KERNEL
 	if (zio->io_pr19262_gang_visit != NULL) {
 		if (zio->io_child_error[ZIO_CHILD_GANG] == 0)
 			zio->io_error = pr19262_zio_visit_gang(zio,
@@ -3627,7 +3606,6 @@ zio_gang_issue(zio_t *zio)
 		zio->io_pipeline = ZIO_INTERLOCK_PIPELINE;
 		return (zio);
 	}
-#endif
 	if (zio->io_child_error[ZIO_CHILD_GANG] == 0)
 		zio_gang_tree_issue(zio, zio->io_gang_tree, bp, zio->io_abd,
 		    0);
@@ -5264,7 +5242,6 @@ zio_alloc_zil(spa_t *spa, objset_t *os, uint64_t txg, blkptr_t *new_bp,
 		    (u_longlong_t)min_size, (u_longlong_t)max_size, error);
 	}
 
-#ifndef _KERNEL
 	if (error == 0) {
 		error = pr19262_engine_journal_bind(spa, new_bp);
 		if (error != 0) {
@@ -5272,7 +5249,6 @@ zio_alloc_zil(spa_t *spa, objset_t *os, uint64_t txg, blkptr_t *new_bp,
 			BP_ZERO(new_bp);
 		}
 	}
-#endif
 	return (error);
 }
 
@@ -5306,14 +5282,12 @@ zio_vdev_io_start(zio_t *zio)
 	ASSERT0(zio->io_child_error[ZIO_CHILD_VDEV]);
 
 	if (vd == NULL) {
-#ifndef _KERNEL
 		/* New/gang allocations gained DVAs after zio_create(). */
 		void *hold = pr19262_engine_hold(spa, zio->io_bp,
 		    zio->io_pr19262_owner_hold, zio->io_type == ZIO_TYPE_READ,
 		    (zio->io_flags & ZIO_FLAG_GANG_CHILD) != 0);
 		pr19262_engine_rele(zio->io_pr19262_owner_hold);
 		zio->io_pr19262_owner_hold = hold;
-#endif
 		if (!(zio->io_flags & ZIO_FLAG_CONFIG_WRITER)) {
 			/*
 			 * A deadlock workaround. The ddt_prune_unique_entries()
@@ -5346,7 +5320,6 @@ zio_vdev_io_start(zio_t *zio)
 	}
 
 	ASSERT3P(zio->io_logical, !=, zio);
-#ifndef _KERNEL
 	{
 		int error = pr19262_engine_dispatch(zio);
 		if (error == EINPROGRESS)
@@ -5357,7 +5330,6 @@ zio_vdev_io_start(zio_t *zio)
 			return (NULL);
 		}
 	}
-#endif
 	if (zio->io_type == ZIO_TYPE_WRITE) {
 		ASSERT(spa->spa_trust_config);
 
@@ -5446,10 +5418,8 @@ zio_vdev_io_start(zio_t *zio)
 	 * for correctness.
 	 */
 	uint64_t repair_birth = zio->io_txg;
-#ifndef _KERNEL
 	if (zio->io_pr19262_backing_birth != 0)
 		repair_birth = zio->io_pr19262_backing_birth;
-#endif
 	if ((zio->io_flags & ZIO_FLAG_IO_REPAIR) &&
 	    !(zio->io_flags & ZIO_FLAG_SELF_HEAL) &&
 	    repair_birth != 0 &&	/* not a delegated i/o */

@@ -138,9 +138,7 @@
 #include <sys/vdev_raidz.h>
 #include <sys/vdev_draid.h>
 #include <sys/uberblock_impl.h>
-#ifndef _KERNEL
 #include <sys/vdev_reloc_engine.h>
-#endif
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
 #include <sys/zio.h>
@@ -1730,7 +1728,6 @@ vdev_uberblock_load_impl(zio_t *zio, vdev_t *vd, int flags,
 	}
 }
 
-#ifndef _KERNEL
 typedef struct pr19262_ub_inventory {
 	uberblock_t *roots;
 	uint_t count;
@@ -1762,27 +1759,40 @@ pr19262_vdev_uberblocks(spa_t *spa, void *arg,
 	    spa_config_held(spa, SCL_STATE, RW_WRITER) == SCL_STATE);
 	vdev_t *root = spa->spa_root_vdev;
 	int error = ENOTSUP;
-	if (root->vdev_children != 1)
-		goto out;
-	vdev_t *vd = root->vdev_child[0];
-	uint64_t capacity = 0;
-	for (uint_t c = 0; c < vd->vdev_children; c++) {
-		vdev_t *leaf = vd->vdev_child[c];
-		if (!leaf->vdev_ops->vdev_op_leaf)
-			goto out;
-		capacity += VDEV_LABELS * VDEV_UBERBLOCK_COUNT(leaf);
+	/* Every leaf of every top-level vdev carries the same uberblocks. */
+	const uint_t max_leaves = 1024;
+	uint_t nleaves = 0;
+	vdev_t **leaves = kmem_alloc(max_leaves * sizeof (*leaves), KM_SLEEP);
+	for (uint_t t = 0; t < root->vdev_children; t++) {
+		vdev_t *top = root->vdev_child[t];
+		if (top->vdev_ops->vdev_op_leaf) {
+			if (nleaves == max_leaves)
+				goto out;
+			leaves[nleaves++] = top;
+			continue;
+		}
+		for (uint_t c = 0; c < top->vdev_children; c++) {
+			vdev_t *leaf = top->vdev_child[c];
+			if (!leaf->vdev_ops->vdev_op_leaf ||
+			    nleaves == max_leaves)
+				goto out;
+			leaves[nleaves++] = leaf;
+		}
 	}
+	uint64_t capacity = 0;
+	for (uint_t c = 0; c < nleaves; c++)
+		capacity += VDEV_LABELS * VDEV_UBERBLOCK_COUNT(leaves[c]);
 	if (capacity == 0 || capacity > 65536)
 		goto out;
 	pr19262_ub_inventory_t inventory = { 0 };
-	inventory.roots = kmem_alloc(capacity * sizeof (uberblock_t),
+	inventory.roots = pr19262_alloc(capacity * sizeof (uberblock_t),
 	    KM_SLEEP);
 	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL |
 	    ZIO_FLAG_SPECULATIVE |
 	    ZIO_FLAG_DONT_PROPAGATE | ZIO_FLAG_DONT_RETRY;
 	zio_t *zio = zio_root(spa, NULL, &inventory, flags);
-	for (uint_t c = 0; c < vd->vdev_children; c++) {
-		vdev_t *leaf = vd->vdev_child[c];
+	for (uint_t c = 0; c < nleaves; c++) {
+		vdev_t *leaf = leaves[c];
 		if (!vdev_readable(leaf)) {
 			mutex_enter(&zio->io_lock);
 			inventory.error = ENXIO;
@@ -1807,9 +1817,9 @@ pr19262_vdev_uberblocks(spa_t *spa, void *arg,
 		error = visit(arg, &inventory.roots[i]);
 	kmem_free(inventory.roots, capacity * sizeof (uberblock_t));
 out:
+	kmem_free(leaves, max_leaves * sizeof (*leaves));
 	return (error);
 }
-#endif
 
 /*
  * Reads the 'best' uberblock from disk along with its associated
@@ -2315,9 +2325,7 @@ retry:
 		    txg, spa->spa_mmp.mmp_delay);
 
 		boolean_t mapped = B_FALSE;
-#ifndef _KERNEL
 		mapped = pr19262_engine_store_dirty(spa);
-#endif
 		if (!changed && list_is_empty(&spa->spa_config_dirty_list) &&
 		    !spa_multihost(spa) && !mapped)
 			return (0);
@@ -2376,10 +2384,8 @@ retry:
 	 *	been successfully committed) will be valid with respect
 	 *	to the new uberblocks.
 	 */
-#ifndef _KERNEL
 	if ((error = pr19262_engine_store_sync(spa, ub)) != 0)
 		goto retry;
-#endif
 	if ((error = vdev_uberblock_sync_list(spa, svd, svdcount, ub,
 	    flags)) != 0) {
 		if ((flags & ZIO_FLAG_IO_RETRY) != 0) {
@@ -2391,9 +2397,7 @@ retry:
 
 	if (spa_multihost(spa))
 		mmp_update_uberblock(spa, ub);
-#ifndef _KERNEL
 	pr19262_engine_journal_ub_committed(spa, ub);
-#endif
 
 	/*
 	 * Sync out odd labels for every dirty vdev.  If the system dies

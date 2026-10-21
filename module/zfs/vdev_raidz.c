@@ -2243,16 +2243,13 @@ vdev_raidz_min_nparity(vdev_t *vd)
 	mutex_enter(&vdrz->vd_expand_lock);
 	for (uint64_t i = 0; i < vdrz->vd_parity_epoch_count; i++)
 		min = MIN(min, vdrz->vd_parity_epochs[3 * i + 2]);
-#ifndef _KERNEL
 	/* A private certificate proves every live backing is stronger. */
 	min = MAX(min, vdrz->vd_pr19262_certified);
-#endif
 	mutex_exit(&vdrz->vd_expand_lock);
 
 	return (min);
 }
 
-#ifndef _KERNEL
 #define	PR19262_CONFIG_CERTIFIED "org.openzfs:pr19262_certified_parity"
 
 uint64_t
@@ -2287,7 +2284,6 @@ pr19262_vdev_asize_for_parity(vdev_t *vd, uint64_t psize, uint64_t width,
 	ASSERT3P(vd->vdev_ops, ==, &vdev_raidz_ops);
 	return (vdev_raidz_psize_to_asize_width(vd, psize, width, parity));
 }
-#endif
 
 static int
 vdev_raidz_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
@@ -2580,10 +2576,8 @@ vdev_raidz_io_exceeds_dva(zio_t *zio, vdev_raidz_layout_t layout,
 
 	ASSERT3P(bp, !=, NULL);
 	ASSERT(BP_GET_DEDUP(bp));
-#ifndef _KERNEL
 	if (zio->io_pr19262_owner_mapped)
 		bp = &zio->io_pr19262_owner_bp;
-#endif
 
 	/*
 	 * Production RAIDZ expansion applies to a top-level RAIDZ; nested
@@ -2607,10 +2601,8 @@ vdev_raidz_io_exceeds_dva(zio_t *zio, vdev_raidz_layout_t layout,
 		uint64_t asize = DVA_GET_GANG(dva) ?
 		    vdev_gang_header_asize(tvd, BP_GET_PHYSICAL_BIRTH(bp)) :
 		    DVA_GET_ASIZE(dva);
-#ifndef _KERNEL
 		if (zio->io_pr19262_owner_mapped)
 			asize = DVA_GET_ASIZE(dva);
-#endif
 		/*
 		 * A second DVA at the same top vdev and offset can only
 		 * occur in an already-malformed BP; keep the smallest owned
@@ -2694,8 +2686,8 @@ vdev_raidz_shadow_child_done(zio_t *zio)
 }
 
 
-#ifndef _KERNEL
 #include <sys/vdev_reloc_probe.h>
+#include <sys/vdev_reloc_engine.h>
 /* Private userspace read-only feasibility probe; no persistent format. */
 typedef struct pr19262_probe_move {
 	uint64_t src;
@@ -2710,13 +2702,13 @@ typedef struct pr19262_probe_move {
 static boolean_t
 pr19262_probe_lookup(zio_t *zio, pr19262_probe_move_t *move)
 {
-	const char *p = getenv("PR19262_PROBE_MAP");
+	const char *p = pr19262_env("PR19262_PROBE_MAP");
 	const blkptr_t *bp = zio->io_bp;
 
 	if (zio->io_logical != NULL &&
 	    zio->io_logical->io_pr19262_physical)
 		return (B_FALSE);
-	if (getenv("PR19262_LIFETIME") != NULL &&
+	if (pr19262_env("PR19262_LIFETIME") != NULL &&
 	    pr19262_reloc_known(zio->io_spa, bp)) {
 		pr19262_backing_desc_t desc;
 		memset(move, 0, sizeof (*move));
@@ -2757,7 +2749,7 @@ pr19262_probe_lookup(zio_t *zio, pr19262_probe_move_t *move)
 			move->src_asize = oldsize;
 			move->dst_asize = newsize;
 			move->error = 0;
-			if (getenv("PR19262_LIFETIME") != NULL) {
+			if (pr19262_env("PR19262_LIFETIME") != NULL) {
 				pr19262_backing_desc_t desc;
 				move->error = pr19262_reloc_resolve(zio, &desc);
 				if (move->error == 0) {
@@ -2780,22 +2772,19 @@ pr19262_probe_lookup(zio_t *zio, pr19262_probe_move_t *move)
 static boolean_t
 pr19262_probe_translate(void)
 {
-	const char *mode = getenv("PR19262_PROBE_MODE");
+	const char *mode = pr19262_env("PR19262_PROBE_MODE");
 	return (mode != NULL && strcmp(mode, "translate") == 0);
 }
-#endif
 
 #ifdef ZFS_DEBUG
 static uint64_t
 pr19262_probe_actual_birth(zio_t *zio)
 {
-#ifndef _KERNEL
 	if (zio->io_pr19262_owner_mapped)
 		return (BP_GET_PHYSICAL_BIRTH(&zio->io_pr19262_owner_bp));
 	pr19262_probe_move_t move;
 	if (pr19262_probe_translate() && pr19262_probe_lookup(zio, &move))
 		return (move.dst_birth);
-#endif
 	return (BP_GET_PHYSICAL_BIRTH(zio->io_bp));
 }
 #endif
@@ -2803,10 +2792,8 @@ pr19262_probe_actual_birth(zio_t *zio)
 static uint64_t
 vdev_raidz_read_birth(zio_t *zio)
 {
-#ifndef _KERNEL
 	if (zio->io_pr19262_backing_birth != 0)
 		return (zio->io_pr19262_backing_birth);
-#endif
 	return (zio->io_txg);
 }
 
@@ -2820,13 +2807,11 @@ vdev_raidz_io_verify(zio_t *zio, raidz_map_t *rm, raidz_row_t *rr, int col)
 	logical_rs.rs_end = logical_rs.rs_start +
 	    vdev_raidz_psize_to_asize(zio->io_vd, rr->rr_size,
 	    pr19262_probe_actual_birth(zio));
-#ifndef _KERNEL
 	if (zio->io_pr19262_owner_mapped)
 		logical_rs.rs_end = logical_rs.rs_start +
 		    vdev_raidz_psize_to_asize_width(zio->io_vd, rr->rr_size,
 		    zio->io_pr19262_backing_width,
 		    zio->io_pr19262_backing_parity);
-#endif
 
 	raidz_col_t *rc = &rr->rr_col[col];
 	vdev_t *cvd = zio->io_vd->vdev_child[rc->rc_devidx];
@@ -3091,11 +3076,8 @@ vdev_raidz_io_start(zio_t *zio)
 	raidz_map_t *rm;
 
 	const blkptr_t *layout_bp = zio->io_bp;
-#ifndef _KERNEL
 	if (zio->io_pr19262_owner_mapped)
 		layout_bp = &zio->io_pr19262_owner_bp;
-#endif
-#ifndef _KERNEL
 	blkptr_t physical_bp;
 	pr19262_probe_move_t probe_move;
 	boolean_t probe_hit = pr19262_probe_lookup(zio, &probe_move);
@@ -3112,7 +3094,7 @@ vdev_raidz_io_start(zio_t *zio)
 		    BP_GET_DEDUP(zio->io_bp) || BP_IS_GANG(zio->io_bp) ||
 		    BP_GET_NDVAS(zio->io_bp) != 1 ||
 		    (zio->io_size != 128 * 1024 &&
-		    getenv("PR19262_SPACE_TEST") == NULL) ||
+		    pr19262_env("PR19262_SPACE_TEST") == NULL) ||
 		    DVA_GET_ASIZE(&zio->io_bp->blk_dva[0]) !=
 		    probe_move.src_asize ||
 		    (zio->io_offset != probe_move.src &&
@@ -3132,20 +3114,17 @@ vdev_raidz_io_start(zio_t *zio)
 		layout_bp = &physical_bp;
 		zio->io_offset = probe_move.dst;
 		zio->io_txg = probe_move.dst_birth;
-		(void) fprintf(stderr, "PR19262_PROBE_TRANSLATE %llx %llx "
+		pr19262_printf("PR19262_PROBE_TRANSLATE %llx %llx "
 		    "%llu %llu\n", (u_longlong_t)probe_move.src,
 		    (u_longlong_t)probe_move.dst,
 		    (u_longlong_t)probe_move.src_asize,
 		    (u_longlong_t)probe_move.dst_asize);
 	}
-#endif
 	vdev_raidz_layout_t layout = vdev_raidz_layout_for_bp(vdrz, layout_bp);
-#ifndef _KERNEL
 	if (zio->io_pr19262_owner_mapped) {
 		layout.vrl_width = zio->io_pr19262_backing_width;
 		layout.vrl_nparity = zio->io_pr19262_backing_parity;
 	}
-#endif
 	if (zfs_flags & ZFS_DEBUG_RAIDZ_RECONSTRUCT)
 		zfs_dbgmsg("io_start: vrl_width=%llu phys=%d "
 		    "off=%llu type=%d", (u_longlong_t)layout.vrl_width,
@@ -3236,14 +3215,13 @@ vdev_raidz_io_start(zio_t *zio)
 		    layout.vrl_nparity);
 	}
 	rm->rm_original_width = vdrz->vd_original_width;
-#ifndef _KERNEL
-	if (probe_hit && getenv("PR19262_PROBE_TRACE") != NULL) {
+	if (probe_hit && pr19262_env("PR19262_PROBE_TRACE") != NULL) {
 		for (int r = 0; r < rm->rm_nrows; r++) {
 			raidz_row_t *row = rm->rm_row[r];
 			for (int c = 0; c < row->rr_cols; c++) {
 				raidz_col_t *col = &row->rr_col[c];
 				if (col->rc_size != 0)
-					(void) fprintf(stderr,
+					pr19262_printf(
 					    "PR19262_PROBE_COL %llx %llx %d "
 					    "%llx %llx\n",
 					    (u_longlong_t)probe_move.src,
@@ -3255,7 +3233,6 @@ vdev_raidz_io_start(zio_t *zio)
 			}
 		}
 	}
-#endif
 
 
 	zio->io_vsd = rm;
@@ -6778,13 +6755,11 @@ vdev_raidz_init(spa_t *spa, nvlist_t *nv, void **tsd)
 		nparity = 1;
 	}
 
-#ifndef _KERNEL
 	uint64_t certified = 0;
 	if (nvlist_lookup_uint64(nv, PR19262_CONFIG_CERTIFIED,
 	    &certified) == 0 && (certified > VDEV_RAIDZ_MAXPARITY ||
 	    children < certified + 1))
 		return (SET_ERROR(EINVAL));
-#endif
 	vdev_raidz_t *vdrz = kmem_zalloc(sizeof (*vdrz), KM_SLEEP);
 	vdrz->vn_vre.vre_vdev_id = -1;
 	vdrz->vn_vre.vre_offset = UINT64_MAX;
@@ -6807,9 +6782,7 @@ vdev_raidz_init(spa_t *spa, nvlist_t *nv, void **tsd)
 
 	vdrz->vd_parity_epochs_config_present =
 	    nvlist_exists(nv, ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS);
-#ifndef _KERNEL
 	vdrz->vd_pr19262_certified = certified;
-#endif
 	uint64_t *pe_label;
 	unsigned int pe_label_size = 0;
 	if (!raidz_ignore_parity_epochs &&
@@ -6920,11 +6893,9 @@ vdev_raidz_config_generate(vdev_t *vd, nvlist_t *nv)
 		fnvlist_add_uint64_array(nv, ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS,
 		    vdrz->vd_parity_epochs, vdrz->vd_parity_epoch_count * 3);
 	}
-#ifndef _KERNEL
 	if (vdrz->vd_pr19262_certified != 0)
 		fnvlist_add_uint64(nv, PR19262_CONFIG_CERTIFIED,
 		    vdrz->vd_pr19262_certified);
-#endif
 	mutex_exit(&vdrz->vd_expand_lock);
 }
 

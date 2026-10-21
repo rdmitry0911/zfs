@@ -1,7 +1,45 @@
 /* SPDX-License-Identifier: CDDL-1.0 */
 #ifndef _VDEV_RELOC_ENGINE_H
 #define	_VDEV_RELOC_ENGINE_H
-#ifndef _KERNEL
+
+/*
+ * The engine prints its witness markers and reads its test hooks through
+ * these: userspace (ztest) prints to stdout and reads the environment, the
+ * kernel logs to zfs_dbgmsg and has no hooks (every cut point is dead).
+ */
+#ifdef _KERNEL
+/* An expression (zfs_dbgmsg is an if statement): usable in a ternary. */
+#define	pr19262_printf(...) \
+	(zfs_dbgmsg_enable ? __dprintf(B_FALSE, __FILE__, __func__, __LINE__, \
+	__VA_ARGS__) : (void)0)
+#define	pr19262_env(name)	((const char *)NULL)
+#define	pr19262_flush()		((void)0)
+#define	pr19262_exit(code)	panic("pr19262 cut %d", (int)(code))
+#define	pr19262_strtoull(s, e, b)	(0ULL)
+#else
+#define	pr19262_printf(...)	(void) printf(__VA_ARGS__)
+#define	pr19262_env(name)	getenv(name)
+#define	pr19262_flush()		(void) fflush(NULL)
+#define	pr19262_exit(code)	_exit(code)
+#define	pr19262_strtoull(s, e, b)	strtoull(s, e, b)
+#endif
+
+/*
+ * Arrays sized by owners, rows or pages: the kernel takes them from the
+ * virtual allocator (no "large kmem_alloc" warning); kmem_free handles both.
+ */
+#ifdef _KERNEL
+#define	pr19262_alloc(size, flags)	vmem_alloc(size, flags)
+#define	pr19262_zalloc(size, flags)	vmem_zalloc(size, flags)
+#else
+#define	pr19262_alloc(size, flags)	kmem_alloc(size, flags)
+#define	pr19262_zalloc(size, flags)	kmem_zalloc(size, flags)
+#endif
+
+/* Every invalid-format verdict of the engine names its site in the log. */
+#define	ENGINE_EINVAL(reason) \
+	(pr19262_printf("PR19262_EINVAL file=%s reason=%d line=%d\n", \
+	__FILE__, (reason), __LINE__), EINVAL)
 #include <sys/uberblock.h>
 #include <sys/range_tree.h>
 /* Private userspace experiment; no supported persistent/public ABI. */
@@ -66,6 +104,8 @@ void pr19262_engine_init(void);
 void pr19262_engine_fini(void);
 void pr19262_engine_start(spa_t *);
 boolean_t pr19262_engine_active(spa_t *);
+vdev_t *pr19262_engine_vdev(spa_t *);
+boolean_t pr19262_engine_bp_foreign(spa_t *, const blkptr_t *);
 uint64_t pr19262_engine_limit(spa_t *, boolean_t);
 void pr19262_engine_block_new(boolean_t);
 void pr19262_engine_fail_writes(boolean_t);
@@ -188,6 +228,7 @@ int pr19262_engine_convert(spa_t *, uint64_t, uint64_t, uint64_t,
 int pr19262_engine_fence(spa_t *, uint64_t *, uint64_t *, uint64_t *,
     uint64_t *);
 int pr19262_engine_certify(spa_t *, uint64_t);
+int pr19262_engine_epoch(spa_t *, uint64_t, uint64_t *);
 uint64_t pr19262_engine_floor(spa_t *);
 /* Incarnation of an owner overlapping [V, V + size), or 0 when none. */
 uint64_t pr19262_engine_owner_incarnation(spa_t *, uint64_t, uint64_t);
@@ -226,6 +267,10 @@ typedef struct pr19262_engine_admit_report {
 	uint64_t levels;
 	uint64_t converter_bytes;
 	uint64_t space_rejections;
+	uint64_t restarts;
+	/* Free space of other normal-class vdevs; guarded allocations. */
+	uint64_t foreign;
+	uint64_t guarded;
 	engine_admit_class_t classes[PR19262_ADMIT_CLASSES];
 } pr19262_engine_admit_report_t;
 int pr19262_engine_admit(spa_t *, uint_t, uint64_t, uint64_t, uint64_t,
@@ -239,5 +284,4 @@ void pr19262_engine_admit_report(spa_t *, const char *,
 uint64_t pr19262_engine_hidden_dspace(spa_t *);
 /* Per-member count of valid live raw pages (arrays of vdev_children). */
 int pr19262_engine_raw_audit(spa_t *, const char *, uint64_t *, uint64_t *);
-#endif
 #endif

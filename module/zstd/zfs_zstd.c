@@ -265,8 +265,9 @@ static struct zstd_pool *zstd_mempool_dctx;
 #define	ADDRESS_SANITIZER 1
 #endif
 
-/* Kernel space. */
-#if defined(_KERNEL) && defined(ADDRESS_SANITIZER)
+/* Kernel space: KASAN defines __SANITIZE_ADDRESS__ but exports no __asan_*. */
+#if defined(_KERNEL) && (defined(ADDRESS_SANITIZER) || \
+	defined(__SANITIZE_ADDRESS__))
 void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
 void __asan_poison_memory_region(void const volatile *addr, size_t size);
 void __asan_unpoison_memory_region(void const volatile *addr, size_t size) {};

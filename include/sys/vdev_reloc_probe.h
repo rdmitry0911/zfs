@@ -2,7 +2,6 @@
 /* Private feasibility API. No persistent representation is defined here. */
 #ifndef _VDEV_RELOC_PROBE_H
 #define	_VDEV_RELOC_PROBE_H
-#ifndef _KERNEL
 
 typedef struct pr19262_backing_desc {
 	uint64_t offset;
@@ -60,9 +59,9 @@ int pr19262_space_stage_publish(void *, const pr19262_stage_t *);
 int pr19262_space_stage_free(void *, const pr19262_stage_t *, boolean_t);
 int pr19262_space_allocate_at(void *, uint64_t, uint64_t, uint64_t,
     uint64_t, pr19262_space_pair_t *);
+boolean_t pr19262_tx_client_txg(spa_t *, uint64_t);
 zio_t *pr19262_read_physical(spa_t *, const blkptr_t *, abd_t *, uint64_t);
 zio_t *pr19262_write_physical(spa_t *, uint64_t, blkptr_t *, abd_t *,
     uint64_t);
 
-#endif
 #endif

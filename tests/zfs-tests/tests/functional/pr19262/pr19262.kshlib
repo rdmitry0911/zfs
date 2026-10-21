@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: CDDL-1.0
+#
+# Helpers for the private pr19262 online-lifetime engine tests.
+#
+
+. $STF_SUITE/include/libtest.shlib
+
+typeset PR19262_POOL=${TESTPOOL}_pr19262
+typeset PR19262_DIR=$TEST_BASE_DIR/pr19262.$$
+typeset PR19262_PARAMS=/sys/module/zfs/parameters
+
+function pr19262_param_set
+{
+	typeset name=$1
+	shift
+	log_must eval "echo '$*' > $PR19262_PARAMS/$name"
+}
+
+function pr19262_status
+{
+	cat $PR19262_PARAMS/zfs_pr19262_status
+}
+
+# Wait until the status line carries the given state (or error).
+function pr19262_wait_state
+{
+	typeset want=$1
+	typeset -i i=0
+	while (( i < 1800 )); do
+		typeset s=$(pr19262_status)
+		if [[ $s == *"state=$want"* ]]; then
+			log_note "$s"
+			return 0
+		fi
+		if [[ $s == *"state=error"* ]]; then
+			log_fail "engine error: $s"
+		fi
+		sleep 1
+		(( i += 1 ))
+	done
+	log_fail "timeout waiting for state=$want: $(pr19262_status)"
+}
+
+function pr19262_make_members
+{
+	typeset -i n=$1
+	typeset size=${2:-256M}
+	mkdir -p $PR19262_DIR
+	typeset -i i=0
+	while (( i < n )); do
+		log_must truncate -s $size $PR19262_DIR/v$i
+		(( i += 1 ))
+	done
+}
+
+function pr19262_members
+{
+	typeset -i n=$1
+	typeset -i i=0
+	typeset list=""
+	while (( i < n )); do
+		list="$list $PR19262_DIR/v$i"
+		(( i += 1 ))
+	done
+	echo $list
+}
+
+# Payload: ordinary writes, then synchronous ones; reference checksums.
+function pr19262_write_payload
+{
+	typeset mnt=$1
+	typeset tag=$2
+	log_must dd if=/dev/urandom of=$mnt/async-$tag bs=1M count=24 \
+	    status=none
+	log_must dd if=/dev/urandom of=$mnt/sync-$tag bs=128k count=64 \
+	    oflag=sync status=none
+	log_must dd if=/dev/urandom of=$mnt/small-$tag bs=8k count=256 \
+	    oflag=sync status=none
+	log_must sync
+}
+
+function pr19262_checksums
+{
+	typeset mnt=$1
+	typeset out=$2
+	(cd $mnt && find . -type f | sort | xargs md5sum) > $out
+}
+
+function pr19262_verify_checksums
+{
+	typeset mnt=$1
+	typeset ref=$2
+	typeset now=$PR19262_DIR/now.$$
+	pr19262_checksums $mnt $now
+	log_must diff $ref $now
+	rm -f $now
+}
+
+function pr19262_cleanup
+{
+	poolexists $PR19262_POOL && destroy_pool $PR19262_POOL
+	rm -rf $PR19262_DIR
+}

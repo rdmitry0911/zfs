@@ -362,6 +362,7 @@ nobase_dist_datadir_zfs_tests_tests_DATA += \
 	functional/projectquota/projectquota_common.kshlib \
 	functional/quota/quota.cfg \
 	functional/quota/quota.kshlib \
+	functional/pr19262/pr19262.kshlib \
 	functional/raidz/blockfiles/raidz_dedup_overrun-0.dat.bz2 \
 	functional/raidz/blockfiles/raidz_dedup_overrun-1.dat.bz2 \
 	functional/raidz/blockfiles/raidz_dedup_overrun-2.dat.bz2 \
@@ -2020,6 +2021,10 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/quota/quota_006_neg.ksh \
 	functional/quota/quota_007_pos.ksh \
 	functional/quota/setup.ksh \
+	functional/pr19262/cleanup.ksh \
+	functional/pr19262/pr19262_degraded_pos.ksh \
+	functional/pr19262/pr19262_online_pos.ksh \
+	functional/pr19262/setup.ksh \
 	functional/raidz/cleanup.ksh \
 	functional/raidz/raidz_001_neg.ksh \
 	functional/raidz/raidz_002_pos.ksh \

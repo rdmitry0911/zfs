@@ -156,7 +156,8 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 		error = pr19262_engine_admit(spa, class, probe_tx.reserved,
 		    bytes, m_pages, frames);
 		if (error != 0) {
-			probe_tx.rejected++;
+			if (error == ENOSPC)
+				probe_tx.rejected++;
 			goto out;
 		}
 	}
@@ -220,13 +221,28 @@ probe_tx_unreserve(dmu_tx_t *tx)
 	mutex_exit(&probe_tx.lock);
 }
 
+/* Does this TXG carry client credit (as opposed to sync-context or ZIL)? */
+boolean_t
+pr19262_tx_client_txg(spa_t *spa, uint64_t txg)
+{
+	(void) spa;
+	mutex_enter(&probe_tx.lock);
+	probe_tx_budget_t *b = probe_tx_budget_find(txg);
+	boolean_t client = b != NULL && b->pending_refs != 0;
+	mutex_exit(&probe_tx.lock);
+	return (client);
+}
+
 void
 pr19262_tx_allocated(spa_t *spa, metaslab_class_t *mc, vdev_t *vd,
     uint64_t offset, uint64_t size, uint64_t txg)
 {
+	/* Native vdevs beside the translated one spend no physical credit. */
+	vdev_t *target = pr19262_engine_vdev(spa);
 	mutex_enter(&probe_tx.lock);
 	if (!probe_tx_scope(spa) ||
-	    mc != spa_normal_class(spa))
+	    mc != spa_normal_class(spa) ||
+	    (target != NULL && vd != target))
 		goto out;
 	probe_tx_budget_t *b = probe_tx_budget_find(txg);
 	/* Open-context ZIL needs its own durable budget, not client credit. */
@@ -395,7 +411,7 @@ pr19262_tx_check(spa_t *spa)
 	VERIFY0(probe_tx.reserved);
 	VERIFY0(probe_tx.inflight);
 	VERIFY(list_is_empty(&probe_tx.allocations));
-	(void) printf("PR19262_ENGINE_BUDGET grants=%llu consumed=%llu "
+	pr19262_printf("PR19262_ENGINE_BUDGET grants=%llu consumed=%llu "
 	    "callbacks=%llu unallocations=%llu\n",
 	    (u_longlong_t)probe_tx.granted, (u_longlong_t)probe_tx.consumed,
 	    (u_longlong_t)probe_tx.callbacks,
@@ -534,7 +550,7 @@ pr19262_tx_probe(spa_t *spa)
 	VERIFY3U(probe_tx.rejected, ==, 3);
 	VERIFY3U(probe_tx.granted, ==, 4);
 	VERIFY3U(probe_tx.consumed, >, physical);
-	(void) printf("PR19262_TX_PASS held=%llu rollback=%llu "
+	pr19262_printf("PR19262_TX_PASS held=%llu rollback=%llu "
 	    "callbacks=%llu rejected=%llu granted=%llu "
 	    "consumed=%llu unallocations=%llu\n",
 	    (u_longlong_t)held, (u_longlong_t)probe_tx.rolled_back,
