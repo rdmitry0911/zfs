@@ -24,6 +24,7 @@
 #include <sys/dsl_pool.h>
 #include <sys/dsl_scan.h>
 #include <sys/vdev_impl.h>
+#include <sys/vdev_reloc_engine.h>
 #include <sys/vdev_draid.h>
 #include <sys/zio.h>
 #include <sys/zio_checksum.h>
@@ -545,6 +546,14 @@ vdev_mirror_child_select(zio_t *zio)
 			mc->mc_error = SET_ERROR(ESTALE);
 			mc->mc_skipped = 1;
 			mc->mc_speculative = 1;
+			pr19262_printf("PR19262_MIRROR_STALE vd=%llu txg=%llu "
+			    "offset=%llu objset=%llu object=%llu level=%lld "
+			    "blkid=%llu\n", (u_longlong_t)mc->mc_vd->vdev_id,
+			    (u_longlong_t)txg, (u_longlong_t)mc->mc_offset,
+			    (u_longlong_t)zio->io_bookmark.zb_objset,
+			    (u_longlong_t)zio->io_bookmark.zb_object,
+			    (longlong_t)zio->io_bookmark.zb_level,
+			    (u_longlong_t)zio->io_bookmark.zb_blkid);
 			continue;
 		}
 
@@ -920,6 +929,10 @@ vdev_mirror_io_done(zio_t *zio)
 				    zio->io_txg, 1))
 					continue;
 				mc->mc_error = SET_ERROR(ESTALE);
+				pr19262_printf("PR19262_MIRROR_STALE_DONE "
+				    "vd=%llu txg=%llu\n",
+				    (u_longlong_t)mc->mc_vd->vdev_id,
+				    (u_longlong_t)zio->io_txg);
 			}
 
 			zio_nowait(zio_vdev_child_io(zio, zio->io_bp,

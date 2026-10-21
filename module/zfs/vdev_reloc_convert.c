@@ -727,6 +727,14 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		/* Hold the open txg: nothing is freed under the walk. */
 		dmu_tx_t *fence = dmu_tx_create_dd(dp->dp_mos_dir);
 		VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
+		/*
+		 * The txg before the held one may still be quiescing or
+		 * syncing, and its sync frees blocks that the last synced
+		 * root (the walk's root) references.  Wait for every txg
+		 * below the held one, so that the root is the held txg's
+		 * predecessor and no free can land under the walk.
+		 */
+		txg_wait_synced(dp, dmu_tx_get_txg(fence) - 1);
 		c.pending = 0;
 		/* Encrypted datasets need no key: only BPs matter. */
 		error = traverse_pool(spa, 0,

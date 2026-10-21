@@ -17,6 +17,7 @@
 #include <sys/zfs_context.h>
 #include <sys/dmu_objset.h>
 #include <sys/dmu_traverse.h>
+#include <sys/vdev_reloc_engine.h>
 #include <sys/dsl_dataset.h>
 #include <sys/dsl_dir.h>
 #include <sys/dsl_pool.h>
@@ -222,6 +223,7 @@ traverse_visitbp(traverse_data_t *td, const dnode_phys_t *dnp,
     const blkptr_t *bp, const zbookmark_phys_t *zb)
 {
 	int err = 0;
+	int read_err = 0;
 	arc_buf_t *buf = NULL;
 	prefetch_data_t *pd = td->td_pfd;
 
@@ -306,6 +308,7 @@ traverse_visitbp(traverse_data_t *td, const dnode_phys_t *dnp,
 
 		err = arc_read(NULL, td->td_spa, bp, arc_getbuf_func, &buf,
 		    ZIO_PRIORITY_ASYNC_READ, ZIO_FLAG_CANFAIL, &flags, zb);
+		read_err = err;
 		if (err != 0)
 			goto post;
 
@@ -378,6 +381,7 @@ traverse_visitbp(traverse_data_t *td, const dnode_phys_t *dnp,
 
 		err = arc_read(NULL, td->td_spa, bp, arc_getbuf_func, &buf,
 		    ZIO_PRIORITY_ASYNC_READ, zio_flags, &flags, zb);
+		read_err = err;
 		if (err != 0)
 			goto post;
 
@@ -405,6 +409,7 @@ traverse_visitbp(traverse_data_t *td, const dnode_phys_t *dnp,
 
 		err = arc_read(NULL, td->td_spa, bp, arc_getbuf_func, &buf,
 		    ZIO_PRIORITY_ASYNC_READ, zio_flags, &flags, zb);
+		read_err = err;
 		if (err != 0)
 			goto post;
 
@@ -455,6 +460,16 @@ traverse_visitbp(traverse_data_t *td, const dnode_phys_t *dnp,
 post:
 	if (err == 0 && (td->td_flags & TRAVERSE_POST))
 		err = td->td_func(td->td_spa, NULL, bp, zb, dnp, td->td_arg);
+	/* Diagnostic: the innermost frame names the stale source. */
+	if (err == ESTALE)
+		pr19262_printf("PR19262_TRAVERSE_STALE objset=%llu object=%llu "
+		    "level=%lld blkid=%llu type=%u lbirth=%llu pbirth=%llu "
+		    "ndvas=%u read=%d\n", (u_longlong_t)zb->zb_objset,
+		    (u_longlong_t)zb->zb_object, (longlong_t)zb->zb_level,
+		    (u_longlong_t)zb->zb_blkid, (uint_t)BP_GET_TYPE(bp),
+		    (u_longlong_t)BP_GET_LOGICAL_BIRTH(bp),
+		    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(bp),
+		    (uint_t)BP_GET_NDVAS(bp), read_err == ESTALE);
 
 	if ((td->td_flags & TRAVERSE_HARD) && (err == EIO || err == ECKSUM)) {
 		/*

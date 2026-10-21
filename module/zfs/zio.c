@@ -63,6 +63,9 @@ const char *const zio_type_name[ZIO_TYPES] = {
 };
 
 int zio_dva_throttle_enabled = B_TRUE;
+static uint64_t pr19262_dispatch_stale_prints;
+static uint64_t pr19262_done_stale_prints;
+
 static int zio_deadman_log_all = B_FALSE;
 
 /*
@@ -5325,6 +5328,24 @@ zio_vdev_io_start(zio_t *zio)
 		if (error == EINPROGRESS)
 			return (NULL);
 		if (error != 0) {
+			if (error == ESTALE &&
+			    pr19262_dispatch_stale_prints++ < 8) {
+				pr19262_printf("PR19262_DISPATCH_STALE type=%u "
+				    "vd=%llu offset=%llu size=%llu objset=%llu "
+				    "object=%llu level=%lld blkid=%llu\n",
+				    (uint_t)zio->io_type,
+				    (u_longlong_t)zio->io_vd->vdev_id,
+				    (u_longlong_t)zio->io_offset,
+				    (u_longlong_t)zio->io_size,
+				    (u_longlong_t)zio->io_bookmark.zb_objset,
+				    (u_longlong_t)zio->io_bookmark.zb_object,
+				    (longlong_t)zio->io_bookmark.zb_level,
+				    (u_longlong_t)zio->io_bookmark.zb_blkid);
+				pr19262_flush();
+				pr19262_engine_hold_report(
+				    zio->io_pr19262_owner_hold);
+				pr19262_backtrace();
+			}
 			zio->io_error = error;
 			zio_execute(zio);
 			return (NULL);
@@ -6223,6 +6244,19 @@ zio_done_postread_done(zio_t *zio)
 static zio_t *
 zio_done(zio_t *zio)
 {
+	/* Diagnostic: every zio that ends with ESTALE, innermost first. */
+	if (zio->io_error == ESTALE && pr19262_done_stale_prints++ < 16)
+		pr19262_printf("PR19262_ZIO_STALE type=%u child=%u vd=%lld "
+		    "offset=%llu size=%llu flags=%llx objset=%llu object=%llu "
+		    "level=%lld blkid=%llu\n", (uint_t)zio->io_type,
+		    (uint_t)zio->io_child_type,
+		    (longlong_t)(zio->io_vd != NULL ? zio->io_vd->vdev_id : -1),
+		    (u_longlong_t)zio->io_offset, (u_longlong_t)zio->io_size,
+		    (u_longlong_t)zio->io_flags,
+		    (u_longlong_t)zio->io_bookmark.zb_objset,
+		    (u_longlong_t)zio->io_bookmark.zb_object,
+		    (longlong_t)zio->io_bookmark.zb_level,
+		    (u_longlong_t)zio->io_bookmark.zb_blkid);
 	/*
 	 * Always attempt to keep stack usage minimal here since
 	 * we can be called recursively up to 19 levels deep.

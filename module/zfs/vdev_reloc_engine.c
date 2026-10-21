@@ -67,6 +67,8 @@ typedef struct engine_hold {
 	uint_t count;
 	engine_owner_t *owner[SPA_DVAS_PER_BP];
 	int error;
+	/* Diagnostic: 1 inherited, 2 no owner (ENOENT), 3 stale verdict. */
+	uint8_t error_site;
 	uint64_t started;
 	boolean_t gang;
 	boolean_t write;
@@ -245,6 +247,8 @@ static struct {
 	uint64_t stale_verdicts;
 	uint64_t retire_prints;
 	uint64_t abort_prints;
+	uint64_t inherit_prints;
+	uint64_t hold_report_prints;
 } engine;
 
 static engine_version_t *
@@ -1105,8 +1109,19 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 	engine_hold_t *h = kmem_zalloc(sizeof (*h), KM_SLEEP);
 	h->refs = 1;
 	h->write = !read;
-	if (prior != NULL)
+	if (prior != NULL) {
 		h->error = prior->error;
+		h->error_site = prior->error != 0 ? 1 : 0;
+	}
+	if (prior != NULL && prior->error == ESTALE &&
+	    engine.inherit_prints++ < 4) {
+		pr19262_printf("PR19262_HOLD_INHERIT_STALE bp=%d write=%u "
+		    "prior_count=%u prior_write=%u prior_gang=%u "
+		    "prior_started=%llu\n", bp != NULL, !read, prior->count,
+		    prior->write, prior->gang, (u_longlong_t)prior->started);
+		pr19262_flush();
+		pr19262_backtrace();
+	}
 	h->started = prior != NULL ? prior->started : ++engine.sequence;
 	h->gang = (prior != NULL && prior->gang) ||
 	    (bp != NULL && BP_IS_GANG(bp));
@@ -1138,6 +1153,7 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 			if (!zfs_range_tree_contains(engine.legacy,
 			    DVA_GET_OFFSET(dva), size)) {
 				h->error = ENOENT;
+				h->error_site = 2;
 				continue;
 			}
 			e = kmem_zalloc(sizeof (*e), KM_SLEEP);
@@ -1161,6 +1177,7 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 		    (descendant && e->created > h->started);
 		if (reused || gone) {
 			h->error = ESTALE;
+			h->error_site = 3;
 			if (engine.stale_verdicts++ < 16)
 				pr19262_printf("PR19262_HOLD_STALE v=%llu "
 				    "reused=%u gone=%u retired=%u aborted=%u "
@@ -1175,6 +1192,10 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 				    (uint_t)BP_GET_TYPE(bp),
 				    (u_longlong_t)e->retired_txg,
 				    (u_longlong_t)spa_last_synced_txg(spa));
+			if (engine.stale_verdicts <= 3) {
+				pr19262_flush();
+				pr19262_backtrace();
+			}
 		}
 		e->holds++;
 		e->queued_writers += h->write;
@@ -1229,6 +1250,42 @@ pr19262_engine_io_rele(zio_t *zio)
 	if (e->aborted)
 		engine_abort_done(e);
 	zio->io_pr19262_owner_version = NULL;
+	mutex_exit(&engine.lock);
+}
+
+/* Diagnostic: the hold behind a stale dispatch verdict. */
+static void
+engine_hold_report(const engine_hold_t *h)
+{
+	pr19262_printf("PR19262_HOLD_REPORT error=%d site=%u count=%u "
+	    "write=%u gang=%u started=%llu foreign=%u\n", h->error,
+	    h->error_site, h->count, h->write, h->gang,
+	    (u_longlong_t)h->started, h->foreign);
+	for (uint_t i = 0; i < h->count; i++) {
+		const engine_owner_t *e = h->owner[i];
+		pr19262_printf("PR19262_HOLD_OWNER i=%u v=%llu size=%llu "
+		    "incarnation=%llu allocation_txg=%llu retired=%u "
+		    "aborted=%u copying=%u holds=%llu retired_txg=%llu\n", i,
+		    (u_longlong_t)e->v, (u_longlong_t)e->size,
+		    (u_longlong_t)e->incarnation,
+		    (u_longlong_t)e->allocation_txg, e->retired, e->aborted,
+		    e->copying, (u_longlong_t)e->holds,
+		    (u_longlong_t)e->retired_txg);
+	}
+	pr19262_flush();
+}
+
+/* Diagnostic: report a zio's hold from the pipeline, ungated. */
+void
+pr19262_engine_hold_report(void *hold)
+{
+	mutex_enter(&engine.lock);
+	if (hold == NULL)
+		pr19262_printf("PR19262_HOLD_REPORT null hold\n");
+	else
+		engine_hold_report(hold);
+	pr19262_printf("PR19262_HOLD_REPORT_COUNTER value=%llu\n",
+	    (u_longlong_t)engine.hold_report_prints);
 	mutex_exit(&engine.lock);
 }
 
@@ -1293,6 +1350,9 @@ pr19262_engine_dispatch(zio_t *zio)
 	if ((!zio->io_pr19262_owner_copy &&
 	    (h == NULL || h->error != 0)) || zio->io_bp == NULL) {
 		int error = h != NULL && h->error != 0 ? h->error : ENOENT;
+		if (error == ESTALE && h != NULL &&
+		    engine.hold_report_prints++ < 4)
+			engine_hold_report(h);
 		mutex_exit(&engine.lock);
 		return (error);
 	}

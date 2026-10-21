@@ -235,6 +235,7 @@ void pr19262_engine_fence_schedule(spa_t *);
 void pr19262_engine_describe(spa_t *, const blkptr_t *, const char *,
     uint64_t, uint64_t);
 void pr19262_engine_quiesce(spa_t *);
+void pr19262_engine_hold_report(void *);
 int pr19262_engine_epoch(spa_t *, uint64_t, uint64_t *);
 uint64_t pr19262_engine_floor(spa_t *);
 /* Incarnation of an owner overlapping [V, V + size), or 0 when none. */

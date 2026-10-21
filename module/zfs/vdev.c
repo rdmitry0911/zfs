@@ -34,6 +34,7 @@
 #include <sys/dmu_tx.h>
 #include <sys/dsl_dir.h>
 #include <sys/vdev_impl.h>
+#include <sys/vdev_reloc_engine.h>
 #include <sys/vdev_rebuild.h>
 #include <sys/vdev_draid.h>
 #include <sys/uberblock_impl.h>
@@ -3228,6 +3229,9 @@ vdev_dirty_leaves(vdev_t *vd, int flags, uint64_t txg)
  * Therefore, that is all we keep on disk.  When loading the pool, or after
  * a configuration change, we generate all other DTLs from first principles.
  */
+/* Diagnostic: who marks a txg missing during the overlapping soak. */
+static uint64_t pr19262_dtl_dirty_prints;
+
 void
 vdev_dtl_dirty(vdev_t *vd, vdev_dtl_type_t t, uint64_t txg, uint64_t size)
 {
@@ -3242,6 +3246,15 @@ vdev_dtl_dirty(vdev_t *vd, vdev_dtl_type_t t, uint64_t txg, uint64_t size)
 		/* Clear whatever is there already. */
 		zfs_range_tree_clear(rt, txg, size);
 		zfs_range_tree_add(rt, txg, size);
+		if (t == DTL_MISSING && pr19262_dtl_dirty_prints++ < 16) {
+			pr19262_printf("PR19262_DTL_DIRTY vd=%llu top=%llu "
+			    "txg=%llu size=%llu\n", (u_longlong_t)vd->vdev_id,
+			    (u_longlong_t)(vd->vdev_top != NULL ?
+			    vd->vdev_top->vdev_id : vd->vdev_id),
+			    (u_longlong_t)txg, (u_longlong_t)size);
+			pr19262_flush();
+			pr19262_backtrace();
+		}
 	}
 	mutex_exit(&vd->vdev_dtl_lock);
 }

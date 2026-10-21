@@ -7059,6 +7059,18 @@ arc_write_done(zio_t *zio)
 			pr19262_engine_describe(zio->io_spa, zio->io_bp,
 			    "arc-write-twice", exists->b_birth,
 			    zio->io_flags);
+			pr19262_printf("PR19262_ARC_TWICE orig_equal=%d "
+			    "orig_hole=%d orig_birth=%llu nopwrite=%u "
+			    "rewrite=%u exists_anon=%d exists_refs=%d\n",
+			    BP_EQUAL(&zio->io_bp_orig, zio->io_bp),
+			    BP_IS_HOLE(&zio->io_bp_orig),
+			    (u_longlong_t)BP_GET_LOGICAL_BIRTH(
+			    &zio->io_bp_orig),
+			    zio->io_prop.zp_nopwrite, zio->io_prop.zp_rewrite,
+			    exists->b_l1hdr.b_state == arc_anon,
+			    (int)zfs_refcount_count(
+			    &exists->b_l1hdr.b_refcnt));
+			pr19262_flush();
 			if (zio->io_flags & ZIO_FLAG_IO_REWRITE) {
 				if (!BP_EQUAL(&zio->io_bp_orig, zio->io_bp))
 					panic("bad overwrite, hdr=%p exists=%p",

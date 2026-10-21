@@ -14707,6 +14707,7 @@ pr19262_soak(spa_t *spa, uint64_t parity, uint64_t seconds)
 	hrtime_t start = gethrtime();
 	hrtime_t deadline = start + SEC2NSEC(seconds);
 	uint64_t cycles = 0, fences = 0, verifies = 0, fence_busy = 0;
+	boolean_t was_settled = !pr19262_soak_overlap;
 	uint64_t max_segments = 0, max_pages = 0, max_retired = 0;
 	uint64_t max_tombstones = 0, reclaimed_total = 0, released_total = 0;
 	pr19262_engine_census_t c;
@@ -14730,6 +14731,9 @@ pr19262_soak(spa_t *spa, uint64_t parity, uint64_t seconds)
 		pr19262_engine_census(spa, parity, &c);
 		boolean_t settled = !pr19262_soak_overlap ||
 		    pr19262_soak_converted;
+		/* An overlapping soak verifies once as soon as it settles. */
+		boolean_t just_settled = settled && !was_settled;
+		was_settled = settled;
 		if (settled) {
 			VERIFY0(c.legacy_bytes);
 			VERIFY0(c.weak_current);
@@ -14740,7 +14744,7 @@ pr19262_soak(spa_t *spa, uint64_t parity, uint64_t seconds)
 		max_tombstones = MAX(max_tombstones, c.tombstones);
 		pr19262_engine_admit_report(spa, "soak", &r);
 		VERIFY3U(r.free, >=, r.protected);
-		if (cycles % 30 == 0 && settled) {
+		if ((cycles % 30 == 0 && settled) || just_settled) {
 			/*
 			 * The traversal walks one root; writers park so no
 			 * txg frees the blocks it still has to read (the live
