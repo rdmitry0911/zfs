@@ -3253,7 +3253,6 @@ vdev_dtl_dirty(vdev_t *vd, vdev_dtl_type_t t, uint64_t txg, uint64_t size)
 			    vd->vdev_top->vdev_id : vd->vdev_id),
 			    (u_longlong_t)txg, (u_longlong_t)size);
 			pr19262_flush();
-			pr19262_backtrace();
 		}
 	}
 	mutex_exit(&vd->vdev_dtl_lock);

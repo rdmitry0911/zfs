@@ -1480,9 +1480,16 @@ engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d, uint64_t birth,
 	/*
 	 * A block allocated ahead of its write (a log chain's tail) has
 	 * nothing to copy; it may be rebound while nothing writes it, since
-	 * writes dispatched from now on defer behind the copying flag.
+	 * writes dispatched from now on defer behind the copying flag.  A
+	 * legacy extent classified by a read is marked ready because its
+	 * content is unknown; when the caller has read it and found no
+	 * valid content (the unwritten tail a log header points at, born
+	 * before the engine), the rebind is allowed as well.
 	 */
-	if (e->copying || e->cur->ready == unwritten ||
+	boolean_t legacy = e->allocation_txg == 0 && e->cur->p == e->v &&
+	    e->cur->journal_seq == 0;
+	if (e->copying || (e->cur->ready == unwritten &&
+	    !(unwritten && legacy)) ||
 	    e->cur->writers != 0 || e->queued_writers != 0 ||
 	    e->catalog_txg > spa_last_synced_txg(spa)) {
 		mutex_exit(&engine.lock);

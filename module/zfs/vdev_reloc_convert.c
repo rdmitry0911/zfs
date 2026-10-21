@@ -331,6 +331,39 @@ pr19262_engine_quiesce(spa_t *spa)
  * control record carries the certificate first; the vdev config follows
  * so that vdev open tolerates that many missing children.
  */
+/* Name the owners whose current version is weaker than the target. */
+static void
+engine_weak_report(uint64_t parity)
+{
+	uint64_t n = 0;
+	mutex_enter(&engine.lock);
+	for (engine_owner_t *e = avl_first(&engine.owners);
+	    e != NULL && n < 8; e = AVL_NEXT(&engine.owners, e)) {
+		engine_version_t *b = e->cur;
+		if (b == NULL || e->retired || e->aborted ||
+		    b->parity >= parity)
+			continue;
+		n++;
+		pr19262_printf("PR19262_WEAK_OWNER v=%llu size=%llu "
+		    "alloc_txg=%llu catalog_txg=%llu claimed_txg=%llu inc=%llu "
+		    "holds=%llu queued_writers=%llu journal_pending=%u "
+		    "journal_touched=%u checkpoint_only=%u copying=%u p=%llu "
+		    "birth=%llu width=%llu "
+		    "parity=%llu leases=%llu writers=%llu ready=%u "
+		    "journal_seq=%llu created=%llu\n", (u_longlong_t)e->v,
+		    (u_longlong_t)e->size, (u_longlong_t)e->allocation_txg,
+		    (u_longlong_t)e->catalog_txg, (u_longlong_t)e->claimed_txg,
+		    (u_longlong_t)e->incarnation, (u_longlong_t)e->holds,
+		    (u_longlong_t)e->queued_writers, e->journal_pending,
+		    e->journal_touched, e->checkpoint_only, e->copying,
+		    (u_longlong_t)b->p, (u_longlong_t)b->birth,
+		    (u_longlong_t)b->width, (u_longlong_t)b->parity,
+		    (u_longlong_t)b->leases, (u_longlong_t)b->writers, b->ready,
+		    (u_longlong_t)b->journal_seq, (u_longlong_t)e->created);
+	}
+	mutex_exit(&engine.lock);
+}
+
 int
 pr19262_engine_certify(spa_t *spa, uint64_t parity)
 {
@@ -344,8 +377,17 @@ pr19262_engine_certify(spa_t *spa, uint64_t parity)
 	if (c.legacy_bytes != 0 || c.weak_current != 0 ||
 	    c.weak_retired != 0 || c.floor == 0 || checkpoint ||
 	    parity == 0 || parity > VDEV_RAIDZ_MAXPARITY ||
-	    engine.vd->vdev_children < parity + 1)
+	    engine.vd->vdev_children < parity + 1) {
+		pr19262_printf("PR19262_CERTIFY_REFUSED parity=%llu "
+		    "legacy=%llu weak_current=%llu weak_retired=%llu "
+		    "floor=%llu checkpoint=%u\n", (u_longlong_t)parity,
+		    (u_longlong_t)c.legacy_bytes, (u_longlong_t)c.weak_current,
+		    (u_longlong_t)c.weak_retired, (u_longlong_t)c.floor,
+		    checkpoint);
+		if (c.weak_current != 0)
+			engine_weak_report(parity);
 		return (EBUSY);
+	}
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
 	mutex_enter(&engine.store_lock);
 	int error = engine_pages_publish_control(spa, engine_pages.floor,
@@ -534,6 +576,12 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 		    !BP_IS_GANG(bp)) {
 			error = pr19262_engine_rebind_unwritten(spa, bp, d,
 			    c->birth);
+			pr19262_printf("PR19262_ZIL_TAIL v=%llu psize=%llu "
+			    "birth=%llu ready=%u alloc_txg=%llu rebind=%d\n",
+			    (u_longlong_t)DVA_GET_OFFSET(&bp->blk_dva[d]),
+			    (u_longlong_t)BP_GET_PSIZE(bp),
+			    (u_longlong_t)before.birth, before.ready,
+			    (u_longlong_t)before.catalog_txg, error);
 			if (error == 0)
 				st->unwritten++;
 		}
@@ -784,10 +832,14 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		}
 		pr19262_printf("PR19262_CONVERT_PASS pass=%llu partial=%u "
 		    "visited=%llu copied=%llu busy=%llu stale=%llu "
-		    "starved=%llu\n", (u_longlong_t)stats->passes, partial,
+		    "starved=%llu candidates=%llu zil_blocks=%llu "
+		    "unwritten=%llu\n", (u_longlong_t)stats->passes, partial,
 		    (u_longlong_t)stats->visited, (u_longlong_t)stats->copied,
 		    (u_longlong_t)stats->busy, (u_longlong_t)stats->stale,
-		    (u_longlong_t)stats->starved);
+		    (u_longlong_t)stats->starved,
+		    (u_longlong_t)stats->candidates,
+		    (u_longlong_t)stats->zil_blocks,
+		    (u_longlong_t)stats->unwritten);
 		if (!partial && stats->copied == copied && stats->busy == busy)
 			break;
 		/* Busy across many idle passes is a defect, not a wait. */
