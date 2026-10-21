@@ -2422,7 +2422,48 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		if (error == 0)
 			engine_pages_fault(2, b->generation, 0, UINT64_MAX);
 	}
-	if (error == 0) {
+	/*
+	 * Without a page-cut hook, every member writes all dirty pages and
+	 * then flushes at once; the hook cuts after a page or the flush of
+	 * the first member alone and keeps the member-by-member order.
+	 */
+	if (error == 0 && pr19262_env("PR19262_M_PAGE_FAULT") == NULL) {
+		uint_t n = 0, children = engine.vd->vdev_children;
+		engine_member_page_t *pv = kmem_alloc(
+		    MAX(1, engine_pages.capacity) * sizeof (*pv), KM_SLEEP);
+		for (uint64_t i = 0; error == 0 &&
+		    i < engine_pages.capacity; i++) {
+			engine_mnode_t *n_i = engine_pages.cache[i];
+			uint64_t index;
+			if (!engine_mdirty(b, n_i))
+				continue;
+			VERIFY(n_i->sealed);
+			if (!engine_mindex(engine_mheader(n_i)->p, &index)) {
+				error = ENGINE_EINVAL(3);
+				break;
+			}
+			pv[n].arena = engine_mheader(n_i)->p;
+			pv[n].page = 0;
+			pv[n++].abd = abd_get_from_buf(n_i->data,
+			    ENGINE_STORE_PAGE);
+		}
+		if (error == 0) {
+			engine_quorum_t q = { 0 };
+			int *errors = kmem_alloc(children * sizeof (int),
+			    KM_SLEEP);
+			spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+			engine_members_write(spa, pv, n, B_TRUE, B_TRUE,
+			    errors);
+			spa_config_exit(spa, SCL_ZIO, FTAG);
+			for (uint_t c = 0; c < children; c++)
+				engine_quorum_add(&q, errors[c]);
+			kmem_free(errors, children * sizeof (int));
+			error = engine_quorum_result(&q);
+		}
+		for (uint_t i = 0; i < n; i++)
+			abd_free(pv[i].abd);
+		kmem_free(pv, MAX(1, engine_pages.capacity) * sizeof (*pv));
+	} else if (error == 0) {
 		engine_quorum_t q = { 0 };
 		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 		for (uint_t c = 0; c < engine.vd->vdev_children; c++) {

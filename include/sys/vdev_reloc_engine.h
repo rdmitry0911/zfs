@@ -88,6 +88,7 @@ typedef struct pr19262_mgrowth_probe {
 int pr19262_engine_mgrowth_probe(spa_t *, boolean_t,
     pr19262_mgrowth_probe_t *);
 int pr19262_engine_metadata_flush(vdev_t *);
+void pr19262_engine_metadata_flush_nowait(zio_t *, vdev_t *);
 void pr19262_engine_store_crash(uint64_t);
 int pr19262_engine_journal_bind(spa_t *, const blkptr_t *);
 void pr19262_engine_journal_gate(zio_t *, spa_t *, const blkptr_t *);

@@ -1403,6 +1403,16 @@ pr19262_engine_metadata_flush(vdev_t *vd)
 	return (zio_wait(zio));
 }
 
+/* The same flush as a child of pio, so that members flush at once. */
+void
+pr19262_engine_metadata_flush_nowait(zio_t *pio, vdev_t *vd)
+{
+	zio_nowait(zio_create(pio, vd->vdev_spa, 0, NULL, NULL, 0, 0,
+	    NULL, NULL, ZIO_TYPE_FLUSH, ZIO_PRIORITY_NOW,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY, vd, 0, NULL,
+	    ZIO_STAGE_OPEN, ZIO_FLUSH_PIPELINE));
+}
+
 zio_t *
 pr19262_engine_physical_io(spa_t *spa, blkptr_t *bp, vdev_t *vd,
     uint64_t v, abd_t *data, uint64_t size, zio_type_t type,

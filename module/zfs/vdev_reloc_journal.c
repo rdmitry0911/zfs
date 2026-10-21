@@ -125,6 +125,22 @@ engine_journal_write(spa_t *spa, uint64_t page, abd_t *abd)
 {
 	engine_quorum_t q = { 0 };
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+	/*
+	 * Without a crash or fault hook armed, every member writes and then
+	 * flushes at once.  The hooks act on the first member alone, so they
+	 * keep the member-by-member order they were written for.
+	 */
+	if (engine_journal_fault_stage == 0 && engine_journal_roll_fault == 0) {
+		uint_t children = engine.vd->vdev_children;
+		int *errors = kmem_alloc(children * sizeof (int), KM_SLEEP);
+		engine_member_page_t pg = { engine.journal_arena, page, abd };
+		engine_members_write(spa, &pg, 1, B_TRUE, B_FALSE, errors);
+		for (uint_t c = 0; c < children; c++)
+			engine_quorum_add(&q, errors[c]);
+		kmem_free(errors, children * sizeof (int));
+		spa_config_exit(spa, SCL_ZIO, FTAG);
+		return (engine_quorum_result(&q));
+	}
 	for (uint64_t i = 0; i < engine.vd->vdev_children; i++) {
 		vdev_t *vd = engine.vd->vdev_child[i];
 		uint64_t *w = abd_to_buf(abd);

@@ -131,6 +131,15 @@ typedef struct engine_quorum {
 	int error;
 } engine_quorum_t;
 
+/* One page of a raw step that every member of the vdev writes. */
+typedef struct engine_member_page {
+	uint64_t arena;
+	uint64_t page;
+	abd_t *abd;
+} engine_member_page_t;
+
+static void engine_members_flush(spa_t *, engine_quorum_t *);
+
 static void
 engine_quorum_add(engine_quorum_t *q, int error)
 {
@@ -1290,6 +1299,9 @@ pr19262_engine_hold_report(void *hold)
 	mutex_exit(&engine.lock);
 }
 
+/* A refused physical write names itself: nothing else reports it. */
+static uint_t engine_dispatch_unsafe_prints;
+
 int
 pr19262_engine_dispatch(zio_t *zio)
 {
@@ -1339,6 +1351,13 @@ pr19262_engine_dispatch(zio_t *zio)
 		    zio->io_offset < zio->io_vd->vdev_psize -
 		    VDEV_LABEL_END_SIZE &&
 		    zio->io_pr19262_owner_hold == NULL && !metadata;
+		if (unsafe && engine_dispatch_unsafe_prints++ < 8)
+			pr19262_printf("PR19262_DISPATCH_UNSAFE child=%llu "
+			    "offset=%llu size=%llu flags=%llx\n",
+			    (u_longlong_t)zio->io_vd->vdev_id,
+			    (u_longlong_t)zio->io_offset,
+			    (u_longlong_t)zio->io_size,
+			    (u_longlong_t)zio->io_flags);
 		mutex_exit(&engine.lock);
 		return (unsafe ? ENOTSUP : 0);
 	}
@@ -1696,14 +1715,12 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 		error = ECKSUM;
 	abd_free(source);
 	abd_free(verify);
-	/* Flush data before publishing its J binding. */
+	/* Flush data before publishing its J binding: every member at once. */
 	if (error == 0 && engine.persistent) {
 		spa_t *spa = engine.spa;
 		engine_quorum_t q = { 0 };
 		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
-		for (uint64_t i = 0; i < engine.vd->vdev_children; i++)
-			engine_quorum_add(&q, pr19262_engine_metadata_flush(
-			    engine.vd->vdev_child[i]));
+		engine_members_flush(spa, &q);
 		spa_config_exit(spa, SCL_ZIO, FTAG);
 		error = engine_quorum_result(&q);
 	}
