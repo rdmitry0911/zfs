@@ -249,6 +249,7 @@ static struct {
 	uint64_t abort_prints;
 	uint64_t inherit_prints;
 	uint64_t hold_report_prints;
+	uint64_t gate_prints;
 } engine;
 
 static engine_version_t *

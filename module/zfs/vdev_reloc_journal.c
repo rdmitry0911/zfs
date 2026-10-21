@@ -1122,6 +1122,14 @@ engine_journal_worker(void *arg)
 		pr19262_printf("PR19262_J_GANG dependencies=%llu error=%d\n",
 		    (u_longlong_t)dependencies, error);
 	job->gate->io_error = error;
+	if (error != 0 && engine.gate_prints++ < 8)
+		pr19262_printf("PR19262_GATE_FAILED error=%d vdev=%llu v=%llu "
+		    "birth=%llu type=%u level=%u\n", error,
+		    (u_longlong_t)DVA_GET_VDEV(&job->bp.blk_dva[0]),
+		    (u_longlong_t)DVA_GET_OFFSET(&job->bp.blk_dva[0]),
+		    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(&job->bp),
+		    (uint_t)BP_GET_TYPE(&job->bp),
+		    (uint_t)BP_GET_LEVEL(&job->bp));
 	pr19262_engine_rele(job->hold);
 	zio_nowait(job->gate);
 	kmem_free(job, sizeof (*job));
@@ -1141,6 +1149,14 @@ pr19262_engine_journal_gate(zio_t *parent, spa_t *spa, const blkptr_t *bp)
 	int error = engine_journal_admit_locked(spa, job->hold);
 	if (job->hold != NULL && error != 0)
 		job->hold->error = error;
+	if (error != 0 && error != ENOENT && engine.gate_prints++ < 8)
+		pr19262_printf("PR19262_GATE_REFUSED error=%d vdev=%llu "
+		    "v=%llu birth=%llu type=%u level=%u ndvas=%u\n", error,
+		    (u_longlong_t)DVA_GET_VDEV(&bp->blk_dva[0]),
+		    (u_longlong_t)DVA_GET_OFFSET(&bp->blk_dva[0]),
+		    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(bp),
+		    (uint_t)BP_GET_TYPE(bp), (uint_t)BP_GET_LEVEL(bp),
+		    (uint_t)BP_GET_NDVAS(bp));
 	mutex_exit(&engine.lock);
 	job->gate = zio_null(parent, spa, NULL, NULL, NULL, ZIO_FLAG_CANFAIL);
 	VERIFY3U(taskq_dispatch(system_taskq, engine_journal_worker, job,

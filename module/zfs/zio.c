@@ -64,6 +64,7 @@ const char *const zio_type_name[ZIO_TYPES] = {
 
 int zio_dva_throttle_enabled = B_TRUE;
 static uint64_t pr19262_dispatch_stale_prints;
+static uint64_t pr19262_unalloc_prints;
 static uint64_t pr19262_done_stale_prints;
 
 static int zio_deadman_log_all = B_FALSE;
@@ -5120,6 +5121,27 @@ zio_dva_unallocate(zio_t *zio, zio_gang_node_t *gn, blkptr_t *bp)
 	ASSERT(BP_GET_BIRTH(bp) == zio->io_txg || BP_IS_HOLE(bp));
 	ASSERT0P(zio->io_bp_override);
 
+	/* Diagnostic: every DVA given back in its own txg, with the cause. */
+	if (!BP_IS_HOLE(bp) && pr19262_unalloc_prints++ < 8) {
+		pr19262_printf("PR19262_UNALLOC error=%d flags=%llx type=%u "
+		    "ndvas=%u dva0=%llu/%llu dva1=%llu/%llu birth=%llu "
+		    "objset=%llu object=%llu level=%lld blkid=%llu\n",
+		    zio->io_error, (u_longlong_t)zio->io_flags,
+		    (uint_t)BP_GET_TYPE(bp), (uint_t)BP_GET_NDVAS(bp),
+		    (u_longlong_t)DVA_GET_VDEV(&bp->blk_dva[0]),
+		    (u_longlong_t)DVA_GET_OFFSET(&bp->blk_dva[0]),
+		    (u_longlong_t)(BP_GET_NDVAS(bp) > 1 ?
+		    DVA_GET_VDEV(&bp->blk_dva[1]) : 0),
+		    (u_longlong_t)(BP_GET_NDVAS(bp) > 1 ?
+		    DVA_GET_OFFSET(&bp->blk_dva[1]) : 0),
+		    (u_longlong_t)BP_GET_BIRTH(bp),
+		    (u_longlong_t)zio->io_bookmark.zb_objset,
+		    (u_longlong_t)zio->io_bookmark.zb_object,
+		    (longlong_t)zio->io_bookmark.zb_level,
+		    (u_longlong_t)zio->io_bookmark.zb_blkid);
+		pr19262_flush();
+		pr19262_backtrace();
+	}
 	if (!BP_IS_HOLE(bp)) {
 		metaslab_free(zio->io_spa, bp, BP_GET_BIRTH(bp), B_TRUE);
 	}
