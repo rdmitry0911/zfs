@@ -191,6 +191,10 @@ pr19262_reloc_resolve(zio_t *zio, pr19262_backing_desc_t *desc)
 	probe_entry_t *e = h->entry;
 	if (e->incarnation != h->incarnation ||
 	    (!e->live && h->leased == NULL)) {
+		pr19262_printf("PR19262_PROBE_STALE offset=%llu e_inc=%llu "
+		    "h_inc=%llu live=%u\n", (u_longlong_t)e->offset,
+		    (u_longlong_t)e->incarnation, (u_longlong_t)h->incarnation,
+		    e->live);
 		mutex_exit(&probe_lock);
 		return (ESTALE);
 	}

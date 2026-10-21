@@ -232,6 +232,19 @@ static struct {
 	uint64_t admit_growth_peak;
 	uint64_t admit_space_rejections;
 	uint64_t admit_restarts;
+	/* The fence the admission schedules past the retired limit. */
+	kcondvar_t fence_cv;
+	boolean_t fence_pending;
+	boolean_t fence_quiesced;
+	/* The last scheduled fence reclaimed and released nothing. */
+	boolean_t fence_stalled;
+	int fence_error;
+	uint64_t fence_requests;
+	uint64_t fence_auto;
+	uint64_t admit_fence_waits;
+	uint64_t stale_verdicts;
+	uint64_t retire_prints;
+	uint64_t abort_prints;
 } engine;
 
 static engine_version_t *
@@ -454,6 +467,7 @@ pr19262_engine_init(void)
 	mutex_init(&engine.journal_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&engine.store_lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&engine.changed, NULL, CV_DEFAULT, NULL);
+	cv_init(&engine.fence_cv, NULL, CV_DEFAULT, NULL);
 	avl_create(&engine.owners, engine_compare, sizeof (engine_owner_t),
 	    offsetof(engine_owner_t, avl));
 	avl_create(&engine.tombstones, engine_tomb_compare,
@@ -473,6 +487,7 @@ pr19262_engine_fini(void)
 	engine_tombstones_clear();
 	avl_destroy(&engine.tombstones);
 	cv_destroy(&engine.changed);
+	cv_destroy(&engine.fence_cv);
 	mutex_destroy(&engine.journal_lock);
 	mutex_destroy(&engine.store_lock);
 	mutex_destroy(&engine.lock);
@@ -866,6 +881,21 @@ engine_abort_done(engine_owner_t *e)
 	kmem_free(e, sizeof (*e));
 }
 
+/* Diagnostic: a journal-touched allocation retained as retired at abort. */
+static void
+engine_abort_report(spa_t *spa, engine_owner_t *e, uint64_t v,
+    uint64_t size, uint64_t txg)
+{
+	pr19262_printf("PR19262_ABORT_RETAINED v=%llu size=%llu txg=%llu "
+	    "holds=%llu copying=%u syncing_txg=%llu last_synced=%llu\n",
+	    (u_longlong_t)v, (u_longlong_t)size, (u_longlong_t)txg,
+	    (u_longlong_t)e->holds, e->copying,
+	    (u_longlong_t)spa_syncing_txg(spa),
+	    (u_longlong_t)spa_last_synced_txg(spa));
+	pr19262_flush();
+	pr19262_backtrace();
+}
+
 boolean_t
 pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
     uint64_t txg)
@@ -889,6 +919,9 @@ pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
 					engine.revision++;
 				}
 				retained = B_TRUE;
+				if (engine.abort_prints++ < 4)
+					engine_abort_report(spa, e, v, size,
+					    txg);
 				goto out;
 			}
 			VERIFY(!e->retired);
@@ -947,6 +980,18 @@ pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
 	engine.revision++;
 	e->retired_at = ++engine.sequence;
 	engine.retired += e->cur->size;
+	if (engine.retire_prints++ < 24) {
+		spa_t *spa = vd->vdev_spa;
+		pr19262_printf("PR19262_RETIRE v=%llu size=%llu birth=%llu "
+		    "allocation_txg=%llu sync_context=%u syncing_txg=%llu "
+		    "last_synced=%llu retired_txg=%llu\n", (u_longlong_t)v,
+		    (u_longlong_t)size, (u_longlong_t)e->cur->birth,
+		    (u_longlong_t)e->allocation_txg,
+		    dsl_pool_sync_context(spa->spa_dsl_pool),
+		    (u_longlong_t)spa_syncing_txg(spa),
+		    (u_longlong_t)spa_last_synced_txg(spa),
+		    (u_longlong_t)e->retired_txg);
+	}
 	/* No fake floor: neither authoritative V nor P becomes free. */
 	handled = B_TRUE;
 out:
@@ -1107,15 +1152,30 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 		boolean_t descendant = prior != NULL && prior->error == 0 &&
 		    prior->gang && gang_child && read;
 		/* A released and reused V must not serve an older BP. */
-		if (e->allocation_txg != 0 && !inherited &&
+		boolean_t reused = e->allocation_txg != 0 && !inherited &&
 		    !BP_GET_DEDUP(bp) &&
-		    BP_GET_PHYSICAL_BIRTH(bp) != e->allocation_txg)
-			h->error = ESTALE;
-		if ((e->retired && !inherited &&
+		    BP_GET_PHYSICAL_BIRTH(bp) != e->allocation_txg;
+		boolean_t gone = (e->retired && !inherited &&
 		    !(descendant && h->started < e->retired_at)) ||
 		    (e->aborted && !inherited) ||
-		    (descendant && e->created > h->started))
+		    (descendant && e->created > h->started);
+		if (reused || gone) {
 			h->error = ESTALE;
+			if (engine.stale_verdicts++ < 16)
+				pr19262_printf("PR19262_HOLD_STALE v=%llu "
+				    "reused=%u gone=%u retired=%u aborted=%u "
+				    "birth=%llu allocation_txg=%llu write=%u "
+				    "level=%u type=%u retired_txg=%llu "
+				    "last_synced=%llu\n",
+				    (u_longlong_t)e->v, reused, gone,
+				    e->retired, e->aborted,
+				    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(bp),
+				    (u_longlong_t)e->allocation_txg, h->write,
+				    (uint_t)BP_GET_LEVEL(bp),
+				    (uint_t)BP_GET_TYPE(bp),
+				    (u_longlong_t)e->retired_txg,
+				    (u_longlong_t)spa_last_synced_txg(spa));
+		}
 		e->holds++;
 		e->queued_writers += h->write;
 		h->owner[h->count++] = e;
@@ -1410,6 +1470,43 @@ pr19262_engine_free_range(spa_t *spa, uint64_t p, uint64_t size)
 	boolean_t free = zfs_range_tree_contains(engine.free, p, size);
 	mutex_exit(&engine.lock);
 	return (free);
+}
+
+/* Diagnostic: the owner state behind a block pointer, at a named site. */
+void
+pr19262_engine_describe(spa_t *spa, const blkptr_t *bp, const char *site,
+    uint64_t a, uint64_t b)
+{
+	const dva_t *dva = &bp->blk_dva[0];
+	mutex_enter(&engine.lock);
+	engine_owner_t *e = engine.spa == spa && engine.vd != NULL &&
+	    DVA_GET_VDEV(dva) == engine.vd->vdev_id ?
+	    engine_find(DVA_GET_OFFSET(dva)) : NULL;
+	uint64_t versions = 0;
+	for (engine_version_t *v = e != NULL ? e->versions : NULL; v != NULL;
+	    v = v->next)
+		versions++;
+	pr19262_printf("PR19262_DESCRIBE site=%s a=%llu b=%llu vdev=%llu "
+	    "v=%llu asize=%llu pbirth=%llu lbirth=%llu type=%u level=%u "
+	    "dedup=%u owner=%d size=%llu incarnation=%llu allocation_txg=%llu "
+	    "retired=%u aborted=%u copying=%u holds=%llu versions=%llu "
+	    "cur_birth=%llu cur_p=%llu\n", site, (u_longlong_t)a,
+	    (u_longlong_t)b, (u_longlong_t)DVA_GET_VDEV(dva),
+	    (u_longlong_t)DVA_GET_OFFSET(dva), (u_longlong_t)DVA_GET_ASIZE(dva),
+	    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(bp),
+	    (u_longlong_t)BP_GET_LOGICAL_BIRTH(bp), (uint_t)BP_GET_TYPE(bp),
+	    (uint_t)BP_GET_LEVEL(bp), (uint_t)BP_GET_DEDUP(bp), e != NULL,
+	    (u_longlong_t)(e != NULL ? e->size : 0),
+	    (u_longlong_t)(e != NULL ? e->incarnation : 0),
+	    (u_longlong_t)(e != NULL ? e->allocation_txg : 0),
+	    e != NULL ? e->retired : 0, e != NULL ? e->aborted : 0,
+	    e != NULL ? e->copying : 0,
+	    (u_longlong_t)(e != NULL ? e->holds : 0), (u_longlong_t)versions,
+	    (u_longlong_t)(e != NULL && e->cur != NULL ? e->cur->birth : 0),
+	    (u_longlong_t)(e != NULL && e->cur != NULL ? e->cur->p : 0));
+	mutex_exit(&engine.lock);
+	/* The caller may assert next: do not lose this line in a buffer. */
+	pr19262_flush();
 }
 
 void

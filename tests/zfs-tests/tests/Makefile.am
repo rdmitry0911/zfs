@@ -2022,8 +2022,10 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/quota/quota_007_pos.ksh \
 	functional/quota/setup.ksh \
 	functional/pr19262/cleanup.ksh \
+	functional/pr19262/pr19262_classes_pos.ksh \
 	functional/pr19262/pr19262_degraded_pos.ksh \
 	functional/pr19262/pr19262_online_pos.ksh \
+	functional/pr19262/pr19262_rewind_pos.ksh \
 	functional/pr19262/setup.ksh \
 	functional/raidz/cleanup.ksh \
 	functional/raidz/raidz_001_neg.ksh \

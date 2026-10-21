@@ -295,6 +295,7 @@
 #include <sys/zthr.h>
 #include <zfs_fletcher.h>
 #include <sys/arc_impl.h>
+#include <sys/vdev_reloc_engine.h>
 #include <sys/trace_zfs.h>
 #include <sys/aggsum.h>
 #include <sys/wmsum.h>
@@ -7055,6 +7056,9 @@ arc_write_done(zio_t *zio)
 			 * sync-to-convergence, because we remove
 			 * buffers from the hash table at arc_release().
 			 */
+			pr19262_engine_describe(zio->io_spa, zio->io_bp,
+			    "arc-write-twice", exists->b_birth,
+			    zio->io_flags);
 			if (zio->io_flags & ZIO_FLAG_IO_REWRITE) {
 				if (!BP_EQUAL(&zio->io_bp_orig, zio->io_bp))
 					panic("bad overwrite, hdr=%p exists=%p",

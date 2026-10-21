@@ -937,7 +937,8 @@ tests = ['redacted_compressed', 'redacted_contents', 'redacted_deleted',
 tags = ['functional', 'redacted_send']
 
 [tests/functional/pr19262]
-tests = ['pr19262_online_pos', 'pr19262_degraded_pos']
+tests = ['pr19262_online_pos', 'pr19262_degraded_pos', 'pr19262_classes_pos',
+    'pr19262_rewind_pos']
 tags = ['functional', 'pr19262']
 
 [tests/functional/raidz]

@@ -222,10 +222,35 @@ pr19262_engine_admit(spa_t *spa, uint_t class, uint64_t reserved,
 	    engine_admit_foreign_free(spa);
 	uint64_t available = (free > protected ? free - protected : 0) +
 	    foreign;
-	boolean_t blocked = class == PR19262_ADMIT_CLIENT &&
-	    engine.retired >= engine.retired_limit;
-	if (blocked || (free < protected && foreign == 0) ||
-	    need > available) {
+	if (class == PR19262_ADMIT_CLIENT &&
+	    engine.retired >= engine.retired_limit) {
+		/*
+		 * Retired bytes return to the allocator at a fence.  The
+		 * engine schedules one itself and the client restarts
+		 * behind it (DMU_TX_WAIT waits for a sync and retries).  A
+		 * fence that cannot run (checkpoint, read-only pool) or
+		 * that reclaimed nothing leaves ENOSPC as the answer until
+		 * one succeeds and makes room.
+		 */
+		boolean_t dispatch = !engine.fence_pending &&
+		    !engine.fence_quiesced && engine.persistent &&
+		    spa_writeable(spa);
+		if (dispatch) {
+			engine.fence_pending = B_TRUE;
+			engine.fence_requests++;
+		}
+		boolean_t wait = engine.fence_pending &&
+		    engine.fence_error == 0 && !engine.fence_stalled;
+		if (wait)
+			engine.admit_fence_waits++;
+		else
+			c->rejected++;
+		mutex_exit(&engine.lock);
+		if (dispatch)
+			pr19262_engine_fence_schedule(spa);
+		return (wait ? ERESTART : ENOSPC);
+	}
+	if ((free < protected && foreign == 0) || need > available) {
 		/*
 		 * The reservations of transactions still open or syncing
 		 * (reserved, worst-case sizes) are released when their txg
@@ -234,7 +259,7 @@ pr19262_engine_admit(spa_t *spa, uint_t class, uint64_t reserved,
 		 * for a sync instead of failing.  The converter admits whole
 		 * batches and is told ENOSPC, as before.
 		 */
-		if (!blocked && class != PR19262_ADMIT_CONVERTER &&
+		if (class != PR19262_ADMIT_CONVERTER &&
 		    reserved != 0 && free >= protected &&
 		    need - reserved <= available) {
 			engine.admit_restarts++;
@@ -242,8 +267,7 @@ pr19262_engine_admit(spa_t *spa, uint_t class, uint64_t reserved,
 			return (ERESTART);
 		}
 		c->rejected++;
-		if (!blocked)
-			engine.admit_space_rejections++;
+		engine.admit_space_rejections++;
 		mutex_exit(&engine.lock);
 		return (ENOSPC);
 	}
@@ -312,6 +336,9 @@ pr19262_engine_admit_report(spa_t *spa, const char *label,
 	out->converter_bytes = engine.admit[PR19262_ADMIT_CONVERTER].p_bytes;
 	out->space_rejections = engine.admit_space_rejections;
 	out->restarts = engine.admit_restarts;
+	out->fence_requests = engine.fence_requests;
+	out->fence_auto = engine.fence_auto;
+	out->fence_waits = engine.admit_fence_waits;
 	for (uint_t c = 0; c < PR19262_ADMIT_CLASSES; c++)
 		out->classes[c] = engine.admit[c];
 	out->protected = ENGINE_ADMIT_SYNC_BYTES + ENGINE_ADMIT_LOG_BYTES +
@@ -327,7 +354,8 @@ pr19262_engine_admit_report(spa_t *spa, const char *label,
 	    "frames_total=%llu frames_free=%llu levels=%llu "
 	    "converter_bytes=%llu space_rejections=%llu "
 	    "client=%llu/%llu/%llu/%llu netfree=%llu/%llu "
-	    "converter=%llu/%llu/%llu/%llu restarts=%llu\n", label,
+	    "converter=%llu/%llu/%llu/%llu restarts=%llu "
+	    "fence=%llu/%llu/%llu\n", label,
 	    (u_longlong_t)out->free, (u_longlong_t)out->protected,
 	    (u_longlong_t)out->foreign, (u_longlong_t)out->guarded,
 	    (u_longlong_t)out->sync_bytes, (u_longlong_t)out->log_bytes,
@@ -350,7 +378,8 @@ pr19262_engine_admit_report(spa_t *spa, const char *label,
 	    (u_longlong_t)out->classes[2].rejected,
 	    (u_longlong_t)out->classes[2].peak_m,
 	    (u_longlong_t)out->classes[2].peak_j,
-	    (u_longlong_t)out->restarts);
+	    (u_longlong_t)out->restarts, (u_longlong_t)out->fence_requests,
+	    (u_longlong_t)out->fence_auto, (u_longlong_t)out->fence_waits);
 	pr19262_flush();
 }
 

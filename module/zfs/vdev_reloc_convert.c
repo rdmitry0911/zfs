@@ -284,6 +284,46 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 	return (error);
 }
 
+/* A fence the admission scheduled for clients past the retired limit. */
+static void
+engine_fence_task(void *arg)
+{
+	spa_t *spa = arg;
+	uint64_t floor, reclaimed, released;
+	int error = pr19262_engine_fence(spa, &floor, &reclaimed, &released,
+	    NULL);
+	mutex_enter(&engine.lock);
+	engine.fence_error = error;
+	engine.fence_auto += error == 0;
+	engine.fence_stalled = error == 0 && reclaimed == 0 && released == 0;
+	engine.fence_pending = B_FALSE;
+	cv_broadcast(&engine.fence_cv);
+	mutex_exit(&engine.lock);
+	pr19262_printf("PR19262_FENCE_AUTO error=%d floor=%llu reclaimed=%llu "
+	    "released=%llu\n", error, (u_longlong_t)floor,
+	    (u_longlong_t)reclaimed, (u_longlong_t)released);
+}
+
+void
+pr19262_engine_fence_schedule(spa_t *spa)
+{
+	VERIFY3U(taskq_dispatch(system_taskq, engine_fence_task, spa,
+	    TQ_SLEEP), !=, TASKQID_INVALID);
+}
+
+/* Before the sync thread stops: no new fence, and none in flight. */
+void
+pr19262_engine_quiesce(spa_t *spa)
+{
+	mutex_enter(&engine.lock);
+	if (engine.spa == spa) {
+		engine.fence_quiesced = B_TRUE;
+		while (engine.fence_pending)
+			cv_wait(&engine.fence_cv, &engine.lock);
+	}
+	mutex_exit(&engine.lock);
+}
+
 /*
  * Certify that every backing any importable root can select has at least
  * the given parity.  This requires a completed sweep, a fence that
@@ -446,6 +486,12 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 					st->unwritten++;
 					continue;
 				}
+				if (error == ESTALE) {
+					/* The chain moved on: stale. */
+					st->stale++;
+					error = 0;
+					continue;
+				}
 				if (error != EBUSY)
 					break;
 			}
@@ -490,6 +536,17 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 			    c->birth);
 			if (error == 0)
 				st->unwritten++;
+		}
+		if (error == ESTALE) {
+			/*
+			 * Freed while being copied (a client free, and the
+			 * fence the admission schedules may already have
+			 * released it): the copy was abandoned by its
+			 * finish, nothing is left to convert.
+			 */
+			st->stale++;
+			error = 0;
+			continue;
 		}
 		if (error != 0)
 			break;
@@ -678,8 +735,17 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		boolean_t partial = error == ERESTART;
 		if (partial)
 			error = 0;
-		if (error == 0 && !partial)
+		if (error != 0)
+			pr19262_printf("PR19262_CONVERT_PASS_ERROR "
+			    "step=traverse error=%d pass=%llu\n", error,
+			    (u_longlong_t)pass);
+		if (error == 0 && !partial) {
 			error = engine_convert_zil(&c);
+			if (error != 0)
+				pr19262_printf("PR19262_CONVERT_PASS_ERROR "
+				    "step=zil error=%d pass=%llu\n", error,
+				    (u_longlong_t)pass);
+		}
 		dmu_tx_commit(fence);
 		if (error != 0)
 			break;

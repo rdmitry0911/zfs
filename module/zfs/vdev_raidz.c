@@ -2946,6 +2946,16 @@ vdev_raidz_io_start_read_row(zio_t *zio, raidz_row_t *rr, boolean_t forceparity)
 				rr->rr_missingparity++;
 			rc->rc_error = SET_ERROR(ESTALE);
 			rc->rc_skipped = 1;
+			pr19262_printf("PR19262_DTL_STALE child=%u birth=%llu "
+			    "offset=%llu size=%llu objset=%llu object=%llu "
+			    "level=%lld blkid=%llu\n", (uint_t)rc->rc_devidx,
+			    (u_longlong_t)vdev_raidz_read_birth(zio),
+			    (u_longlong_t)zio->io_offset,
+			    (u_longlong_t)zio->io_size,
+			    (u_longlong_t)zio->io_bookmark.zb_objset,
+			    (u_longlong_t)zio->io_bookmark.zb_object,
+			    (longlong_t)zio->io_bookmark.zb_level,
+			    (u_longlong_t)zio->io_bookmark.zb_blkid);
 			continue;
 		}
 
@@ -3021,6 +3031,10 @@ vdev_raidz_io_start_read_phys_cols(zio_t *zio, raidz_map_t *rm)
 		    vdev_raidz_read_birth(zio), 1)) {
 			prc->rc_error = SET_ERROR(ESTALE);
 			prc->rc_skipped = 1;
+			pr19262_printf("PR19262_DTL_STALE_PARITY child=%u "
+			    "birth=%llu offset=%llu\n", (uint_t)i,
+			    (u_longlong_t)vdev_raidz_read_birth(zio),
+			    (u_longlong_t)zio->io_offset);
 			continue;
 		}
 		zio_nowait(zio_vdev_child_io(zio, NULL, cvd,

@@ -16,7 +16,10 @@
 #define	pr19262_flush()		((void)0)
 #define	pr19262_exit(code)	panic("pr19262 cut %d", (int)(code))
 #define	pr19262_strtoull(s, e, b)	(0ULL)
+#define	pr19262_backtrace()	dump_stack()
 #else
+extern void libspl_backtrace(int);
+#define	pr19262_backtrace()	libspl_backtrace(1)
 #define	pr19262_printf(...)	(void) printf(__VA_ARGS__)
 #define	pr19262_env(name)	getenv(name)
 #define	pr19262_flush()		(void) fflush(NULL)
@@ -228,6 +231,10 @@ int pr19262_engine_convert(spa_t *, uint64_t, uint64_t, uint64_t,
 int pr19262_engine_fence(spa_t *, uint64_t *, uint64_t *, uint64_t *,
     uint64_t *);
 int pr19262_engine_certify(spa_t *, uint64_t);
+void pr19262_engine_fence_schedule(spa_t *);
+void pr19262_engine_describe(spa_t *, const blkptr_t *, const char *,
+    uint64_t, uint64_t);
+void pr19262_engine_quiesce(spa_t *);
 int pr19262_engine_epoch(spa_t *, uint64_t, uint64_t *);
 uint64_t pr19262_engine_floor(spa_t *);
 /* Incarnation of an owner overlapping [V, V + size), or 0 when none. */
@@ -268,6 +275,10 @@ typedef struct pr19262_engine_admit_report {
 	uint64_t converter_bytes;
 	uint64_t space_rejections;
 	uint64_t restarts;
+	/* Fences the admission scheduled, completed; clients restarted. */
+	uint64_t fence_requests;
+	uint64_t fence_auto;
+	uint64_t fence_waits;
 	/* Free space of other normal-class vdevs; guarded allocations. */
 	uint64_t foreign;
 	uint64_t guarded;

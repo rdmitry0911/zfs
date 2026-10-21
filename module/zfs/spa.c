@@ -2362,6 +2362,9 @@ spa_unload(spa_t *spa)
 		spa_config_exit(spa, SCL_ALL, FTAG);
 	}
 
+	/* A fence of the engine still in flight needs the sync thread. */
+	pr19262_engine_quiesce(spa);
+
 	/*
 	 * Stop syncing.
 	 */

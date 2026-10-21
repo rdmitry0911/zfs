@@ -120,6 +120,7 @@
 #include <sys/abd.h>
 #include <sys/brt.h>
 #include <sys/ddt.h>
+#include <sys/ddt_impl.h>
 #include <sys/spa_checkpoint.h>
 #include <sys/blake3.h>
 #include <stdio.h>
@@ -11960,6 +11961,30 @@ static void pr19262_arc_limit(uint64_t);
 static uint64_t pr19262_classes_object(objset_t *, uint64_t);
 static void pr19262_soak(spa_t *, uint64_t, uint64_t);
 
+/*
+ * Soak overlapping the sweep (PR19262_ENGINE_SOAK_OVERLAP): the writers,
+ * their frees and the harness fences run while the converter copies, so
+ * the fence the admission schedules, the converter's own fence and the
+ * harness fence contend; the per-cycle conversion invariants and the
+ * parked verification wait for the certificate.
+ */
+static volatile boolean_t pr19262_soak_overlap;
+static volatile boolean_t pr19262_soak_converted;
+
+typedef struct pr19262_soak_job {
+	spa_t *spa;
+	uint64_t parity;
+	uint64_t seconds;
+} pr19262_soak_job_t;
+
+static void
+pr19262_soak_thread(void *arg)
+{
+	pr19262_soak_job_t *job = arg;
+	pr19262_soak(job->spa, job->parity, job->seconds);
+	thread_exit();
+}
+
 static void
 pr19262_runtime_wait(void *arg)
 {
@@ -12331,13 +12356,29 @@ pr19262_runtime_test(spa_t *spa)
 	pr19262_engine_retired_limit(1);
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_space(tx, 4096);
-	VERIFY3S(dmu_tx_assign(tx, DMU_TX_NOWAIT), ==, ENOSPC);
+	/* Past the limit: the engine schedules a fence; the client restarts. */
+	int past = dmu_tx_assign(tx, DMU_TX_NOWAIT);
+	VERIFY(past == ERESTART || past == ENOSPC);
 	dmu_tx_abort(tx);
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_space(tx, 4096);
 	dmu_tx_mark_netfree(tx);
 	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
 	dmu_tx_commit(tx);
+	pr19262_engine_admit_report_t fr;
+	for (int i = 0; i < 600; i++) {
+		pr19262_engine_admit_report(spa, "blocked", &fr);
+		if (fr.fence_requests == fr.fence_auto)
+			break;
+		usleep(100000);
+	}
+	if (past == ERESTART) {
+		VERIFY3U(fr.fence_requests, >=, 1);
+		VERIFY3U(fr.fence_auto, ==, fr.fence_requests);
+	}
+	(void) printf("PR19262_RUNTIME_FENCE past=%d requests=%llu auto=%llu "
+	    "waits=%llu\n", past, (u_longlong_t)fr.fence_requests,
+	    (u_longlong_t)fr.fence_auto, (u_longlong_t)fr.fence_waits);
 	pr19262_engine_retired_limit(64ULL << 20);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
 	dmu_objset_disown(os, B_TRUE, FTAG);
@@ -13938,6 +13979,9 @@ pr19262_live_verify(boolean_t readonly)
 	    (u_longlong_t)half, (u_longlong_t)cold_blocks);
 }
 
+/* Top-level vdevs the witnesses count: target, raidz, log, special, dedup. */
+#define	PR19262_TOPS 5
+
 typedef struct pr19262_verify {
 	uint64_t blocks;
 	uint64_t bytes;
@@ -13945,8 +13989,8 @@ typedef struct pr19262_verify {
 	uint64_t errors;
 	uint64_t zil_tail;
 	/* Placement by top-level vdev of DVA 0; blocks spanning two vdevs. */
-	uint64_t per_vdev[4];
-	uint64_t zil_per_vdev[4];
+	uint64_t per_vdev[PR19262_TOPS];
+	uint64_t zil_per_vdev[PR19262_TOPS];
 	uint64_t mixed;
 } pr19262_verify_t;
 
@@ -13969,7 +14013,7 @@ pr19262_verify_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	v->bytes += size;
 	v->gang += BP_IS_GANG(bp);
 	uint64_t top = DVA_GET_VDEV(&bp->blk_dva[0]);
-	if (top < 4) {
+	if (top < PR19262_TOPS) {
 		v->per_vdev[top]++;
 		v->zil_per_vdev[top] += zb->zb_level == ZB_ZIL_LEVEL;
 	}
@@ -14008,16 +14052,17 @@ pr19262_verify_all(spa_t *spa)
 		missing += !vdev_readable(vd->vdev_child[c]);
 	(void) printf("PR19262_VERIFY blocks=%llu bytes=%llu gang=%llu "
 	    "errors=%llu zil_tail=%llu traverse_error=%d "
-	    "missing_children=%u vdevs=%llu/%llu/%llu/%llu "
-	    "zil_vdevs=%llu/%llu/%llu/%llu mixed=%llu\n",
+	    "missing_children=%u vdevs=%llu/%llu/%llu/%llu/%llu "
+	    "zil_vdevs=%llu/%llu/%llu/%llu/%llu mixed=%llu\n",
 	    (u_longlong_t)v.blocks,
 	    (u_longlong_t)v.bytes, (u_longlong_t)v.gang,
 	    (u_longlong_t)v.errors, (u_longlong_t)v.zil_tail, error, missing,
 	    (u_longlong_t)v.per_vdev[0], (u_longlong_t)v.per_vdev[1],
 	    (u_longlong_t)v.per_vdev[2], (u_longlong_t)v.per_vdev[3],
+	    (u_longlong_t)v.per_vdev[4],
 	    (u_longlong_t)v.zil_per_vdev[0], (u_longlong_t)v.zil_per_vdev[1],
 	    (u_longlong_t)v.zil_per_vdev[2], (u_longlong_t)v.zil_per_vdev[3],
-	    (u_longlong_t)v.mixed);
+	    (u_longlong_t)v.zil_per_vdev[4], (u_longlong_t)v.mixed);
 	VERIFY0(error);
 	VERIFY0(v.errors);
 }
@@ -14326,6 +14371,15 @@ pr19262_convert_test(spa_t *spa)
 		    "reclaimed_after_discard=%llu\n",
 		    (u_longlong_t)pinned.copied, (u_longlong_t)reclaimed);
 	}
+	uint64_t soak = pr19262_env_u64("PR19262_ENGINE_SOAK_SECONDS", 0);
+	pr19262_soak_overlap = soak != 0 &&
+	    getenv("PR19262_ENGINE_SOAK_OVERLAP") != NULL;
+	pr19262_soak_converted = B_FALSE;
+	pr19262_soak_job_t job = { .spa = spa, .parity = parity,
+	    .seconds = soak };
+	kthread_t *soaker = pr19262_soak_overlap ? _thread_create(NULL, 0,
+	    pr19262_soak_thread, &job, 0, NULL, TS_RUN | TS_JOINABLE,
+	    defclsyspri) : NULL;
 	kthread_t *writer = _thread_create(NULL, 0, pr19262_live_writer, &w,
 	    0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
 	pr19262_engine_convert_stats_t st;
@@ -14369,13 +14423,16 @@ pr19262_convert_test(spa_t *spa)
 		(void) printf("PR19262_CONVERT_CUT fence armed\n");
 	}
 	pr19262_convert_finish(spa, parity);
+	pr19262_soak_converted = B_TRUE;
+	/* The overlapping soak ends after the certificate; nothing writes. */
+	if (soaker != NULL)
+		VERIFY0(thread_join(soaker));
 	pr19262_live_verify(B_FALSE);
 	pr19262_verify_all(spa);
 	pr19262_convert_scrub(spa);
 	if (getenv("PR19262_ENGINE_CLASSES") != NULL)
 		pr19262_classes_verify(spa, B_FALSE, B_TRUE);
-	uint64_t soak = pr19262_env_u64("PR19262_ENGINE_SOAK_SECONDS", 0);
-	if (soak != 0)
+	if (soak != 0 && !pr19262_soak_overlap)
 		pr19262_soak(spa, parity, soak);
 	/* The finally freed scratch V left the engine and is native again. */
 	if (w.scratch_size != 0)
@@ -14671,18 +14728,23 @@ pr19262_soak(spa_t *spa, uint64_t parity, uint64_t seconds)
 			fence_busy++;
 		}
 		pr19262_engine_census(spa, parity, &c);
-		VERIFY0(c.legacy_bytes);
-		VERIFY0(c.weak_current);
+		boolean_t settled = !pr19262_soak_overlap ||
+		    pr19262_soak_converted;
+		if (settled) {
+			VERIFY0(c.legacy_bytes);
+			VERIFY0(c.weak_current);
+		}
 		max_segments = MAX(max_segments, c.journal_segments);
 		max_pages = MAX(max_pages, c.pages_used);
 		max_retired = MAX(max_retired, c.retired_bytes);
 		max_tombstones = MAX(max_tombstones, c.tombstones);
 		pr19262_engine_admit_report(spa, "soak", &r);
 		VERIFY3U(r.free, >=, r.protected);
-		if (cycles % 30 == 0) {
+		if (cycles % 30 == 0 && settled) {
 			/*
 			 * The traversal walks one root; writers park so no
-			 * txg frees the blocks it still has to read.
+			 * txg frees the blocks it still has to read (the live
+			 * writer of an overlapping sweep is gone by then).
 			 */
 			pause = B_TRUE;
 			for (uint_t k = 0; k < PR19262_SOAK_WRITERS; k++)
@@ -14701,6 +14763,9 @@ pr19262_soak(spa_t *spa, uint64_t parity, uint64_t seconds)
 	for (uint_t k = 0; k < PR19262_SOAK_WRITERS; k++)
 		VERIFY0(thread_join(threads[k]));
 	txg_wait_synced(dp, 0);
+	/* An overlapping soak checks its invariants once the sweep is done. */
+	while (pr19262_soak_overlap && !pr19262_soak_converted)
+		usleep(100000);
 	/* Every block still inside a window reads back with its pattern. */
 	uint8_t *data = kmem_alloc(PR19262_LIVE_BLOCK, KM_SLEEP);
 	uint64_t checked = 0;
@@ -14903,7 +14968,13 @@ pr19262_full_test(spa_t *spa)
 	txg_wait_synced(dp, 0);
 	pr19262_memory_report("full", block);
 	pr19262_engine_admit_report(spa, "full-enospc", &r);
-	VERIFY3U(r.free, >=, r.protected);
+	/*
+	 * The standing reserve is held.  The forecast of the engine's own
+	 * arena growth (catalog pages consumed by the syncs of the fill)
+	 * may exceed the free space at this instant; the sweep's first
+	 * fence collects those pages and the checks below hold it again.
+	 */
+	VERIFY3U(r.free + r.growth, >=, r.protected);
 	avail_full = pr19262_full_avail(spa, os, "enospc", &r);
 	pr19262_engine_census_t c;
 	pr19262_census_report(spa, parity, "full", &c);
@@ -15082,7 +15153,7 @@ pr19262_resilver_wait(spa_t *spa)
  * Fixture layout: v0..v{n-1} form the translated RAIDZ (children, parity
  * and ashift from the environment); PR19262_ENGINE_VDEVS adds native
  * top-level vdevs in this order: "raidz" (w0..w{n-1}, same geometry),
- * "log" (log0) and "special" (special0).
+ * "log" (log0), "special" (special0) and "dedup" (dedup0, the DDT class).
  */
 static uint64_t
 pr19262_env_u64(const char *name, uint64_t fallback)
@@ -15154,7 +15225,7 @@ pr19262_fixture_root(const char *directory)
 	uint64_t children = pr19262_env_u64("PR19262_ENGINE_CHILDREN", 6);
 	uint64_t parity = pr19262_env_u64("PR19262_ENGINE_PARITY", 1);
 	uint64_t ashift = pr19262_env_u64("PR19262_ENGINE_ASHIFT", 12);
-	nvlist_t *tops[4];
+	nvlist_t *tops[PR19262_TOPS];
 	uint_t count = 0;
 	char roles[128];
 	(void) snprintf(roles, sizeof (roles), "target=0");
@@ -15178,6 +15249,12 @@ pr19262_fixture_root(const char *directory)
 		tops[count++] = pr19262_fixture_leaf(directory, "special0",
 		    ashift, B_FALSE, VDEV_ALLOC_BIAS_SPECIAL);
 	}
+	if (pr19262_vdevs_has("dedup")) {
+		(void) snprintf(roles + strlen(roles),
+		    sizeof (roles) - strlen(roles), " dedup=%u", count);
+		tops[count++] = pr19262_fixture_leaf(directory, "dedup0",
+		    ashift, B_FALSE, VDEV_ALLOC_BIAS_DEDUP);
+	}
 	nvlist_t *root = fnvlist_alloc();
 	fnvlist_add_string(root, ZPOOL_CONFIG_TYPE, VDEV_TYPE_ROOT);
 	VERIFY0(nvlist_add_nvlist_array(root, ZPOOL_CONFIG_CHILDREN,
@@ -15199,6 +15276,171 @@ pr19262_special_id(spa_t *spa)
 		if (root->vdev_child[c]->vdev_alloc_bias == VDEV_BIAS_SPECIAL)
 			return (c);
 	return (UINT64_MAX);
+}
+
+/* Top-level id of the dedup device, or UINT64_MAX. */
+static uint64_t
+pr19262_dedup_id(spa_t *spa)
+{
+	vdev_t *root = spa->spa_root_vdev;
+	for (uint64_t c = 0; c < root->vdev_children; c++)
+		if (root->vdev_child[c]->vdev_alloc_bias == VDEV_BIAS_DEDUP)
+			return (c);
+	return (UINT64_MAX);
+}
+
+/*
+ * The dedup class holds the DDT: every block of the DDT log and ZAP
+ * objects of the MOS (their L0 blocks and the indirect blocks above them)
+ * sits on the dedup device, as native DVAs the engine never translates.
+ * Counted on a synced pool so that no block pointer is still dirty.
+ */
+#define	PR19262_DEDUP_OBJECTS \
+	(ZIO_CHECKSUM_FUNCTIONS * (2 + DDT_TYPES * DDT_CLASSES))
+
+typedef struct pr19262_dedup_walk {
+	uint64_t dedup;
+	uint_t n;
+	uint64_t list[PR19262_DEDUP_OBJECTS];
+	uint64_t blocks;
+	uint64_t on_dedup;
+	uint64_t indirect;
+	uint64_t indirect_on_dedup;
+	uint64_t per_vdev[PR19262_TOPS];
+} pr19262_dedup_walk_t;
+
+/* Where the DDT keeps the shared block's entry, and with how many refs. */
+static void
+pr19262_dedup_probe(spa_t *spa, const blkptr_t *bp, uint_t round)
+{
+	ddt_t *ddt = spa->spa_ddt[BP_GET_CHECKSUM(bp)];
+	ddt_key_t key;
+	ddt_key_fill(&key, bp);
+	ddt_lightweight_entry_t ddlwe;
+	memset(&ddlwe, 0, sizeof (ddlwe));
+	boolean_t flushing = B_FALSE;
+	boolean_t in_log = ddt_log_find_key(ddt, &key, &ddlwe, &flushing);
+	uint64_t log_refs = in_log ?
+	    ddt_phys_total_refcnt(ddt, &ddlwe.ddlwe_phys) : 0;
+	ddt_enter(ddt);
+	ddt_entry_t *live = avl_find(&ddt->ddt_tree, &key, NULL);
+	uint64_t live_refs = live != NULL ?
+	    ddt_phys_total_refcnt(ddt, live->dde_phys) : 0;
+	uint_t live_flags = live != NULL ? live->dde_flags : 0;
+	/* The free's own lookup: NULL means the entry rejects this BP. */
+	ddt_entry_t *found = ddt_lookup(ddt, bp, B_TRUE);
+	uint64_t found_refs = found != NULL ?
+	    ddt_phys_total_refcnt(ddt, found->dde_phys) : 0;
+	int found_type = found != NULL ? (int)found->dde_type : -1;
+	int found_class = found != NULL ? (int)found->dde_class : -1;
+	int variant = found != NULL ?
+	    (int)ddt_phys_select(ddt, found, bp) : -1;
+	ddt_exit(ddt);
+	(void) printf("PR19262_DEDUP_PROBE round=%u live=%d/%llu flags=%x "
+	    "log=%d/%llu flushing=%d lookup=%d/%llu type=%d class=%d "
+	    "variant=%d quota=%llu dsize=%llu dedup_bit=%d birth=%llu\n",
+	    round, live != NULL, (u_longlong_t)live_refs, live_flags,
+	    in_log, (u_longlong_t)log_refs, flushing, found != NULL,
+	    (u_longlong_t)found_refs, found_type, found_class, variant,
+	    (u_longlong_t)spa->spa_dedup_table_quota,
+	    (u_longlong_t)ddt_get_ddt_dsize(spa), (int)BP_GET_DEDUP(bp),
+	    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(bp));
+}
+
+/* Count the blocks of the DDT objects by the vdev of their first DVA. */
+static int
+pr19262_dedup_walk_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, const dnode_phys_t *dnp, void *arg)
+{
+	(void) spa, (void) zilog, (void) dnp;
+	pr19262_dedup_walk_t *w = arg;
+	if (zb->zb_objset != 0 || bp == NULL || BP_IS_HOLE(bp) ||
+	    BP_IS_EMBEDDED(bp) || zb->zb_level == ZB_ZIL_LEVEL)
+		return (0);
+	boolean_t mine = B_FALSE;
+	for (uint_t i = 0; i < w->n; i++)
+		mine |= w->list[i] == zb->zb_object;
+	if (!mine)
+		return (0);
+	uint64_t top = DVA_GET_VDEV(&bp->blk_dva[0]);
+	boolean_t on = top == w->dedup;
+	if (zb->zb_level > 0) {
+		w->indirect++;
+		w->indirect_on_dedup += on;
+	} else {
+		w->blocks++;
+		w->on_dedup += on;
+		if (top < PR19262_TOPS)
+			w->per_vdev[top]++;
+	}
+	return (0);
+}
+
+static void
+pr19262_dedup_vdev_report(spa_t *spa, const char *phase)
+{
+	objset_t *mos = spa->spa_meta_objset;
+	pr19262_dedup_walk_t w;
+	memset(&w, 0, sizeof (w));
+	w.dedup = pr19262_dedup_id(spa);
+	VERIFY3U(w.dedup, <, PR19262_TOPS);
+	/* The DDT objects and their blocks exist in the synced root. */
+	if (spa_writeable(spa))
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+	uint64_t objects = 0;
+	for (int c = 0; c < ZIO_CHECKSUM_FUNCTIONS; c++) {
+		ddt_t *ddt = spa->spa_ddt[c];
+		if (ddt == NULL)
+			continue;
+		uint64_t list[2 + DDT_TYPES * DDT_CLASSES];
+		uint_t n = 0;
+		list[n++] = ddt->ddt_log[0].ddl_object;
+		list[n++] = ddt->ddt_log[1].ddl_object;
+		for (int t = 0; t < DDT_TYPES; t++)
+			for (int k = 0; k < DDT_CLASSES; k++)
+				list[n++] = ddt->ddt_object[t][k];
+		for (uint_t i = 0; i < n; i++) {
+			if (list[i] == 0)
+				continue;
+			dmu_object_info_t info;
+			VERIFY0(dmu_object_info(mos, list[i], &info));
+			objects++;
+			VERIFY3U(w.n, <, PR19262_DEDUP_OBJECTS);
+			w.list[w.n++] = list[i];
+		}
+	}
+	VERIFY0(traverse_pool(spa, 0, TRAVERSE_PRE |
+	    TRAVERSE_PREFETCH_METADATA | TRAVERSE_NO_DECRYPT,
+	    pr19262_dedup_walk_cb, &w));
+	uint64_t blocks = w.blocks, on_dedup = w.on_dedup;
+	uint64_t indirect = w.indirect, indirect_on_dedup = w.indirect_on_dedup;
+	uint64_t dedup = w.dedup;
+	vdev_t *vd = spa->spa_root_vdev->vdev_child[dedup];
+	mutex_enter(&vd->vdev_stat_lock);
+	uint64_t alloc = vd->vdev_stat.vs_alloc;
+	mutex_exit(&vd->vdev_stat_lock);
+	uint64_t target = pr19262_engine_vdev(spa)->vdev_id;
+	(void) printf("PR19262_DEDUP_VDEV phase=%s vdev=%llu objects=%llu "
+	    "blocks=%llu on_dedup=%llu indirect=%llu indirect_on_dedup=%llu "
+	    "vdevs=%llu/%llu/%llu/%llu/%llu on_target=%llu alloc=%llu\n",
+	    phase, (u_longlong_t)dedup, (u_longlong_t)objects,
+	    (u_longlong_t)blocks, (u_longlong_t)on_dedup,
+	    (u_longlong_t)indirect, (u_longlong_t)indirect_on_dedup,
+	    (u_longlong_t)w.per_vdev[0], (u_longlong_t)w.per_vdev[1],
+	    (u_longlong_t)w.per_vdev[2], (u_longlong_t)w.per_vdev[3],
+	    (u_longlong_t)w.per_vdev[4], (u_longlong_t)w.per_vdev[target],
+	    (u_longlong_t)alloc);
+	/*
+	 * The entry blocks of the fast-DDT log carry the DDT storage type
+	 * and take the dedup class; the log headers are plain metadata and
+	 * take the special class while it has room.  Nothing lands on the
+	 * target before the special class fills (phase "prepared").
+	 */
+	VERIFY3U(blocks, >, 0);
+	VERIFY3U(on_dedup, >, 0);
+	if (strcmp(phase, "prepared") == 0)
+		VERIFY0(w.per_vdev[target]);
+	VERIFY3U(alloc, >, 0);
 }
 
 /* The native RAIDZ beside the target, or NULL. */
@@ -15233,6 +15475,8 @@ pr19262_other_raidz(spa_t *spa)
 #define	PR19262_ENC_COLD 32ULL
 #define	PR19262_ENC_SYNC 8ULL
 #define	PR19262_DEDUP_BLOCKS 16ULL
+/* First word of every classes block: writers never share by accident. */
+#define	PR19262_CLASSES_TAG 0x5052313932363200ULL
 #define	PR19262_DITTO_BLOCKS 16ULL
 #define	PR19262_SPILL_BLOCKS 8ULL
 
@@ -15297,6 +15541,12 @@ pr19262_classes_fill(objset_t *os, uint64_t object, uint64_t blocksize,
 		for (uint64_t i = base; i < base + span; i++) {
 			memset(payload, pr19262_live_pattern(i) ^ salt,
 			    blocksize);
+			/*
+			 * The block index in the first word: objects with
+			 * different salts cannot produce equal blocks, so a
+			 * dedup pair shares with its twin only.
+			 */
+			*(uint64_t *)payload = PR19262_CLASSES_TAG | i;
 			dmu_write(os, object, i * blocksize, blocksize,
 			    payload, tx, 0);
 		}
@@ -15313,7 +15563,8 @@ pr19262_classes_expect(objset_t *os, uint64_t object, uint64_t blocksize,
 	for (uint64_t i = first; i < first + count; i++) {
 		VERIFY0(dmu_read(os, object, i * blocksize, blocksize, data,
 		    DMU_READ_NO_PREFETCH));
-		for (uint64_t b = 0; b < blocksize; b++)
+		VERIFY3U(*(uint64_t *)data, ==, PR19262_CLASSES_TAG | i);
+		for (uint64_t b = sizeof (uint64_t); b < blocksize; b++)
 			VERIFY3U(data[b], ==,
 			    (uint8_t)(pr19262_live_pattern(i) ^ salt));
 	}
@@ -15339,7 +15590,7 @@ pr19262_classes_placement(spa_t *spa, objset_t *os, uint64_t object,
 	vdev_t *root = spa->spa_root_vdev;
 	blkptr_t *bps = kmem_alloc(64 * sizeof (blkptr_t), KM_SLEEP);
 	*mixed = 0;
-	for (uint64_t c = 0; c < 4; c++)
+	for (uint64_t c = 0; c < PR19262_TOPS; c++)
 		per_vdev[c] = 0;
 	for (uint64_t base = 0; base < blocks; base += 64) {
 		size_t nbps = 64;
@@ -15349,7 +15600,7 @@ pr19262_classes_placement(spa_t *spa, objset_t *os, uint64_t object,
 		VERIFY3U(nbps, ==, span);
 		for (size_t i = 0; i < nbps; i++) {
 			uint64_t v0 = DVA_GET_VDEV(&bps[i].blk_dva[0]);
-			VERIFY3U(v0, <, MIN(root->vdev_children, 4));
+			VERIFY3U(v0, <, MIN(root->vdev_children, PR19262_TOPS));
 			per_vdev[v0]++;
 			for (int d = 1; d < BP_GET_NDVAS(&bps[i]); d++) {
 				if (DVA_GET_VDEV(&bps[i].blk_dva[d]) != v0) {
@@ -15477,6 +15728,8 @@ pr19262_classes_prepare(spa_t *spa)
 	    (u_longlong_t)DVA_GET_OFFSET(&pr19262_classes.dedup_bp.blk_dva[0]),
 	    (u_longlong_t)chosen, (u_longlong_t)info.incarnation,
 	    info.retired);
+	if (pr19262_vdevs_has("dedup"))
+		pr19262_dedup_vdev_report(spa, "prepared");
 	/* Small blocks fill the special class, then fall back to normal. */
 	if (pr19262_vdevs_has("special")) {
 		char small[] = PR19262_SMALL;
@@ -15495,18 +15748,20 @@ pr19262_classes_prepare(spa_t *spa)
 		pr19262_classes_fill(os, object, PR19262_SMALL_BLOCK, 0, blocks,
 		    0x5a);
 		txg_wait_synced(spa->spa_dsl_pool, 0);
-		uint64_t per_vdev[4], mixed;
+		uint64_t per_vdev[PR19262_TOPS], mixed;
 		pr19262_classes_placement(spa, os, object, PR19262_SMALL_BLOCK,
 		    blocks, per_vdev, &mixed);
 		dmu_objset_disown(os, B_TRUE, FTAG);
 		uint64_t special = pr19262_special_id(spa);
-		VERIFY3U(special, <, 4);
+		VERIFY3U(special, <, PR19262_TOPS);
 		(void) printf("PR19262_SPECIAL phase=prepared blocks=%llu "
-		    "special=%llu enospc=%llu vdevs=%llu/%llu/%llu/%llu\n",
+		    "special=%llu enospc=%llu "
+		    "vdevs=%llu/%llu/%llu/%llu/%llu\n",
 		    (u_longlong_t)blocks, (u_longlong_t)per_vdev[special],
 		    (u_longlong_t)pr19262_classes.enospc,
 		    (u_longlong_t)per_vdev[0], (u_longlong_t)per_vdev[1],
-		    (u_longlong_t)per_vdev[2], (u_longlong_t)per_vdev[3]);
+		    (u_longlong_t)per_vdev[2], (u_longlong_t)per_vdev[3],
+		    (u_longlong_t)per_vdev[4]);
 		/* Some landed on the special device, the rest fell back. */
 		VERIFY3U(per_vdev[special], >, 0);
 		VERIFY3U(per_vdev[special], <, blocks);
@@ -15526,15 +15781,16 @@ pr19262_classes_prepare(spa_t *spa)
 		pr19262_classes_fill(os, object, PR19262_LIVE_BLOCK, 0,
 		    PR19262_DITTO_BLOCKS, 0x66);
 		txg_wait_synced(spa->spa_dsl_pool, 0);
-		uint64_t per_vdev[4], mixed;
+		uint64_t per_vdev[PR19262_TOPS], mixed;
 		pr19262_classes_placement(spa, os, object, PR19262_LIVE_BLOCK,
 		    PR19262_DITTO_BLOCKS, per_vdev, &mixed);
 		dmu_objset_disown(os, B_TRUE, FTAG);
 		(void) printf("PR19262_DITTO phase=prepared blocks=%llu "
-		    "mixed=%llu vdevs=%llu/%llu/%llu/%llu\n",
+		    "mixed=%llu vdevs=%llu/%llu/%llu/%llu/%llu\n",
 		    (u_longlong_t)PR19262_DITTO_BLOCKS, (u_longlong_t)mixed,
 		    (u_longlong_t)per_vdev[0], (u_longlong_t)per_vdev[1],
-		    (u_longlong_t)per_vdev[2], (u_longlong_t)per_vdev[3]);
+		    (u_longlong_t)per_vdev[2], (u_longlong_t)per_vdev[3],
+		    (u_longlong_t)per_vdev[4]);
 		VERIFY3U(mixed, >, 0);
 	}
 }
@@ -15614,17 +15870,42 @@ pr19262_classes_verify(spa_t *spa, boolean_t readonly, boolean_t live)
 		 * sync flushes in bounded portions: the physical free, and
 		 * so the retirement, may take several syncs to land.
 		 */
-		uint_t rounds = 0;
+		uint_t rounds = 0, forced = 0;
 		do {
 			ztest_pe_settle(spa);
 			pr19262_engine_inspect(spa, &pr19262_classes.dedup_bp,
 			    0, &last);
-		} while (!last.retired && ++rounds < 64);
+			if (last.retired)
+				break;
+			if (rounds == 0 || rounds == 32)
+				pr19262_dedup_probe(spa,
+				    &pr19262_classes.dedup_bp, rounds);
+			ddt_t *ddt = spa->spa_ddt[BP_GET_CHECKSUM(
+			    &pr19262_classes.dedup_bp)];
+			(void) printf("PR19262_DEDUP_WAIT round=%u txg=%llu "
+			    "active=%lu/%llu flushing=%lu/%llu force=%llu "
+			    "holds=%llu leases=%llu\n", rounds,
+			    (u_longlong_t)spa_last_synced_txg(spa),
+			    avl_numnodes(&ddt->ddt_log_active->ddl_tree),
+			    (u_longlong_t)ddt->ddt_log_active->ddl_first_txg,
+			    avl_numnodes(&ddt->ddt_log_flushing->ddl_tree),
+			    (u_longlong_t)ddt->ddt_log_flushing->ddl_first_txg,
+			    (u_longlong_t)ddt->ddt_flush_force_txg,
+			    (u_longlong_t)last.holds,
+			    (u_longlong_t)last.leases);
+			/* The scan's request: flush the logs soon. */
+			if (rounds == 16) {
+				ddt_walk_init(spa, 0);
+				forced = 1;
+			}
+		} while (++rounds < 64);
 		VERIFY(last.retired);
 		(void) printf("PR19262_DEDUP phase=freed shared_kept=%u "
-		    "last_retired=%u incarnation=%llu ratio=%llu rounds=%u\n",
+		    "last_retired=%u incarnation=%llu ratio=%llu rounds=%u "
+		    "forced=%u\n",
 		    !kept.retired, last.retired, (u_longlong_t)last.incarnation,
-		    (u_longlong_t)ddt_get_pool_dedup_ratio(spa), rounds + 1);
+		    (u_longlong_t)ddt_get_pool_dedup_ratio(spa), rounds + 1,
+		    forced);
 		pr19262_classes_free(os, pr19262_classes.dedup_c, 0,
 		    DMU_OBJECT_END);
 		pr19262_classes_free(os, pr19262_classes.dedup_d, 0,
@@ -15640,6 +15921,11 @@ pr19262_classes_verify(spa_t *spa, boolean_t readonly, boolean_t live)
 	    "fast=%u\n", (u_longlong_t)PR19262_DEDUP_BLOCKS,
 	    (u_longlong_t)ddt_get_pool_dedup_ratio(spa),
 	    spa_feature_is_active(spa, SPA_FEATURE_FAST_DEDUP));
+	if (pr19262_vdevs_has("dedup")) {
+		if (spa_writeable(spa))
+			txg_wait_synced(spa->spa_dsl_pool, 0);
+		pr19262_dedup_vdev_report(spa, "verified");
+	}
 	if (pr19262_vdevs_has("log")) {
 		/* The log class took the synchronous records (chains freed). */
 		vdev_t *root = spa->spa_root_vdev;
@@ -15670,17 +15956,18 @@ pr19262_classes_verify(spa_t *spa, boolean_t readonly, boolean_t live)
 		uint64_t blocks = info.doi_max_offset / PR19262_SMALL_BLOCK;
 		pr19262_classes_expect(os, object, PR19262_SMALL_BLOCK, 0,
 		    blocks, 0x5a);
-		uint64_t per_vdev[4], mixed;
+		uint64_t per_vdev[PR19262_TOPS], mixed;
 		pr19262_classes_placement(spa, os, object, PR19262_SMALL_BLOCK,
 		    blocks, per_vdev, &mixed);
 		dmu_objset_disown(os, B_TRUE, FTAG);
 		uint64_t special = pr19262_special_id(spa);
-		VERIFY3U(special, <, 4);
+		VERIFY3U(special, <, PR19262_TOPS);
 		(void) printf("PR19262_SPECIAL phase=verified blocks=%llu "
-		    "special=%llu vdevs=%llu/%llu/%llu/%llu\n",
+		    "special=%llu vdevs=%llu/%llu/%llu/%llu/%llu\n",
 		    (u_longlong_t)blocks, (u_longlong_t)per_vdev[special],
 		    (u_longlong_t)per_vdev[0], (u_longlong_t)per_vdev[1],
-		    (u_longlong_t)per_vdev[2], (u_longlong_t)per_vdev[3]);
+		    (u_longlong_t)per_vdev[2], (u_longlong_t)per_vdev[3],
+		    (u_longlong_t)per_vdev[4]);
 		VERIFY3U(per_vdev[special], >, 0);
 		VERIFY3U(per_vdev[special], <, blocks);
 	}
@@ -15691,15 +15978,16 @@ pr19262_classes_verify(spa_t *spa, boolean_t readonly, boolean_t live)
 		VERIFY0(dmu_object_next(os, &object, B_FALSE, 0));
 		pr19262_classes_expect(os, object, PR19262_LIVE_BLOCK, 0,
 		    PR19262_DITTO_BLOCKS, 0x66);
-		uint64_t per_vdev[4], mixed;
+		uint64_t per_vdev[PR19262_TOPS], mixed;
 		pr19262_classes_placement(spa, os, object, PR19262_LIVE_BLOCK,
 		    PR19262_DITTO_BLOCKS, per_vdev, &mixed);
 		dmu_objset_disown(os, B_TRUE, FTAG);
 		(void) printf("PR19262_DITTO phase=verified blocks=%llu "
-		    "mixed=%llu vdevs=%llu/%llu/%llu/%llu\n",
+		    "mixed=%llu vdevs=%llu/%llu/%llu/%llu/%llu\n",
 		    (u_longlong_t)PR19262_DITTO_BLOCKS, (u_longlong_t)mixed,
 		    (u_longlong_t)per_vdev[0], (u_longlong_t)per_vdev[1],
-		    (u_longlong_t)per_vdev[2], (u_longlong_t)per_vdev[3]);
+		    (u_longlong_t)per_vdev[2], (u_longlong_t)per_vdev[3],
+		    (u_longlong_t)per_vdev[4]);
 		VERIFY3U(mixed, >, 0);
 	}
 	if (pr19262_vdevs_has("raidz") && live) {
@@ -15727,7 +16015,7 @@ pr19262_classes_verify(spa_t *spa, boolean_t readonly, boolean_t live)
 			pr19262_classes_fill(os, object, PR19262_LIVE_BLOCK, i,
 			    1, 0x77);
 		txg_wait_synced(spa->spa_dsl_pool, 0);
-		uint64_t per_vdev[4], mixed;
+		uint64_t per_vdev[PR19262_TOPS], mixed;
 		pr19262_classes_placement(spa, os, object, PR19262_LIVE_BLOCK,
 		    PR19262_SPILL_BLOCKS, per_vdev, &mixed);
 		pr19262_classes_expect(os, object, PR19262_LIVE_BLOCK, 0,

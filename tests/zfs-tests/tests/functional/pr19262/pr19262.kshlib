@@ -101,3 +101,39 @@ function pr19262_cleanup
 	poolexists $PR19262_POOL && destroy_pool $PR19262_POOL
 	rm -rf $PR19262_DIR
 }
+
+# The durable floor the kernel driver reports after its last fence.
+function pr19262_floor
+{
+	pr19262_status | sed -n 's/.*floor=\([0-9]*\).*/\1/p'
+}
+
+# One fence now; the floor it reports is the current durable floor.
+function pr19262_fence
+{
+	typeset pool=$1
+	if ! echo "$pool" > $PR19262_PARAMS/zfs_pr19262_fence; then
+		log_fail "fence of $pool refused"
+	fi
+	sed -n 's/.*floor=\([0-9]*\).*/\1/p' $PR19262_PARAMS/zfs_pr19262_fence
+}
+
+# The engine's and the loader's lines from the kernel debug log.
+function pr19262_dbgmsg_note
+{
+	typeset tag=$1
+	log_note "dbgmsg $tag:"
+	grep -E 'PR19262|pr19262|spa_load_failed|using uberblock|load_verify' \
+	    /proc/spl/kstat/zfs/dbgmsg | tail -60 | while read -r line; do
+		log_note "$line"
+	done
+}
+
+# The txg in which the named snapshot was taken, from the pool history.
+function pr19262_snapshot_txg
+{
+	typeset pool=$1
+	typeset snap=$2
+	zpool history -il $pool | grep -E "\] snapshot $snap " | tail -1 | \
+	    sed -n 's/.*\[txg:\([0-9]*\)\].*/\1/p'
+}

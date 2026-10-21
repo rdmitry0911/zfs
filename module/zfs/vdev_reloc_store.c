@@ -526,6 +526,11 @@ engine_store_clear(void)
 	engine.admit_space_rejections = 0;
 	engine.admit_batch = ENGINE_ADMIT_BATCH;
 	engine.admit_refreshed = UINT64_MAX;
+	VERIFY(!engine.fence_pending);
+	engine.fence_quiesced = engine.fence_stalled = B_FALSE;
+	engine.fence_error = 0;
+	engine.fence_requests = engine.fence_auto = 0;
+	engine.admit_fence_waits = 0;
 }
 
 void
@@ -1010,8 +1015,13 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 		return (ENOTSUP);
 	/* Older M bitmaps cannot allocate over newer still-selectable roots. */
 	if ((spa->spa_mode & SPA_MODE_WRITE) &&
-	    ub->ub_txg < spa->spa_load_latest_ub_txg)
+	    ub->ub_txg < spa->spa_load_latest_ub_txg) {
+		pr19262_printf("PR19262_REWIND_REFUSED ub=%llu latest=%llu "
+		    "(writable; import read-only to read this root)\n",
+		    (u_longlong_t)ub->ub_txg,
+		    (u_longlong_t)spa->spa_load_latest_ub_txg);
 		return (ENOTSUP);
+	}
 	if (vd->vdev_ops != &vdev_raidz_ops || d[1] != vd->vdev_guid ||
 	    d[3] != ENGINE_STORE_BYTES || d[12] != vd->vdev_ashift ||
 	    d[13] != vd->vdev_children || d[14] != vd->vdev_asize ||
