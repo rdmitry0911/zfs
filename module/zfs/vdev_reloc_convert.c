@@ -417,7 +417,7 @@ pr19262_engine_certify(spa_t *spa, uint64_t parity)
  * Copies one flush and journal round carries, and the bytes they may
  * buffer: a copy run alone paid a data flush, a frame and a head.
  */
-static uint_t zfs_pr19262_convert_group = 32;
+static uint_t zfs_pr19262_convert_group = 128;
 static uint64_t engine_convert_group_bytes = 8ULL << 20;
 
 /* A copy begun by the walk, run with the group it joined. */
