@@ -14230,8 +14230,9 @@ pr19262_convert_scrub(spa_t *spa)
 }
 
 /*
- * Quiescent pool: a final full sweep must find nothing, then fence,
- * reclaim every weaker backing and certify the stronger parity.
+ * Quiescent pool (but for an overlapping soak): a final full sweep must
+ * find nothing, then fence, reclaim every weaker backing and certify the
+ * stronger parity.
  */
 static void
 pr19262_convert_finish_passes(spa_t *spa, uint64_t parity,
@@ -14248,7 +14249,11 @@ pr19262_convert_finish_passes(spa_t *spa, uint64_t parity,
 	    sample));
 	pr19262_census_report(spa, parity, "fenced", &c);
 	VERIFY0(c.weak_retired);
-	VERIFY3U(c.floor, ==, floor);
+	/* An overlapping soak's own fences may move the floor on since. */
+	if (pr19262_soak_overlap && !pr19262_soak_converted)
+		VERIFY3U(c.floor, >=, floor);
+	else
+		VERIFY3U(c.floor, ==, floor);
 	VERIFY0(pr19262_engine_certify(spa, parity));
 	pr19262_census_report(spa, parity, "certified", &c);
 	VERIFY3U(c.certified, ==, parity);
