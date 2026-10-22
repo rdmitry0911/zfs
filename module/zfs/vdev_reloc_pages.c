@@ -810,6 +810,28 @@ engine_pages_row_limit(void)
 	return (MIN(UINT_MAX, engine_pages.capacity * ENGINE_M_ROWS));
 }
 
+/* A catalog row: one owner's identity with one of its versions. */
+static void
+engine_mrow_fill(engine_mrow_t *r, const uint64_t *v, const uint64_t *p,
+    boolean_t head)
+{
+	r->key[0] = 1; r->key[1] = v[0]; r->key[2] = v[3];
+	r->key[3] = head ? 0 : p[7];
+	memcpy(r->data, v, 8 * sizeof (uint64_t));
+	memcpy(r->data + 8, p, 8 * sizeof (uint64_t));
+}
+
+/* Rows in key order; a duplicate key is a malformed catalog. */
+static int
+engine_mrows_order(engine_mrow_t *rows, uint_t total)
+{
+	qsort(rows, total, sizeof (*rows), engine_mkey_compare);
+	for (uint_t i = 1; i < total; i++)
+		if (engine_mkey_compare(rows[i - 1].key, rows[i].key) >= 0)
+			return (ENGINE_EINVAL(20));
+	return (0);
+}
+
 static int
 engine_mrows(nvlist_t *nv, engine_mrow_t **out, uint_t *count)
 {
@@ -840,21 +862,11 @@ engine_mrows(nvlist_t *nv, engine_mrow_t **out, uint_t *count)
 			error = ENGINE_EINVAL(19);
 			break;
 		}
-		for (uint_t j = 0; j < np; j += 8) {
-			engine_mrow_t *r = &rows[at++];
-			r->key[0] = 1; r->key[1] = v[0]; r->key[2] = v[3];
-			r->key[3] = j == 0 ? 0 : p[j + 7];
-			memcpy(r->data, v, 8 * sizeof (uint64_t));
-			memcpy(r->data + 8, p + j, 8 * sizeof (uint64_t));
-		}
+		for (uint_t j = 0; j < np; j += 8)
+			engine_mrow_fill(&rows[at++], v, p + j, j == 0);
 	}
-	if (error == 0) {
-		qsort(rows, total, sizeof (*rows), engine_mkey_compare);
-		for (uint_t i = 1; i < total; i++)
-			if (engine_mkey_compare(rows[i - 1].key,
-			    rows[i].key) >= 0)
-				error = ENGINE_EINVAL(20);
-	}
+	if (error == 0)
+		error = engine_mrows_order(rows, total);
 	if (error != 0) {
 		kmem_free(rows, MAX(1, total) * sizeof (*rows));
 		return (error);
@@ -2306,22 +2318,29 @@ engine_pages_expire_tombstones(const uint64_t *keys, uint_t count)
 	mutex_exit(&engine.lock);
 }
 
+/*
+ * Store this root's catalog: rows (count of them, in key order, taken
+ * over) against the tree of the last stored root.  A row the last root
+ * stored byte for byte needs no insert: the tree already holds it.
+ */
 static int
 engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
-    uint64_t desc[16])
+    engine_mrow_t *rows, uint_t count, uint64_t desc[16])
 {
 	ASSERT(MUTEX_HELD(&engine.store_lock));
 	engine_pages_init();
 	if (engine_pages.pending[1] != 0) {
 		int error = engine_pages_reconcile(spa, B_TRUE);
-		if (error != 0)
+		if (error != 0) {
+			kmem_free(rows, MAX(1, count) * sizeof (*rows));
 			return (error);
+		}
 	}
-	engine_mrow_t *rows;
-	uint_t count;
-	int error = engine_mrows(nv, &rows, &count);
-	if (error != 0)
-		return (error);
+	if (count > engine_pages_row_limit()) {
+		kmem_free(rows, MAX(1, count) * sizeof (*rows));
+		return (ENGINE_EINVAL(9));
+	}
+	int error = 0;
 	if (engine_pages.generation == UINT64_MAX) {
 		kmem_free(rows, MAX(1, count) * sizeof (*rows));
 		return (EOVERFLOW);
@@ -2349,6 +2368,16 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			} else {
 				error = engine_mdel(b, &tree, removed.key);
 			}
+		} else if (order == 0 && memcmp(&engine_pages.rows[before],
+		    &rows[after], sizeof (engine_mrow_t)) == 0) {
+#if defined(ZFS_DEBUG) && !defined(_KERNEL)
+			/* Debug ztest proves the mirror: a no-op insert. */
+			uint64_t changes = b->changes;
+			error = engine_mput(b, &tree, &rows[after]);
+			VERIFY(error != 0 || b->changes == changes);
+#endif
+			before++;
+			after++;
 		} else {
 			if (order == 0)
 				before++;
@@ -2371,7 +2400,8 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 	uint_t nb = 0;
 	engine_mref_t root = { .p = UINT64_MAX };
 	if (error == 0) {
-		fnvlist_remove(nv, "owners");
+		/* A snapshot for this store carries no nvlist of owners. */
+		(void) nvlist_remove_all(nv, "owners");
 		fnvlist_add_uint64_array(nv, "page-tree", (uint64_t *)&tree, 6);
 		fnvlist_add_uint64(nv, "page-generation", b->generation);
 		error = nvlist_pack(nv, &packed, &size, NV_ENCODE_XDR,
@@ -2382,7 +2412,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		if (nb == 0 || nb > engine_pages.capacity)
 			error = ENOSPC;
 		else
-			blobs = kmem_zalloc(nb * sizeof (*blobs), KM_SLEEP);
+			blobs = pr19262_zalloc(nb * sizeof (*blobs), KM_SLEEP);
 	}
 	for (uint_t i = 0; error == 0 && i < nb; i++)
 		error = engine_mnew(b, ENGINE_M_BLOB, 0, &blobs[i]);
@@ -2429,7 +2459,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 	 */
 	if (error == 0 && pr19262_env("PR19262_M_PAGE_FAULT") == NULL) {
 		uint_t n = 0, children = engine.vd->vdev_children;
-		engine_member_page_t *pv = kmem_alloc(
+		engine_member_page_t *pv = pr19262_alloc(
 		    MAX(1, engine_pages.capacity) * sizeof (*pv), KM_SLEEP);
 		for (uint64_t i = 0; error == 0 &&
 		    i < engine_pages.capacity; i++) {

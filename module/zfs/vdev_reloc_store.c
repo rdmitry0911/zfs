@@ -301,8 +301,74 @@ engine_store_range(void *arg, uint64_t start, uint64_t size)
 	r->values[r->count++] = size;
 }
 
+/*
+ * The paged catalog's rows of this root, straight from the owners, with
+ * the snapshot's inclusion and retirement stamping: every sync lists
+ * every owner, so no nvlist per owner.
+ */
+static int
+engine_store_rows(const uberblock_t *ub, engine_mrow_t **out, uint_t *count)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	uint64_t total = 0;
+	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
+	    e = AVL_NEXT(&engine.owners, e)) {
+		if (e->aborted || e->catalog_txg > ub->ub_txg ||
+		    e->journal_pending)
+			continue;
+		total++;
+		for (engine_version_t *b = e->versions; b != NULL; b = b->next)
+			total += b != e->cur && b->retired;
+	}
+	/* The arena limit is checked by the store, once it is open. */
+	if (total > UINT_MAX)
+		return (ENGINE_EINVAL(9));
+	engine_mrow_t *rows = pr19262_zalloc(MAX(1, total) * sizeof (*rows),
+	    KM_SLEEP);
+	uint_t at = 0;
+	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
+	    e = AVL_NEXT(&engine.owners, e)) {
+		if (e->aborted || e->catalog_txg > ub->ub_txg ||
+		    e->journal_pending)
+			continue;
+		if (e->retired && e->retired_txg == 0)
+			e->retired_txg = ub->ub_txg;
+		uint64_t identity[] = { e->v, e->size, e->allocation_txg,
+		    e->incarnation, e->created, e->retired_at,
+		    e->retired ? 1 : (e->checkpoint_only ? 2 : 0),
+		    e->catalog_txg };
+		engine_version_t *b = e->cur;
+		for (;;) {
+			if (b == e->cur || b->retired) {
+				if (b != e->cur && b->retired_txg == 0)
+					b->retired_txg = ub->ub_txg;
+				uint64_t values[] = { b->p, b->size, b->birth,
+				    b->width, b->parity, b->ready, b->retired,
+				    b->generation };
+				engine_mrow_fill(&rows[at++], identity, values,
+				    b == e->cur);
+			}
+			/* Current first, then all other retired versions. */
+			b = b == e->cur ? e->versions : b->next;
+			if (b == e->cur)
+				b = b->next;
+			if (b == NULL)
+				break;
+		}
+	}
+	VERIFY3U(at, ==, total);
+	int error = engine_mrows_order(rows, total);
+	if (error != 0) {
+		kmem_free(rows, MAX(1, total) * sizeof (*rows));
+		return (error);
+	}
+	*out = rows;
+	*count = total;
+	return (0);
+}
+
 static nvlist_t *
-engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
+engine_store_snapshot(spa_t *spa, const uberblock_t *ub, boolean_t owners)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
 	nvlist_t *nv = fnvlist_alloc();
@@ -350,11 +416,13 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 	uint64_t state[] = { engine.sequence, engine.next_incarnation,
 	    engine.retired_limit };
 	fnvlist_add_uint64_array(nv, "state", state, 3);
-	uint64_t max = avl_numnodes(&engine.owners);
-	nvlist_t **rows = kmem_alloc(MAX(1, max) * sizeof (*rows), KM_SLEEP);
+	uint64_t max = owners ? avl_numnodes(&engine.owners) : 0;
+	nvlist_t **rows = pr19262_alloc(MAX(1, max) * sizeof (*rows),
+	    KM_SLEEP);
 	uint_t n = 0;
-	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-	    e = AVL_NEXT(&engine.owners, e)) {
+	/* The paged store takes its rows from engine_store_rows instead. */
+	for (engine_owner_t *e = owners ? avl_first(&engine.owners) : NULL;
+	    e != NULL; e = AVL_NEXT(&engine.owners, e)) {
 		/* New uncommitted V allocations are outside this MOS root. */
 		if (e->aborted || e->catalog_txg > ub->ub_txg ||
 		    e->journal_pending)
@@ -396,13 +464,14 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub)
 		fnvlist_add_uint64_array(row, "P", versions, j);
 		kmem_free(versions, count * 8 * sizeof (uint64_t));
 	}
-	fnvlist_add_nvlist_array(nv, "owners",
-	    (const nvlist_t * const *)rows, n);
+	if (owners)
+		fnvlist_add_nvlist_array(nv, "owners",
+		    (const nvlist_t * const *)rows, n);
 	for (uint_t i = 0; i < n; i++)
 		fnvlist_free(rows[i]);
 	kmem_free(rows, MAX(1, max) * sizeof (*rows));
 	uint64_t nr = zfs_range_tree_numsegs(engine.legacy) * 2;
-	engine_ranges_t r = { kmem_alloc(MAX(1, nr) * sizeof (uint64_t),
+	engine_ranges_t r = { pr19262_alloc(MAX(1, nr) * sizeof (uint64_t),
 	    KM_SLEEP), 0 };
 	zfs_range_tree_walk(engine.legacy, engine_store_range, &r);
 	fnvlist_add_uint64_array(nv, "legacy", r.values, r.count);
@@ -425,12 +494,20 @@ engine_store_sync(spa_t *spa, uberblock_t *ub)
 		mutex_exit(&engine.lock);
 		return (0);
 	}
-	nvlist_t *nv = engine_store_snapshot(spa, ub);
-	if (engine.store_codec >= 6) {
+	boolean_t paged = engine.store_codec >= 6;
+	nvlist_t *nv = engine_store_snapshot(spa, ub, !paged);
+	if (paged) {
+		engine_mrow_t *rows;
+		uint_t count;
+		int error = engine_store_rows(ub, &rows, &count);
 		uint64_t revision = engine.revision;
 		mutex_exit(&engine.lock);
+		if (error != 0) {
+			fnvlist_free(nv);
+			return (error);
+		}
 		uint64_t desc[16];
-		int error = engine_pages_store(spa, ub, nv, desc);
+		error = engine_pages_store(spa, ub, nv, rows, count, desc);
 		fnvlist_free(nv);
 		if (error == 0) {
 			mutex_enter(&engine.lock);
