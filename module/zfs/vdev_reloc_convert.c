@@ -418,6 +418,7 @@ pr19262_engine_certify(spa_t *spa, uint64_t parity)
  * buffer: a copy run alone paid a data flush, a frame and a head.
  */
 static uint_t zfs_pr19262_convert_group = 128;
+#define	ENGINE_CONVERT_FIRST_GROUP	8
 static uint64_t engine_convert_group_bytes = 8ULL << 20;
 
 /* A copy begun by the walk, run with the group it joined. */
@@ -750,10 +751,14 @@ out:
 	 * A log chain is copied block by block, as the chain is followed.  A
 	 * group drains at half a slice's work too: under load a full group
 	 * outlasted the slice's early yield (at most half a slice), and the
-	 * slice held the open txg past its time.
+	 * slice held the open txg past its time.  Before any drain has set
+	 * a pace, a small first group measures it: a full first group after
+	 * a cold import drained for up to 2 s with nothing to bound it.
 	 */
 	if (grouped && error == 0 && (c->zil_chain ||
 	    c->group_count >= c->group_max ||
+	    (c->drain_psize == 0 &&
+	    c->group_count >= ENGINE_CONVERT_FIRST_GROUP) ||
 	    c->group_psize >= engine_convert_group_bytes ||
 	    (c->slice_ns != 0 &&
 	    engine_convert_drain_estimate(c) >= c->slice_ns / 2)))
