@@ -452,8 +452,15 @@ typedef struct engine_convert {
 	boolean_t mos_done;
 	uint64_t cursor;
 	zbookmark_phys_t resume;
-	/* The current slice yields at the first block past this time. */
+	/*
+	 * The current slice yields at the first block past this time, less
+	 * the time the group it holds would take to drain at the last
+	 * group's pace (at most half a slice): it then drains by the end.
+	 */
 	hrtime_t slice_end;
+	hrtime_t slice_ns;
+	hrtime_t drain_ns;
+	uint64_t drain_psize;
 	boolean_t yielded;
 	pr19262_engine_convert_stats_t *stats;
 	blkptr_t *gang;
@@ -527,6 +534,8 @@ engine_convert_drain(engine_convert_t *c)
 	uint_t n = c->group_count;
 	if (n == 0)
 		return (0);
+	hrtime_t start = gethrtime();
+	uint64_t psize = c->group_psize;
 	spa_t *spa = c->spa;
 	pr19262_engine_convert_stats_t *st = c->stats;
 	void **handles = kmem_alloc(n * sizeof (void *), KM_SLEEP);
@@ -595,6 +604,8 @@ engine_convert_drain(engine_convert_t *c)
 	kmem_free(tail, n * sizeof (boolean_t));
 	kmem_free(errors, n * sizeof (int));
 	kmem_free(handles, n * sizeof (void *));
+	c->drain_ns = gethrtime() - start;
+	c->drain_psize = psize;
 	return (first);
 }
 
@@ -762,8 +773,11 @@ engine_convert_visit(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	if (error == 0 && ((c->batch != 0 &&
 	    c->pending + c->group_asize >= c->batch) || c->starved))
 		error = ERESTART;
-	/* A slice holds the open txg: past its time it yields here. */
-	if (error == 0 && gethrtime() >= c->slice_end) {
+	/* A slice holds the open txg: near its time it yields here. */
+	hrtime_t drain = c->drain_psize == 0 ? 0 :
+	    c->drain_ns * c->group_psize / c->drain_psize;
+	if (error == 0 && gethrtime() + MIN(drain, c->slice_ns / 2) >=
+	    c->slice_end) {
 		c->yielded = B_TRUE;
 		error = ERESTART;
 	}
@@ -992,8 +1006,8 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 			 */
 			txg_wait_synced(dp, dmu_tx_get_txg(fence) - 1);
 			c.yielded = B_FALSE;
-			c.slice_end = gethrtime() +
-			    MSEC2NSEC(engine_convert_slice_ms);
+			c.slice_ns = MSEC2NSEC(engine_convert_slice_ms);
+			c.slice_end = gethrtime() + c.slice_ns;
 			error = engine_convert_slice(&c);
 			/* The slice's copies finish under its hold. */
 			int ran = engine_convert_drain(&c);
@@ -1025,9 +1039,14 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 					    error, (u_longlong_t)pass);
 			}
 			dmu_tx_commit(fence);
+			hrtime_t now = gethrtime();
 			stats->slices++;
 			stats->hold_ms_max = MAX(stats->hold_ms_max,
-			    NSEC2MSEC(gethrtime() - held));
+			    NSEC2MSEC(now - held));
+			if (now > c.slice_end)
+				stats->slice_over_ms_max = MAX(
+				    stats->slice_over_ms_max,
+				    NSEC2MSEC(now - c.slice_end));
 		}
 		if (error != 0)
 			break;
@@ -1059,7 +1078,8 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		pr19262_printf("PR19262_CONVERT_PASS pass=%llu partial=%u "
 		    "visited=%llu copied=%llu busy=%llu stale=%llu "
 		    "starved=%llu candidates=%llu zil_blocks=%llu "
-		    "unwritten=%llu slices=%llu hold_ms_max=%llu\n",
+		    "unwritten=%llu slices=%llu hold_ms_max=%llu "
+		    "slice_over_ms_max=%llu\n",
 		    (u_longlong_t)stats->passes, !swept,
 		    (u_longlong_t)stats->visited, (u_longlong_t)stats->copied,
 		    (u_longlong_t)stats->busy, (u_longlong_t)stats->stale,
@@ -1068,7 +1088,8 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		    (u_longlong_t)stats->zil_blocks,
 		    (u_longlong_t)stats->unwritten,
 		    (u_longlong_t)stats->slices,
-		    (u_longlong_t)stats->hold_ms_max);
+		    (u_longlong_t)stats->hold_ms_max,
+		    (u_longlong_t)stats->slice_over_ms_max);
 		if (!swept)
 			continue;
 		/* A full sweep that found nothing ends the conversion. */

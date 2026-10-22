@@ -209,9 +209,13 @@ typedef struct pr19262_engine_census {
 void pr19262_engine_census(spa_t *, uint64_t, pr19262_engine_census_t *);
 typedef struct pr19262_engine_convert_stats {
 	uint64_t passes;
-	/* Slices of the sweep, and the longest any held the open txg. */
+	/*
+	 * Slices of the sweep, the longest any held the open txg, and the
+	 * most any ran past its time.
+	 */
 	uint64_t slices;
 	uint64_t hold_ms_max;
+	uint64_t slice_over_ms_max;
 	uint64_t visited;
 	uint64_t gang_members;
 	uint64_t zil_blocks;
