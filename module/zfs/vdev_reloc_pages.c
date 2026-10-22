@@ -45,11 +45,31 @@ typedef struct engine_mchild {
 #define	ENGINE_M_CHILDREN (ENGINE_M_PAYLOAD / sizeof (engine_mchild_t))
 
 
+/*
+ * A catalog page in memory.  The page is its own 4 KiB buffer: kept inline,
+ * the 4104-byte node took an 8 KiB slab and doubled the memory of every
+ * cached page.  Nodes come only from engine_mnode_alloc().
+ */
 typedef struct engine_mnode {
-	uint64_t data[ENGINE_STORE_PAGE / sizeof (uint64_t)];
+	uint64_t *data;
 	boolean_t dirty;
 	boolean_t sealed;
 } engine_mnode_t;
+
+static engine_mnode_t *
+engine_mnode_alloc(void)
+{
+	engine_mnode_t *n = kmem_zalloc(sizeof (*n), KM_SLEEP);
+	n->data = kmem_zalloc(ENGINE_STORE_PAGE, KM_SLEEP);
+	return (n);
+}
+
+static void
+engine_mnode_free(engine_mnode_t *n)
+{
+	kmem_free(n->data, ENGINE_STORE_PAGE);
+	kmem_free(n, sizeof (*n));
+}
 
 typedef struct engine_mbatch {
 	spa_t *spa;
@@ -293,7 +313,7 @@ engine_mread_ref(spa_t *spa, const engine_mref_t *ref,
 	    stripe > engine.total - ref->p ||
 	    (!bootstrap && !engine_mindex(ref->p, &index)))
 		return (ENGINE_EINVAL(4));
-	engine_mnode_t *n = kmem_zalloc(sizeof (*n), KM_SLEEP);
+	engine_mnode_t *n = engine_mnode_alloc();
 	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
 	int error = ECKSUM;
 	for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
@@ -342,7 +362,7 @@ engine_mread_ref(spa_t *spa, const engine_mref_t *ref,
 	}
 	abd_free(abd);
 	if (error != 0) {
-		kmem_free(n, sizeof (*n));
+		engine_mnode_free(n);
 		return (error);
 	}
 	n->sealed = B_TRUE;
@@ -405,7 +425,7 @@ engine_mnew(engine_mbatch_t *b, uint64_t type, uint64_t level,
 	if (index < ENGINE_STORE_PAGES)
 		engine.bitmap[index] = 1;
 	mutex_exit(&engine.lock);
-	engine_mnode_t *n = kmem_zalloc(sizeof (*n), KM_SLEEP);
+	engine_mnode_t *n = engine_mnode_alloc();
 	engine_mheader_t *h = engine_mheader(n);
 	h->magic = ENGINE_M_MAGIC;
 	h->type = type; h->level = level;
@@ -643,7 +663,7 @@ engine_mrelease(engine_mbatch_t *b, engine_mnode_t *n)
 		engine.bitmap[index] = 0;
 	mutex_exit(&engine.lock);
 	engine_pages.cache[index] = NULL;
-	kmem_free(n, sizeof (*n));
+	engine_mnode_free(n);
 	VERIFY3U(b->pages, >, 0);
 	b->pages--;
 }
@@ -789,8 +809,7 @@ engine_pages_tree_clear(void)
 {
 	for (uint64_t i = 0; i < engine_pages.capacity; i++) {
 		if (engine_pages.cache[i] != NULL)
-			kmem_free(engine_pages.cache[i],
-			    sizeof (engine_mnode_t));
+			engine_mnode_free(engine_pages.cache[i]);
 		engine_pages.cache[i] = NULL;
 	}
 	if (engine_pages.rows != NULL)
@@ -933,7 +952,7 @@ static int
 engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
     uint64_t generation, uint64_t serial, const engine_mcontrol_t *control)
 {
-	engine_mnode_t *n = kmem_zalloc(sizeof (*n), KM_SLEEP);
+	engine_mnode_t *n = engine_mnode_alloc();
 	engine_mheader_t *h = engine_mheader(n);
 	uint_t slot = serial % 2;
 	h->magic = ENGINE_M_ALLOC_MAGIC;
@@ -986,7 +1005,7 @@ engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
 	}
 	spa_config_exit(spa, SCL_ZIO, FTAG);
 	abd_free(abd);
-	kmem_free(n, sizeof (*n));
+	engine_mnode_free(n);
 	return (engine_quorum_result(&q));
 }
 
@@ -1075,7 +1094,7 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
     uint8_t *bitmap, uint64_t *generation, uint64_t *serial_high,
     engine_mcontrol_t *control, boolean_t strict)
 {
-	engine_mnode_t *n = kmem_zalloc(sizeof (*n), KM_SLEEP);
+	engine_mnode_t *n = engine_mnode_alloc();
 	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
 	boolean_t found = B_FALSE;
 	boolean_t conflict = B_FALSE;
@@ -1206,7 +1225,7 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 	kmem_free(masks, 2 * children * a->pages);
 	kmem_free(absent, children * sizeof (boolean_t));
 	abd_free(abd);
-	kmem_free(n, sizeof (*n));
+	engine_mnode_free(n);
 	if (error != 0)
 		return (error);
 	return (conflict ? ECKSUM : (found ? 0 : ENOENT));
@@ -1343,7 +1362,7 @@ engine_pages_mark_io(engine_mmarker_t *m, engine_mnode_t *n, uint64_t p,
 	}
 	if (m->audit_ok == NULL)
 		return;
-	engine_mnode_t *probe = kmem_zalloc(sizeof (*probe), KM_SLEEP);
+	engine_mnode_t *probe = engine_mnode_alloc();
 	abd_t *pabd = abd_get_from_buf(probe->data, ENGINE_STORE_PAGE);
 	for (uint_t c = 0; c < children; c++) {
 		boolean_t ok = B_FALSE;
@@ -1364,7 +1383,7 @@ engine_pages_mark_io(engine_mmarker_t *m, engine_mnode_t *n, uint64_t p,
 			m->audit_missing[c]++;
 	}
 	abd_free(pabd);
-	kmem_free(probe, sizeof (*probe));
+	engine_mnode_free(probe);
 }
 
 /* Mark every page reachable from a blob chain or a page-tree reference. */
@@ -1402,7 +1421,7 @@ engine_pages_mark_ref(engine_mmarker_t *m, const engine_mref_t *ref)
 		error = engine_pages_mark_ref(m, &next);
 	}
 	if (owned)
-		kmem_free(n, sizeof (*n));
+		engine_mnode_free(n);
 	return (error);
 }
 
@@ -1461,8 +1480,7 @@ engine_pages_gc(spa_t *spa, uint64_t *freed)
 				engine.bitmap[i] = 0;
 			if (engine_pages.cache[i] != NULL) {
 				VERIFY(!engine_pages.cache[i]->dirty);
-				kmem_free(engine_pages.cache[i],
-				    sizeof (engine_mnode_t));
+				engine_mnode_free(engine_pages.cache[i]);
 				engine_pages.cache[i] = NULL;
 			}
 			(*freed)++;
@@ -1520,7 +1538,7 @@ engine_pages_members(spa_t *spa, int target, uint64_t *ok,
 		if (ok == NULL)
 			continue;
 		/* Control slots: the current serial or the one before it. */
-		engine_mnode_t *probe = kmem_zalloc(sizeof (*probe), KM_SLEEP);
+		engine_mnode_t *probe = engine_mnode_alloc();
 		abd_t *pabd = abd_get_from_buf(probe->data, ENGINE_STORE_PAGE);
 		for (uint_t slot = 0; slot < 2; slot++) {
 			for (uint_t c = 0; c < children; c++) {
@@ -1546,7 +1564,7 @@ engine_pages_members(spa_t *spa, int target, uint64_t *ok,
 			}
 		}
 		abd_free(pabd);
-		kmem_free(probe, sizeof (*probe));
+		engine_mnode_free(probe);
 	}
 	kmem_free(m.marked, engine_pages.capacity);
 	*written = m.written;
@@ -1700,7 +1718,7 @@ engine_pages_manifest(spa_t *spa)
 			    ref.generation > previous)
 				error = ENGINE_EINVAL(22);
 		}
-		kmem_free(n, sizeof (*n));
+		engine_mnode_free(n);
 		if (error != 0)
 			return (error);
 	}
@@ -1741,7 +1759,7 @@ engine_pages_directory_write(spa_t *spa, engine_marena_t *a,
 	engine_mnode_t *n = engine_pages.cache[index];
 	engine_mref_t candidate = a->candidate;
 	if (n == NULL) {
-		n = kmem_zalloc(sizeof (*n), KM_SLEEP);
+		n = engine_mnode_alloc();
 		engine_mheader_t *h = engine_mheader(n);
 		h->magic = ENGINE_M_MAGIC; h->type = ENGINE_M_DIRECTORY;
 		h->count = 10 * sizeof (uint64_t);
@@ -1767,7 +1785,7 @@ engine_pages_directory_write(spa_t *spa, engine_marena_t *a,
 		if (a->candidate.generation != 0 &&
 		    memcmp(&candidate, &a->candidate,
 		    sizeof (candidate)) != 0) {
-			kmem_free(n, sizeof (*n));
+			engine_mnode_free(n);
 			return (ECKSUM);
 		}
 		n->sealed = B_TRUE;
@@ -1905,8 +1923,7 @@ engine_pages_remove_pending(engine_marena_t *a)
 	memcpy(bits, engine_pages.bits, count);
 	for (uint64_t i = count; i < engine_pages.capacity; i++)
 		if (engine_pages.cache[i] != NULL)
-			kmem_free(engine_pages.cache[i],
-			    sizeof (engine_mnode_t));
+			engine_mnode_free(engine_pages.cache[i]);
 	kmem_free(engine_pages.cache,
 	    engine_pages.capacity * sizeof (*engine_pages.cache));
 	kmem_free(engine_pages.bits, engine_pages.capacity);
@@ -1923,8 +1940,8 @@ engine_pages_pending_inspect(spa_t *spa, engine_marena_t *a)
 {
 	if (a->formatted)
 		return (0);
-	engine_mnode_t *n = kmem_zalloc(sizeof (*n), KM_SLEEP);
-	engine_mnode_t *wire = kmem_zalloc(sizeof (*wire), KM_SLEEP);
+	engine_mnode_t *n = engine_mnode_alloc();
+	engine_mnode_t *wire = engine_mnode_alloc();
 	engine_mnode_t *directory = NULL;
 	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
 	uint8_t *bits = pr19262_zalloc(a->pages, KM_SLEEP);
@@ -2063,8 +2080,7 @@ engine_pages_pending_inspect(spa_t *spa, engine_marena_t *a)
 				candidate = ref;
 				if (directory == NULL) {
 					directory = wire;
-					wire = kmem_zalloc(sizeof (*wire),
-					    KM_SLEEP);
+					wire = engine_mnode_alloc();
 					directory->sealed = B_TRUE;
 				}
 				bits[2] = 1;
@@ -2096,10 +2112,10 @@ engine_pages_pending_inspect(spa_t *spa, engine_marena_t *a)
 	}
 	kmem_free(bits, a->pages);
 	if (directory != NULL)
-		kmem_free(directory, sizeof (*directory));
-	kmem_free(wire, sizeof (*wire));
+		engine_mnode_free(directory);
+	engine_mnode_free(wire);
 	abd_free(abd);
-	kmem_free(n, sizeof (*n));
+	engine_mnode_free(n);
 	return (error);
 }
 
@@ -2728,7 +2744,7 @@ engine_mwalk(engine_mreader_t *r, const engine_mref_t *ref, uint64_t level,
 	}
 	memcpy(low, h->low, sizeof (h->low));
 	memcpy(high, h->high, sizeof (h->high));
-	kmem_free(n, sizeof (*n));
+	engine_mnode_free(n);
 	return (error);
 }
 
@@ -2837,7 +2853,7 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 			if (ref.p != UINT64_MAX && ref.generation == 0)
 				error = ENGINE_EINVAL(33);
 		}
-		kmem_free(n, sizeof (*n));
+		engine_mnode_free(n);
 	}
 	nvlist_t *nv = NULL;
 	if (error == 0 && offset != d[7])
