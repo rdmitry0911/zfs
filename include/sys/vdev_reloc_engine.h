@@ -45,6 +45,7 @@ extern void libspl_backtrace(int);
 	__FILE__, (reason), __LINE__), EINVAL)
 #include <sys/uberblock.h>
 #include <sys/range_tree.h>
+#include <sys/dmu_traverse.h>
 /* Private userspace experiment; no supported persistent/public ABI. */
 #define	PR19262_ENGINE_LABEL_FEATURE "org.openzfs:pr19262_private_vp"
 boolean_t pr19262_engine_persistent(spa_t *);
@@ -206,6 +207,9 @@ typedef struct pr19262_engine_census {
 void pr19262_engine_census(spa_t *, uint64_t, pr19262_engine_census_t *);
 typedef struct pr19262_engine_convert_stats {
 	uint64_t passes;
+	/* Slices of the sweep, and the longest any held the open txg. */
+	uint64_t slices;
+	uint64_t hold_ms_max;
 	uint64_t visited;
 	uint64_t gang_members;
 	uint64_t zil_blocks;
@@ -229,6 +233,9 @@ typedef struct pr19262_engine_convert_stats {
 } pr19262_engine_convert_stats_t;
 int pr19262_engine_convert(spa_t *, uint64_t, uint64_t, uint64_t,
     pr19262_engine_convert_stats_t *);
+/* The MOS alone, resumable (dmu_traverse.c): the sweep walks in slices. */
+int pr19262_traverse_mos_resume(spa_t *, zbookmark_phys_t *, int,
+    blkptr_cb_t, void *);
 int pr19262_engine_fence(spa_t *, uint64_t *, uint64_t *, uint64_t *,
     uint64_t *);
 int pr19262_engine_certify(spa_t *, uint64_t);

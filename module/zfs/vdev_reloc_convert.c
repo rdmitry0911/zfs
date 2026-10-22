@@ -428,6 +428,16 @@ typedef struct engine_convert {
 	uint64_t idle_passes;
 	/* Inside a log chain: an unreadable block is an unwritten tail. */
 	boolean_t zil_chain;
+	/*
+	 * The sweep's cursor: the MOS, then each dataset object in order,
+	 * and the bookmark the traversal left where the last slice stopped.
+	 */
+	boolean_t mos_done;
+	uint64_t cursor;
+	zbookmark_phys_t resume;
+	/* The current slice yields at the first block past this time. */
+	hrtime_t slice_end;
+	boolean_t yielded;
 	pr19262_engine_convert_stats_t *stats;
 	blkptr_t *gang;
 	uint_t gang_count;
@@ -647,7 +657,77 @@ engine_convert_visit(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	if (error == 0 && ((c->batch != 0 && c->pending >= c->batch) ||
 	    c->starved))
 		error = ERESTART;
+	/* A slice holds the open txg: past its time it yields here. */
+	if (error == 0 && gethrtime() >= c->slice_end) {
+		c->yielded = B_TRUE;
+		error = ERESTART;
+	}
 	return (error);
+}
+
+/*
+ * Longest one slice of the sweep holds the open txg.  The hold keeps any
+ * free from landing under the walk; a sweep that held it throughout, as
+ * a full walk costs about a scrub, would stop the pool's txgs (and every
+ * sync task, and spa_namespace_lock behind spa_async) for that long.
+ */
+static uint64_t engine_convert_slice_ms = 1000;
+
+/*
+ * One slice of a sweep: walk from the cursor until the visitor stops
+ * (ERESTART, the bookmark is in c->resume) or the sweep reaches its end
+ * (0).  Each slice walks a fresh root under its own hold, so a stop and
+ * a resume never read a block freed after the root it started from.
+ */
+static int
+engine_convert_slice(engine_convert_t *c)
+{
+	dsl_pool_t *dp = spa_get_dsl(c->spa);
+	objset_t *mos = dp->dp_meta_objset;
+	int flags = TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
+	    TRAVERSE_NO_DECRYPT;
+	int error = 0;
+	if (!c->mos_done) {
+		error = pr19262_traverse_mos_resume(c->spa, &c->resume, flags,
+		    engine_convert_visit, c);
+		if (error != 0)
+			return (error);
+		c->mos_done = B_TRUE;
+		c->cursor = 1;
+		memset(&c->resume, 0, sizeof (c->resume));
+		c->resume.zb_objset = c->cursor;
+	}
+	for (; error == 0;
+	    error = dmu_object_next(mos, &c->cursor, B_FALSE, 0)) {
+		dmu_object_info_t doi;
+		dsl_dataset_t *ds;
+		/* Objects freed since the last slice are skipped. */
+		if (dmu_object_info(mos, c->cursor, &doi) != 0 ||
+		    doi.doi_bonus_type != DMU_OT_DSL_DATASET)
+			continue;
+		dsl_pool_config_enter(dp, FTAG);
+		error = dsl_dataset_hold_obj(dp, c->cursor, FTAG, &ds);
+		dsl_pool_config_exit(dp, FTAG);
+		if (error == ENOENT) {
+			error = 0;
+			continue;
+		}
+		if (error != 0)
+			return (error);
+		if (c->resume.zb_objset != c->cursor) {
+			memset(&c->resume, 0, sizeof (c->resume));
+			c->resume.zb_objset = c->cursor;
+		}
+		/* Like traverse_pool: each block in the dataset born in it. */
+		error = traverse_dataset_resume(ds,
+		    dsl_dataset_phys(ds)->ds_prev_snap_txg, &c->resume, flags,
+		    engine_convert_visit, c);
+		dsl_dataset_rele(ds, FTAG);
+		if (error != 0)
+			return (error);
+		memset(&c->resume, 0, sizeof (c->resume));
+	}
+	return (error == ESRCH ? 0 : error);
 }
 
 static int
@@ -731,9 +811,12 @@ engine_convert_zil(engine_convert_t *c)
 /*
  * Sweep every allocation of the engine's vdev that a persistent root or
  * log chain references and move each backing weaker than the layout of
- * birth.  Each pass holds the open txg so that no block is freed under the
- * walk, converts at most batch bytes, then fences so that the old backing
- * returns before the next pass.  Returns when a full pass finds nothing.
+ * birth.  The sweep walks in slices; each holds the open txg so that no
+ * block is freed under its walk, for at most engine_convert_slice_ms, and
+ * the next resumes on a fresh root where it stopped.  A pass converts at
+ * most batch bytes, then fences so that the old backing returns before
+ * the next pass, which resumes the sweep.  Returns when a full sweep finds
+ * nothing.
  */
 int
 pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
@@ -767,42 +850,63 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		return (ENOSPC);
 	}
 	int error = 0;
+	/* A sweep spans passes: it resumes where a full batch stopped it. */
+	uint64_t sweep_copied = 0, sweep_busy = 0;
 	for (uint64_t pass = 0; pass < max_passes; pass++) {
 		stats->passes++;
-		uint64_t copied = stats->copied, busy = stats->busy;
+		uint64_t copied = stats->copied;
 		c.starved = B_FALSE;
-		txg_wait_synced(dp, 0);
-		/* Hold the open txg: nothing is freed under the walk. */
-		dmu_tx_t *fence = dmu_tx_create_dd(dp->dp_mos_dir);
-		VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
-		/*
-		 * The txg before the held one may still be quiescing or
-		 * syncing, and its sync frees blocks that the last synced
-		 * root (the walk's root) references.  Wait for every txg
-		 * below the held one, so that the root is the held txg's
-		 * predecessor and no free can land under the walk.
-		 */
-		txg_wait_synced(dp, dmu_tx_get_txg(fence) - 1);
 		c.pending = 0;
-		/* Encrypted datasets need no key: only BPs matter. */
-		error = traverse_pool(spa, 0,
-		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
-		    TRAVERSE_NO_DECRYPT, engine_convert_visit, &c);
-		boolean_t partial = error == ERESTART;
-		if (partial)
-			error = 0;
-		if (error != 0)
-			pr19262_printf("PR19262_CONVERT_PASS_ERROR "
-			    "step=traverse error=%d pass=%llu\n", error,
-			    (u_longlong_t)pass);
-		if (error == 0 && !partial) {
-			error = engine_convert_zil(&c);
-			if (error != 0)
+		boolean_t partial = B_FALSE, swept = B_FALSE;
+		for (boolean_t first = B_TRUE; error == 0 && !partial &&
+		    !swept; first = B_FALSE) {
+			/*
+			 * A pass starts on a fresh sync; the slices after its
+			 * first only wait for the txg below their own hold,
+			 * which, while nobody kicked a sync, is no wait.
+			 */
+			if (first)
+				txg_wait_synced(dp, 0);
+			/* Hold the open txg: nothing is freed under it. */
+			dmu_tx_t *fence = dmu_tx_create_dd(dp->dp_mos_dir);
+			VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
+			hrtime_t held = gethrtime();
+			/*
+			 * The txg before the held one may still be quiescing
+			 * or syncing, and its sync frees blocks that the last
+			 * synced root (the walk's root) references.  Wait for
+			 * every txg below the held one, so that the root is
+			 * the held txg's predecessor and no free can land
+			 * under the walk.
+			 */
+			txg_wait_synced(dp, dmu_tx_get_txg(fence) - 1);
+			c.yielded = B_FALSE;
+			c.slice_end = gethrtime() +
+			    MSEC2NSEC(engine_convert_slice_ms);
+			error = engine_convert_slice(&c);
+			if (error == ERESTART) {
+				error = 0;
+				partial = !c.yielded;
+			} else if (error == 0) {
+				swept = B_TRUE;
+			} else {
 				pr19262_printf("PR19262_CONVERT_PASS_ERROR "
-				    "step=zil error=%d pass=%llu\n", error,
-				    (u_longlong_t)pass);
+				    "step=traverse error=%d pass=%llu\n",
+				    error, (u_longlong_t)pass);
+			}
+			if (swept) {
+				error = engine_convert_zil(&c);
+				if (error != 0)
+					pr19262_printf(
+					    "PR19262_CONVERT_PASS_ERROR "
+					    "step=zil error=%d pass=%llu\n",
+					    error, (u_longlong_t)pass);
+			}
+			dmu_tx_commit(fence);
+			stats->slices++;
+			stats->hold_ms_max = MAX(stats->hold_ms_max,
+			    NSEC2MSEC(gethrtime() - held));
 		}
-		dmu_tx_commit(fence);
 		if (error != 0)
 			break;
 		if (batch != 0) {
@@ -833,27 +937,37 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		pr19262_printf("PR19262_CONVERT_PASS pass=%llu partial=%u "
 		    "visited=%llu copied=%llu busy=%llu stale=%llu "
 		    "starved=%llu candidates=%llu zil_blocks=%llu "
-		    "unwritten=%llu\n", (u_longlong_t)stats->passes, partial,
+		    "unwritten=%llu slices=%llu hold_ms_max=%llu\n",
+		    (u_longlong_t)stats->passes, !swept,
 		    (u_longlong_t)stats->visited, (u_longlong_t)stats->copied,
 		    (u_longlong_t)stats->busy, (u_longlong_t)stats->stale,
 		    (u_longlong_t)stats->starved,
 		    (u_longlong_t)stats->candidates,
 		    (u_longlong_t)stats->zil_blocks,
-		    (u_longlong_t)stats->unwritten);
-		if (!partial && stats->copied == copied && stats->busy == busy)
+		    (u_longlong_t)stats->unwritten,
+		    (u_longlong_t)stats->slices,
+		    (u_longlong_t)stats->hold_ms_max);
+		if (!swept)
+			continue;
+		/* A full sweep that found nothing ends the conversion. */
+		if (stats->copied == sweep_copied && stats->busy == sweep_busy)
 			break;
-		/* Busy across many idle passes is a defect, not a wait. */
-		if (!partial && stats->copied == copied)
+		/* Busy across many idle sweeps is a defect, not a wait. */
+		if (stats->copied == sweep_copied)
 			c.idle_passes++;
 		else
 			c.idle_passes = 0;
 		if (c.idle_passes >= 8) {
 			pr19262_printf("PR19262_CONVERT_STUCK passes=%llu "
 			    "busy=%llu\n", (u_longlong_t)stats->passes,
-			    (u_longlong_t)(stats->busy - busy));
+			    (u_longlong_t)(stats->busy - sweep_busy));
 			error = EBUSY;
 			break;
 		}
+		sweep_copied = stats->copied;
+		sweep_busy = stats->busy;
+		c.mos_done = B_FALSE;
+		memset(&c.resume, 0, sizeof (c.resume));
 	}
 	if (error != 0)
 		pr19262_engine_admit_release(spa, PR19262_ADMIT_CONVERTER,

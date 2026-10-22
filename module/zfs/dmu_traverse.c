@@ -828,6 +828,15 @@ traverse_pool(spa_t *spa, uint64_t txg_start, int flags,
 	return (err != 0 ? err : hard_err);
 }
 
+/* The MOS alone, resumable: the private converter walks it in slices. */
+int
+pr19262_traverse_mos_resume(spa_t *spa, zbookmark_phys_t *resume, int flags,
+    blkptr_cb_t func, void *arg)
+{
+	return (traverse_impl(spa, NULL, 0, spa_get_rootblkptr(spa), 0,
+	    resume, flags, func, arg));
+}
+
 EXPORT_SYMBOL(traverse_dataset);
 EXPORT_SYMBOL(traverse_pool);
 
