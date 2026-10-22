@@ -610,6 +610,14 @@ engine_convert_drain(engine_convert_t *c)
 }
 
 /* One concrete allocation: a plain block, a gang header or a gang member. */
+/* The time the group held now would take to drain at the last pace. */
+static hrtime_t
+engine_convert_drain_estimate(const engine_convert_t *c)
+{
+	return (c->drain_psize == 0 ? 0 :
+	    c->drain_ns * c->group_psize / c->drain_psize);
+}
+
 static int
 engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
     boolean_t member)
@@ -733,10 +741,17 @@ out:
 		c->group_holds[c->group_hold_count++] = h;
 	else
 		pr19262_engine_rele(h);
-	/* A log chain is copied block by block, as the chain is followed. */
+	/*
+	 * A log chain is copied block by block, as the chain is followed.  A
+	 * group drains at half a slice's work too: under load a full group
+	 * outlasted the slice's early yield (at most half a slice), and the
+	 * slice held the open txg past its time.
+	 */
 	if (grouped && error == 0 && (c->zil_chain ||
 	    c->group_count >= c->group_max ||
-	    c->group_psize >= engine_convert_group_bytes))
+	    c->group_psize >= engine_convert_group_bytes ||
+	    (c->slice_ns != 0 &&
+	    engine_convert_drain_estimate(c) >= c->slice_ns / 2)))
 		error = engine_convert_drain(c);
 	return (error);
 }
@@ -774,8 +789,7 @@ engine_convert_visit(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	    c->pending + c->group_asize >= c->batch) || c->starved))
 		error = ERESTART;
 	/* A slice holds the open txg: near its time it yields here. */
-	hrtime_t drain = c->drain_psize == 0 ? 0 :
-	    c->drain_ns * c->group_psize / c->drain_psize;
+	hrtime_t drain = engine_convert_drain_estimate(c);
 	if (error == 0 && gethrtime() + MIN(drain, c->slice_ns / 2) >=
 	    c->slice_end) {
 		c->yielded = B_TRUE;
