@@ -116,8 +116,16 @@ static boolean_t engine_store_extent(uint64_t, uint64_t);
 static boolean_t engine_m_read_injected;
 static boolean_t engine_m_active_error_injected;
 
+/*
+ * Readers holding only engine.lock (admission, the census) walk the arena
+ * list and the page bits.  A new arena is prepared in full, bits and
+ * pending flag included, and published with the new arrays under
+ * engine.lock; the old arrays are freed after.  Callers hold the store
+ * lock, never engine.lock.
+ */
 static int
-engine_pages_add_arena(uint64_t p, uint64_t pages)
+engine_pages_add_arena(uint64_t p, uint64_t pages, const uint8_t *init,
+    boolean_t pending)
 {
 	uint64_t stripe = ENGINE_STORE_PAGE * engine.vd->vdev_children;
 	if (pages < 3 || pages > ENGINE_M_PAYLOAD ||
@@ -137,20 +145,33 @@ engine_pages_add_arena(uint64_t p, uint64_t pages)
 	engine_mnode_t **cache = pr19262_zalloc(count * sizeof (*cache),
 	    KM_SLEEP);
 	uint8_t *bits = pr19262_zalloc(count, KM_SLEEP);
-	bits[old] = bits[old + 1] = 1;
 	if (old != 0) {
 		memcpy(cache, engine_pages.cache, old * sizeof (*cache));
 		memcpy(bits, engine_pages.bits, old);
-		kmem_free(engine_pages.cache, old * sizeof (*cache));
-		kmem_free(engine_pages.bits, old);
 	}
+	/* A pending arena stays allocated until its growth finishes. */
+	if (pending)
+		memset(bits + old, 1, pages);
+	else if (init != NULL)
+		memcpy(bits + old, init, pages);
+	else
+		bits[old] = bits[old + 1] = 1;
 	engine_marena_t *a = kmem_zalloc(sizeof (*a), KM_SLEEP);
-	a->p = p; a->first = old; a->pages = pages;
+	a->p = p; a->first = old; a->pages = pages; a->pending = pending;
+	engine_mnode_t **old_cache = engine_pages.cache;
+	uint8_t *old_bits = engine_pages.bits;
+	ASSERT(!MUTEX_HELD(&engine.lock));
+	mutex_enter(&engine.lock);
 	a->next = engine_pages.arenas;
 	engine_pages.arenas = a;
 	engine_pages.cache = cache;
 	engine_pages.bits = bits;
 	engine_pages.capacity = count;
+	mutex_exit(&engine.lock);
+	if (old != 0) {
+		kmem_free(old_cache, old * sizeof (*cache));
+		kmem_free(old_bits, old);
+	}
 	return (0);
 }
 
@@ -159,9 +180,8 @@ engine_pages_init(void)
 {
 	if (engine_pages.capacity != 0)
 		return;
-	VERIFY0(engine_pages_add_arena(engine.arena, ENGINE_STORE_PAGES));
-	if (engine.bitmap != NULL)
-		memcpy(engine_pages.bits, engine.bitmap, ENGINE_STORE_PAGES);
+	VERIFY0(engine_pages_add_arena(engine.arena, ENGINE_STORE_PAGES,
+	    engine.bitmap, B_FALSE));
 }
 
 static void
@@ -1660,7 +1680,8 @@ engine_pages_manifest(spa_t *spa)
 		    (data[2] == 0 && data[3] == 0)) {
 			error = ENGINE_EINVAL(21);
 		} else {
-			error = engine_pages_add_arena(data[0], data[1]);
+			error = engine_pages_add_arena(data[0], data[1],
+			    NULL, B_FALSE);
 			if (error == 0) {
 				engine_marena_t *a = engine_pages.arenas;
 				memcpy(a->uuid, data + 2, sizeof (a->uuid));
@@ -1688,13 +1709,11 @@ engine_pages_manifest(spa_t *spa)
 		    engine_pages.pending[3] == 0)
 			return (ENGINE_EINVAL(13));
 		error = engine_pages_add_arena(engine_pages.pending[0],
-		    engine_pages.pending[1]);
+		    engine_pages.pending[1], NULL, B_TRUE);
 		if (error != 0)
 			return (error);
 		engine_marena_t *a = engine_pages.arenas;
 		memcpy(a->uuid, engine_pages.pending + 2, sizeof (a->uuid));
-		a->pending = B_TRUE;
-		memset(engine_pages.bits + a->first, 1, a->pages);
 	} else {
 		uint64_t empty[4] = { 0 };
 		if (memcmp(engine_pages.pending, empty, sizeof (empty)) != 0)
@@ -1854,7 +1873,8 @@ engine_pages_grow(engine_mbatch_t *b)
 	zfs_range_tree_remove(engine.free, range[0], bytes);
 	zfs_range_tree_add(engine.store_extents, range[0], bytes);
 	mutex_exit(&engine.lock);
-	int error = engine_pages_add_arena(range[0], ENGINE_STORE_PAGES);
+	int error = engine_pages_add_arena(range[0], ENGINE_STORE_PAGES, NULL,
+	    B_TRUE);
 	if (error != 0) {
 		mutex_enter(&engine.lock);
 		zfs_range_tree_remove(engine.store_extents, range[0], bytes);
@@ -1863,8 +1883,6 @@ engine_pages_grow(engine_mbatch_t *b)
 		return (error);
 	}
 	engine_marena_t *a = engine_pages.arenas;
-	a->pending = B_TRUE;
-	memset(engine_pages.bits + a->first, 1, a->pages);
 	engine_pages.pending[0] = range[0];
 	engine_pages.pending[1] = a->pages;
 	VERIFY0(random_get_pseudo_bytes((void *)(engine_pages.pending + 2),
