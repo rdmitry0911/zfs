@@ -2404,6 +2404,114 @@ engine_pages_expire_tombstones(const uint64_t *keys, uint_t count)
  * over) against the tree of the last stored root.  A row the last root
  * stored byte for byte needs no insert: the tree already holds it.
  */
+/*
+ * Debug ztest still keeps the stored rows twice, as a sorted mirror, and
+ * checks every step of the tree walk against it; elsewhere the walk alone
+ * stands in for the mirror (160 B per allocation).
+ */
+#if defined(ZFS_DEBUG) && !defined(_KERNEL)
+#define	ENGINE_MIRROR	1
+#else
+#define	ENGINE_MIRROR	0
+#endif
+
+/*
+ * An in-order walk of a stored tree's rows, tombstones skipped: what the
+ * last store wrote, read from the cached pages.  The tree is a previous
+ * generation's; a batch copies a page before it changes it and frees only
+ * its own, so the walk sees it unchanged while the batch builds the next.
+ */
+#define	ENGINE_M_DEPTH	16
+typedef struct engine_mcursor {
+	engine_mbatch_t *b;
+	uint_t depth;
+	engine_mnode_t *node[ENGINE_M_DEPTH];
+	uint_t at[ENGINE_M_DEPTH];
+} engine_mcursor_t;
+
+static int
+engine_mcursor_down(engine_mcursor_t *c, const engine_mref_t *ref)
+{
+	for (;;) {
+		if (c->depth == ENGINE_M_DEPTH)
+			return (ENGINE_EINVAL(39));
+		engine_mnode_t *n;
+		int error = engine_mget(c->b, ref, &n);
+		if (error != 0)
+			return (error);
+		engine_mheader_t *h = engine_mheader(n);
+		if (h->count == 0 || (h->type != ENGINE_M_LEAF &&
+		    h->type != ENGINE_M_BRANCH))
+			return (ENGINE_EINVAL(40));
+		c->node[c->depth] = n;
+		c->at[c->depth] = 0;
+		c->depth++;
+		if (h->type == ENGINE_M_LEAF)
+			return (0);
+		ref = &((engine_mchild_t *)engine_mpayload(n))[0].ref;
+	}
+}
+
+/* The current row, or NULL past the last. */
+static const engine_mrow_t *
+engine_mcursor_row(const engine_mcursor_t *c)
+{
+	if (c->depth == 0)
+		return (NULL);
+	uint_t d = c->depth - 1;
+	return (&((engine_mrow_t *)engine_mpayload(c->node[d]))[c->at[d]]);
+}
+
+/* One row on, climbing out of finished nodes; depth 0 past the last. */
+static int
+engine_mcursor_step(engine_mcursor_t *c)
+{
+	while (c->depth > 0) {
+		uint_t d = c->depth - 1;
+		engine_mnode_t *n = c->node[d];
+		engine_mheader_t *h = engine_mheader(n);
+		if (++c->at[d] < h->count) {
+			if (h->type == ENGINE_M_LEAF)
+				return (0);
+			engine_mchild_t *child = engine_mpayload(n);
+			return (engine_mcursor_down(c, &child[c->at[d]].ref));
+		}
+		c->depth--;
+	}
+	return (0);
+}
+
+static int
+engine_mcursor_skip(engine_mcursor_t *c)
+{
+	int error = 0;
+	const engine_mrow_t *r;
+	while (error == 0 && (r = engine_mcursor_row(c)) != NULL &&
+	    r->data[6] == 3)
+		error = engine_mcursor_step(c);
+	return (error);
+}
+
+/* Past the current row, and past any tombstones after it. */
+static int
+engine_mcursor_next(engine_mcursor_t *c)
+{
+	if (c->depth == 0)
+		return (ENGINE_EINVAL(41));
+	int error = engine_mcursor_step(c);
+	return (error != 0 ? error : engine_mcursor_skip(c));
+}
+
+static int
+engine_mcursor_open(engine_mcursor_t *c, const engine_mref_t *root)
+{
+	c->depth = 0;
+	if (root->p == UINT64_MAX)
+		return (0);
+	int error = engine_mcursor_down(c, root);
+	return (error != 0 ? error : engine_mcursor_skip(c));
+}
+
 static int
 engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
     engine_mrow_t *rows, uint_t count, uint64_t desc[16])
@@ -2430,39 +2538,59 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 	b->spa = spa;
 	b->generation = ++engine_pages.generation;
 	engine_mref_t tree = engine_pages.root;
+	/* The rows the last store wrote, walked from its tree. */
+	engine_mcursor_t cur = { .b = b };
+	error = engine_mcursor_open(&cur, &engine_pages.root);
 	uint_t before = 0, after = 0;
-	while (error == 0 && (before < engine_pages.count || after < count)) {
-		int order = before == engine_pages.count ? 1 :
-		    (after == count ? -1 : engine_mkey_compare(
-		    engine_pages.rows[before].key, rows[after].key));
+	while (error == 0) {
+		const engine_mrow_t *old = engine_mcursor_row(&cur);
+		if (ENGINE_MIRROR) {
+			VERIFY3U(before, <=, engine_pages.count);
+			VERIFY((old == NULL) == (before == engine_pages.count));
+			VERIFY(old == NULL || memcmp(old,
+			    &engine_pages.rows[before], sizeof (*old)) == 0);
+		}
+		if (old == NULL && after == count)
+			break;
+		int order = old == NULL ? 1 : (after == count ? -1 :
+		    engine_mkey_compare(old->key, rows[after].key));
 		if (order < 0) {
-			engine_mrow_t removed = engine_pages.rows[before++];
+			engine_mrow_t removed = *old;
+			before++;
+			error = engine_mcursor_next(&cur);
 			/*
 			 * A released journaled owner leaves a tombstone row
 			 * while a journal segment may still bind it; every
 			 * other dead row is deleted.
 			 */
-			if (engine_pages_tombstone_needed(&removed)) {
+			if (error != 0) {
+				break;
+			} else if (engine_pages_tombstone_needed(&removed)) {
 				removed.data[6] = 3;
 				error = engine_mput(b, &tree, &removed);
 				b->tombstones++;
 			} else {
 				error = engine_mdel(b, &tree, removed.key);
 			}
-		} else if (order == 0 && memcmp(&engine_pages.rows[before],
-		    &rows[after], sizeof (engine_mrow_t)) == 0) {
+		} else if (order == 0 && memcmp(old, &rows[after],
+		    sizeof (engine_mrow_t)) == 0) {
 #if defined(ZFS_DEBUG) && !defined(_KERNEL)
-			/* Debug ztest proves the mirror: a no-op insert. */
+			/* Debug ztest proves the walk: a no-op insert. */
 			uint64_t changes = b->changes;
 			error = engine_mput(b, &tree, &rows[after]);
 			VERIFY(error != 0 || b->changes == changes);
 #endif
 			before++;
 			after++;
+			if (error == 0)
+				error = engine_mcursor_next(&cur);
 		} else {
-			if (order == 0)
+			if (order == 0) {
 				before++;
-			error = engine_mput(b, &tree, &rows[after++]);
+				error = engine_mcursor_next(&cur);
+			}
+			if (error == 0)
+				error = engine_mput(b, &tree, &rows[after++]);
 		}
 	}
 	/* Tombstones whose journal segments are gone leave the tree. */
@@ -2614,9 +2742,13 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			uint64_t bytes = MAX(1, engine_pages.count) *
 			    sizeof (engine_mrow_t);
 			kmem_free(engine_pages.rows, bytes);
+			engine_pages.rows = NULL;
+			engine_pages.count = 0;
 		}
-		engine_pages.rows = rows; rows = NULL;
-		engine_pages.count = count;
+		if (ENGINE_MIRROR) {
+			engine_pages.rows = rows; rows = NULL;
+			engine_pages.count = count;
+		}
 		engine_pages.root = tree;
 		engine_pages.levels = 0;
 		if (tree.p != UINT64_MAX) {
@@ -3032,7 +3164,11 @@ engine_pages_install(nvlist_t *nv)
 	if (nvlist_lookup_uint64(nv, "page-reservation-generation",
 	    &reserved) == 0)
 		engine_pages.generation = MAX(generation, reserved);
-	engine_pages.rows = rows; engine_pages.count = count;
+	if (ENGINE_MIRROR) {
+		engine_pages.rows = rows; engine_pages.count = count;
+	} else {
+		kmem_free(rows, MAX(1, count) * sizeof (*rows));
+	}
 	uint64_t levels;
 	if (nvlist_lookup_uint64(nv, "page-levels", &levels) == 0)
 		engine_pages.levels = levels;
