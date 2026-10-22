@@ -14043,9 +14043,23 @@ static void
 pr19262_verify_all(spa_t *spa)
 {
 	pr19262_verify_t v = { 0 };
+	/*
+	 * A writable pool keeps syncing (replay, resilver, fences): hold the
+	 * open txg as the converter does, so that no free lands under the
+	 * walk and an owner released after its root is not a verify error.
+	 */
+	dmu_tx_t *hold = NULL;
+	if (spa_writeable(spa)) {
+		dsl_pool_t *dp = spa->spa_dsl_pool;
+		hold = dmu_tx_create_dd(dp->dp_mos_dir);
+		VERIFY0(dmu_tx_assign(hold, DMU_TX_WAIT));
+		txg_wait_synced(dp, dmu_tx_get_txg(hold) - 1);
+	}
 	int error = traverse_pool(spa, 0, TRAVERSE_PRE |
 	    TRAVERSE_PREFETCH_METADATA | TRAVERSE_HARD | TRAVERSE_NO_DECRYPT,
 	    pr19262_verify_cb, &v);
+	if (hold != NULL)
+		dmu_tx_commit(hold);
 	vdev_t *vd = pr19262_engine_vdev(spa);
 	uint_t missing = 0;
 	for (uint64_t c = 0; c < vd->vdev_children; c++)
