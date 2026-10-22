@@ -461,6 +461,10 @@ typedef struct engine_convert {
 	hrtime_t slice_ns;
 	hrtime_t drain_ns;
 	uint64_t drain_psize;
+	/* Where a slice's time went, printed for a slice that ran past it. */
+	hrtime_t visit_end;
+	hrtime_t walk_gap_max;
+	hrtime_t slice_drains;
 	boolean_t yielded;
 	pr19262_engine_convert_stats_t *stats;
 	blkptr_t *gang;
@@ -606,6 +610,7 @@ engine_convert_drain(engine_convert_t *c)
 	kmem_free(handles, n * sizeof (void *));
 	c->drain_ns = gethrtime() - start;
 	c->drain_psize = psize;
+	c->slice_drains += c->drain_ns;
 	return (first);
 }
 
@@ -780,6 +785,11 @@ engine_convert_visit(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 {
 	(void) spa, (void) zilog, (void) zb, (void) dnp;
 	engine_convert_t *c = arg;
+	/* The traversal's own time between two visits (reads, prefetch). */
+	hrtime_t now = gethrtime();
+	if (c->visit_end != 0)
+		c->walk_gap_max = MAX(c->walk_gap_max, now - c->visit_end);
+	c->visit_end = now;
 	if (bp == NULL || BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp) ||
 	    BP_IS_REDACTED(bp))
 		return (0);
@@ -790,7 +800,8 @@ engine_convert_visit(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 		error = ERESTART;
 	/* A slice holds the open txg: near its time it yields here. */
 	hrtime_t drain = engine_convert_drain_estimate(c);
-	if (error == 0 && gethrtime() + MIN(drain, c->slice_ns / 2) >=
+	c->visit_end = gethrtime();
+	if (error == 0 && c->visit_end + MIN(drain, c->slice_ns / 2) >=
 	    c->slice_end) {
 		c->yielded = B_TRUE;
 		error = ERESTART;
@@ -1022,9 +1033,12 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 			c.yielded = B_FALSE;
 			c.slice_ns = MSEC2NSEC(engine_convert_slice_ms);
 			c.slice_end = gethrtime() + c.slice_ns;
+			c.visit_end = c.walk_gap_max = c.slice_drains = 0;
 			error = engine_convert_slice(&c);
+			hrtime_t walked = gethrtime();
 			/* The slice's copies finish under its hold. */
 			int ran = engine_convert_drain(&c);
+			hrtime_t drained = gethrtime();
 			if (error == ERESTART) {
 				error = 0;
 				partial = !c.yielded;
@@ -1061,6 +1075,21 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 				stats->slice_over_ms_max = MAX(
 				    stats->slice_over_ms_max,
 				    NSEC2MSEC(now - c.slice_end));
+			if (now > c.slice_end + MSEC2NSEC(200)) {
+				hrtime_t begun = c.slice_end - c.slice_ns;
+				pr19262_printf("PR19262_SLICE_OVER pass=%llu "
+				    "over_ms=%llu walk_ms=%llu gap_max_ms=%llu "
+				    "drains_ms=%llu last_drain_ms=%llu "
+				    "after_ms=%llu yielded=%u swept=%u\n",
+				    (u_longlong_t)pass,
+				    (u_longlong_t)NSEC2MSEC(now - c.slice_end),
+				    (u_longlong_t)NSEC2MSEC(walked - begun),
+				    (u_longlong_t)NSEC2MSEC(c.walk_gap_max),
+				    (u_longlong_t)NSEC2MSEC(c.slice_drains),
+				    (u_longlong_t)NSEC2MSEC(drained - walked),
+				    (u_longlong_t)NSEC2MSEC(now - drained),
+				    c.yielded, swept);
+			}
 		}
 		if (error != 0)
 			break;
