@@ -1631,7 +1631,7 @@ engine_copy_io(engine_copy_t *c, engine_version_t *b, abd_t *abd,
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	zio_t *zio = pr19262_engine_physical_io(spa, &c->original,
 	    engine.vd, c->owner->v, abd, c->psize, type,
-	    spa_last_synced_txg(spa) + 1, b);
+	    spa_last_synced_txg(spa) + 1, b, 0);
 	int error = zio_wait(zio);
 	spa_config_exit(spa, SCL_ZIO, FTAG);
 	return (error);
@@ -1750,10 +1750,13 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
  * the reads, the writes, the verifying reads, then one flush of every
  * member before one write of all their journal frames and one head.  A
  * copy run alone pays the three flush rounds by itself.  errors[i]
- * receives each copy's result; every handle is consumed.
+ * receives each copy's result; every handle is consumed.  A source that
+ * may never have been written (speculative[i], a log chain's tail) is
+ * read without charging its checksum failure to the children.
  */
 void
-pr19262_engine_copy_group(void **handles, uint_t n, int *errors)
+pr19262_engine_copy_group(void **handles, uint_t n,
+    const boolean_t *speculative, int *errors)
 {
 	engine_copy_t **cv = (engine_copy_t **)handles;
 	spa_t *spa = engine.spa;
@@ -1777,7 +1780,9 @@ pr19262_engine_copy_group(void **handles, uint_t n, int *errors)
 			    step == 2 ? verify[i] : source[i], c->psize,
 			    step == 1 ? ZIO_TYPE_WRITE : ZIO_TYPE_READ,
 			    spa_last_synced_txg(spa) + 1,
-			    step == 0 ? c->source : c->stage);
+			    step == 0 ? c->source : c->stage,
+			    step == 0 && speculative != NULL &&
+			    speculative[i] ? ZIO_FLAG_SPECULATIVE : 0);
 		}
 		for (uint_t i = 0; i < n; i++)
 			if (zio[i] != NULL)

@@ -1416,11 +1416,11 @@ pr19262_engine_metadata_flush_nowait(zio_t *pio, vdev_t *vd)
 zio_t *
 pr19262_engine_physical_io(spa_t *spa, blkptr_t *bp, vdev_t *vd,
     uint64_t v, abd_t *data, uint64_t size, zio_type_t type,
-    uint64_t txg, void *version)
+    uint64_t txg, void *version, zio_flag_t extra)
 {
 	VERIFY(type == ZIO_TYPE_READ || type == ZIO_TYPE_WRITE);
 	zio_flag_t flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY |
-	    ZIO_FLAG_RAW | ZIO_FLAG_IO_REWRITE;
+	    ZIO_FLAG_RAW | ZIO_FLAG_IO_REWRITE | extra;
 	zio_priority_t priority = type == ZIO_TYPE_READ ?
 	    ZIO_PRIORITY_SYNC_READ : ZIO_PRIORITY_SYNC_WRITE;
 	/* Keep a logical owner for checksum reports and error propagation. */

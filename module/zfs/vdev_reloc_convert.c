@@ -531,16 +531,24 @@ engine_convert_drain(engine_convert_t *c)
 	pr19262_engine_convert_stats_t *st = c->stats;
 	void **handles = kmem_alloc(n * sizeof (void *), KM_SLEEP);
 	int *errors = kmem_alloc(n * sizeof (int), KM_SLEEP);
-	for (uint_t i = 0; i < n; i++)
-		handles[i] = c->group[i].copy;
-	pr19262_engine_copy_group(handles, n, errors);
+	boolean_t *tail = kmem_alloc(n * sizeof (boolean_t), KM_SLEEP);
+	/*
+	 * A log chain's block may be its never-written tail: read it as the
+	 * ZIL reads its chain, so that its checksum failure is not charged
+	 * to the children as a device error.
+	 */
+	for (uint_t i = 0; i < n; i++) {
+		engine_convert_entry_t *g = &c->group[i];
+		handles[i] = g->copy;
+		tail[i] = g->zil_chain && !g->member && !BP_IS_GANG(&g->bp);
+	}
+	pr19262_engine_copy_group(handles, n, tail, errors);
 	int first = 0;
 	for (uint_t i = 0; i < n; i++) {
 		engine_convert_entry_t *g = &c->group[i];
 		const blkptr_t *bp = &g->bp;
 		int error = errors[i];
-		if (error == ECKSUM && g->zil_chain && !g->member &&
-		    !BP_IS_GANG(bp)) {
+		if (error == ECKSUM && tail[i]) {
 			error = pr19262_engine_rebind_unwritten(spa, bp, g->d,
 			    c->birth);
 			pr19262_printf("PR19262_ZIL_TAIL v=%llu psize=%llu "
@@ -584,6 +592,7 @@ engine_convert_drain(engine_convert_t *c)
 		pr19262_engine_rele(c->group_holds[i]);
 	c->group_count = c->group_hold_count = 0;
 	c->group_asize = c->group_psize = 0;
+	kmem_free(tail, n * sizeof (boolean_t));
 	kmem_free(errors, n * sizeof (int));
 	kmem_free(handles, n * sizeof (void *));
 	return (first);

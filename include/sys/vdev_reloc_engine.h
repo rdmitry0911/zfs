@@ -142,10 +142,10 @@ void pr19262_engine_io_rele(zio_t *);
 int pr19262_engine_copy_begin(spa_t *, const blkptr_t *, int, uint64_t,
     void **);
 int pr19262_engine_copy_run(void *, boolean_t);
-void pr19262_engine_copy_group(void **, uint_t, int *);
+void pr19262_engine_copy_group(void **, uint_t, const boolean_t *, int *);
 int pr19262_engine_rebind_unwritten(spa_t *, const blkptr_t *, int, uint64_t);
 zio_t *pr19262_engine_physical_io(spa_t *, blkptr_t *, vdev_t *,
-    uint64_t, abd_t *, uint64_t, zio_type_t, uint64_t, void *);
+    uint64_t, abd_t *, uint64_t, zio_type_t, uint64_t, void *, zio_flag_t);
 void pr19262_engine_park_next(void);
 uint64_t pr19262_engine_waiting(boolean_t);
 void pr19262_engine_unpark(void);
