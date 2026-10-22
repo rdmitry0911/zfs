@@ -78,6 +78,7 @@ typedef struct engine_mbatch {
 	uint_t changes;
 	uint_t deletes;
 	uint_t tombstones;
+	uint_t joins;
 } engine_mbatch_t;
 
 typedef struct engine_marena {
@@ -674,6 +675,50 @@ engine_mrelease(engine_mbatch_t *b, engine_mnode_t *n)
  * way are unreachable and the fence's page collection returns them; pages
  * of this batch are released at once.
  */
+/*
+ * Deletes never merge leaves on their own, so a catalog that churns thins
+ * out (a quarter full after a conversion).  A leaf left under half full
+ * takes in its neighbour's rows when both fit in three quarters of a page.
+ * The leaf is the copy this batch already made, so the join writes no
+ * page; the neighbour's page goes (now if this batch made it, otherwise
+ * at the next page GC).
+ */
+static int
+engine_mjoin(engine_mbatch_t *b, engine_mchild_t *copy, uint_t *total,
+    uint_t at, engine_mnode_t *leaf)
+{
+	engine_mheader_t *lh = engine_mheader(leaf);
+	if (lh->type != ENGINE_M_LEAF || lh->count >= ENGINE_M_ROWS / 2)
+		return (0);
+	uint_t sib = at + 1 < *total ? at + 1 : at - 1;
+	engine_mnode_t *other;
+	int error = engine_mget(b, &copy[sib].ref, &other);
+	if (error != 0)
+		return (error);
+	engine_mheader_t *oh = engine_mheader(other);
+	if (oh->type != ENGINE_M_LEAF ||
+	    lh->count + oh->count > ENGINE_M_ROWS * 3 / 4)
+		return (0);
+	VERIFY(leaf->dirty && lh->generation == b->generation);
+	uint_t n = lh->count + oh->count;
+	engine_mnode_t *first = sib < at ? other : leaf;
+	uint_t nf = engine_mheader(first)->count;
+	engine_mrow_t *rows = kmem_alloc(n * sizeof (*rows), KM_SLEEP);
+	memcpy(rows, engine_mpayload(first), nf * sizeof (*rows));
+	memcpy(rows + nf, engine_mpayload(sib < at ? leaf : other),
+	    (n - nf) * sizeof (*rows));
+	engine_mleaf_set(leaf, rows, n);
+	kmem_free(rows, n * sizeof (*rows));
+	engine_mrelease(b, other);
+	uint_t lo = MIN(at, sib), hi = MAX(at, sib);
+	copy[lo].ref = engine_mreference(leaf);
+	memcpy(copy[lo].high, lh->high, sizeof (copy[lo].high));
+	memmove(copy + hi, copy + hi + 1, (*total - hi - 1) * sizeof (*copy));
+	(*total)--;
+	b->joins++;
+	return (0);
+}
+
 static int
 engine_mremove(engine_mbatch_t *b, const engine_mref_t *root,
     const uint64_t key[4], engine_mchange_t *change)
@@ -740,6 +785,8 @@ engine_mremove(engine_mbatch_t *b, const engine_mref_t *root,
 			memcpy(copy[at].high, engine_mheader(child_node)->high,
 			    sizeof (copy[at].high));
 		}
+		if (error == 0 && h->level == 1 && total > 1)
+			error = engine_mjoin(b, copy, &total, at, child_node);
 	}
 	if (error == 0 && total == 0) {
 		change->left.p = UINT64_MAX;
@@ -2600,12 +2647,12 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		pr19262_printf("PR19262_PAGED_SYNC txg=%llu newpages=%u "
 		    "changes=%u deletes=%u tombstones=%u expired=%u rows=%u "
 		    "root=%llu generation=%llu levels=%llu allocated=%llu "
-		    "cached=%llu\n",
+		    "cached=%llu joins=%u\n",
 		    (u_longlong_t)ub->ub_txg, b->pages, b->changes, b->deletes,
 		    b->tombstones, expired, count, (u_longlong_t)root.p,
 		    (u_longlong_t)b->generation,
 		    (u_longlong_t)engine_pages.levels, (u_longlong_t)allocated,
-		    (u_longlong_t)cached);
+		    (u_longlong_t)cached, b->joins);
 	}
 	if (expired_keys != NULL)
 		kmem_free(expired_keys, expired * 2 * sizeof (uint64_t));
