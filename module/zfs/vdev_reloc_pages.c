@@ -2575,13 +2575,21 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		memcpy(d + 8, &root.hash, sizeof (root.hash));
 		memcpy(desc, d, sizeof (d));
 		engine_pages_expire_tombstones(expired_keys, expired);
+		/* Pages allocated in the arenas, and those held in memory. */
+		uint64_t allocated = 0, cached = 0;
+		for (uint64_t i = 0; i < engine_pages.capacity; i++) {
+			allocated += engine_pages.bits[i] != 0;
+			cached += engine_pages.cache[i] != NULL;
+		}
 		pr19262_printf("PR19262_PAGED_SYNC txg=%llu newpages=%u "
 		    "changes=%u deletes=%u tombstones=%u expired=%u rows=%u "
-		    "root=%llu generation=%llu levels=%llu\n",
+		    "root=%llu generation=%llu levels=%llu allocated=%llu "
+		    "cached=%llu\n",
 		    (u_longlong_t)ub->ub_txg, b->pages, b->changes, b->deletes,
 		    b->tombstones, expired, count, (u_longlong_t)root.p,
 		    (u_longlong_t)b->generation,
-		    (u_longlong_t)engine_pages.levels);
+		    (u_longlong_t)engine_pages.levels, (u_longlong_t)allocated,
+		    (u_longlong_t)cached);
 	}
 	if (expired_keys != NULL)
 		kmem_free(expired_keys, expired * 2 * sizeof (uint64_t));

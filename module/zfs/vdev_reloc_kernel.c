@@ -262,13 +262,14 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	int n = scnprintf(buf, PAGE_SIZE, "state=%s pool=%s active=%u "
 	    "parity=%llu owners=%llu legacy=%llu weak=%llu retired=%llu "
 	    "certified=%llu floor=%llu journal_segments=%llu pages=%llu "
-	    "copied=%llu passes=%llu error=%d\n", state, pool, active,
-	    (u_longlong_t)parity, (u_longlong_t)c.owners,
+	    "copied=%llu passes=%llu error=%d versions=%llu\n", state, pool,
+	    active, (u_longlong_t)parity, (u_longlong_t)c.owners,
 	    (u_longlong_t)c.legacy_bytes, (u_longlong_t)c.weak_current,
 	    (u_longlong_t)c.retired_bytes, (u_longlong_t)c.certified,
 	    (u_longlong_t)(floor != 0 ? floor : c.floor),
 	    (u_longlong_t)c.journal_segments, (u_longlong_t)c.pages_used,
-	    (u_longlong_t)copied, (u_longlong_t)passes, error);
+	    (u_longlong_t)copied, (u_longlong_t)passes, error,
+	    (u_longlong_t)(c.current_versions + c.retired_versions));
 	return (n);
 }
 
