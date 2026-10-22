@@ -284,4 +284,6 @@ ZFS_MODULE_VIRTUAL_PARAM_CALL(zfs, zfs_pr19262_, fence,
 ZFS_MODULE_VIRTUAL_PARAM_CALL(zfs, zfs_pr19262_, status,
 	engine_kernel_status_set, engine_kernel_status_get, ZMOD_RD,
 	"Private pr19262 engine: state and census");
+ZFS_MODULE_PARAM(zfs, zfs_pr19262_, convert_group, UINT, ZMOD_RW,
+	"Private pr19262 engine: copies per data flush and journal round");
 #endif	/* _KERNEL */

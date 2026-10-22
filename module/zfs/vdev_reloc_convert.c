@@ -413,6 +413,23 @@ pr19262_engine_certify(spa_t *spa, uint64_t parity)
 	return (0);
 }
 
+/*
+ * Copies one flush and journal round carries, and the bytes they may
+ * buffer: a copy run alone paid a data flush, a frame and a head.
+ */
+static uint_t zfs_pr19262_convert_group = 32;
+static uint64_t engine_convert_group_bytes = 8ULL << 20;
+
+/* A copy begun by the walk, run with the group it joined. */
+typedef struct engine_convert_entry {
+	void *copy;
+	blkptr_t bp;
+	int d;
+	boolean_t member;
+	boolean_t zil_chain;
+	pr19262_engine_info_t before;
+} engine_convert_entry_t;
+
 typedef struct engine_convert {
 	spa_t *spa;
 	uint64_t birth;
@@ -442,6 +459,17 @@ typedef struct engine_convert {
 	blkptr_t *gang;
 	uint_t gang_count;
 	uint_t gang_capacity;
+	/*
+	 * The copies begun and not yet run, the holds of their blocks, and
+	 * their sizes: new backing for the batch, buffers for the cap.
+	 */
+	engine_convert_entry_t *group;
+	engine_hold_t **group_holds;
+	uint_t group_count;
+	uint_t group_hold_count;
+	uint_t group_max;
+	uint64_t group_asize;
+	uint64_t group_psize;
 } engine_convert_t;
 
 static int
@@ -477,6 +505,90 @@ engine_convert_weak(engine_convert_t *c, const blkptr_t *bp, int d)
 	return (weak);
 }
 
+static boolean_t
+engine_convert_grouped(engine_convert_t *c, uint64_t v)
+{
+	for (uint_t i = 0; i < c->group_count; i++) {
+		engine_convert_entry_t *g = &c->group[i];
+		if (DVA_GET_OFFSET(&g->bp.blk_dva[g->d]) == v)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
+ * Run the copies begun since the last drain as one group, then account
+ * for each as a copy run on its own was.  Every hold is released; the
+ * first error the walk does not tolerate is returned.
+ */
+static int
+engine_convert_drain(engine_convert_t *c)
+{
+	uint_t n = c->group_count;
+	if (n == 0)
+		return (0);
+	spa_t *spa = c->spa;
+	pr19262_engine_convert_stats_t *st = c->stats;
+	void **handles = kmem_alloc(n * sizeof (void *), KM_SLEEP);
+	int *errors = kmem_alloc(n * sizeof (int), KM_SLEEP);
+	for (uint_t i = 0; i < n; i++)
+		handles[i] = c->group[i].copy;
+	pr19262_engine_copy_group(handles, n, errors);
+	int first = 0;
+	for (uint_t i = 0; i < n; i++) {
+		engine_convert_entry_t *g = &c->group[i];
+		const blkptr_t *bp = &g->bp;
+		int error = errors[i];
+		if (error == ECKSUM && g->zil_chain && !g->member &&
+		    !BP_IS_GANG(bp)) {
+			error = pr19262_engine_rebind_unwritten(spa, bp, g->d,
+			    c->birth);
+			pr19262_printf("PR19262_ZIL_TAIL v=%llu psize=%llu "
+			    "birth=%llu ready=%u alloc_txg=%llu rebind=%d\n",
+			    (u_longlong_t)DVA_GET_OFFSET(&bp->blk_dva[g->d]),
+			    (u_longlong_t)BP_GET_PSIZE(bp),
+			    (u_longlong_t)g->before.birth, g->before.ready,
+			    (u_longlong_t)g->before.catalog_txg, error);
+			if (error == 0)
+				st->unwritten++;
+		}
+		if (error == ESTALE) {
+			/*
+			 * Freed while being copied (a client free, and the
+			 * fence the admission schedules may already have
+			 * released it): the copy was abandoned by its
+			 * finish, nothing is left to convert.
+			 */
+			st->stale++;
+			continue;
+		}
+		if (error != 0) {
+			if (first == 0)
+				first = error;
+			continue;
+		}
+		pr19262_engine_info_t after;
+		pr19262_engine_inspect(spa, bp, g->d, &after);
+		VERIFY3U(after.p, !=, g->before.p);
+		VERIFY3U(after.birth, ==, c->birth);
+		st->copied++;
+		st->old_bytes += g->before.psize;
+		st->new_bytes += after.psize;
+		c->pending += after.psize;
+		mutex_enter(&engine.lock);
+		st->peak_retired_bytes = MAX(st->peak_retired_bytes,
+		    engine.retired);
+		mutex_exit(&engine.lock);
+	}
+	for (uint_t i = 0; i < c->group_hold_count; i++)
+		pr19262_engine_rele(c->group_holds[i]);
+	c->group_count = c->group_hold_count = 0;
+	c->group_asize = c->group_psize = 0;
+	kmem_free(errors, n * sizeof (int));
+	kmem_free(handles, n * sizeof (void *));
+	return (first);
+}
+
 /* One concrete allocation: a plain block, a gang header or a gang member. */
 static int
 engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
@@ -495,6 +607,7 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 	engine_hold_t *h = pr19262_engine_hold(spa, bp, NULL, B_TRUE, B_FALSE);
 	if (h == NULL)
 		return (ENOENT);
+	boolean_t grouped = B_FALSE;
 	int error = h->error;
 	if (error == ESTALE) {
 		/* Freed between the root snapshot and this visit. */
@@ -507,6 +620,9 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 	for (int d = 0; d < BP_GET_NDVAS(bp) && error == 0; d++) {
 		if (DVA_GET_VDEV(&bp->blk_dva[d]) != engine.vd->vdev_id ||
 		    !engine_convert_weak(c, bp, d))
+			continue;
+		/* A block the walk meets twice (a clone) is copied once. */
+		if (engine_convert_grouped(c, DVA_GET_OFFSET(&bp->blk_dva[d])))
 			continue;
 		st->candidates++;
 		/* Admit this copy's bytes, catalog row and journal frame. */
@@ -579,49 +695,29 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 		}
 		if (error != 0)
 			break;
-		pr19262_engine_info_t before, after;
-		pr19262_engine_inspect(spa, bp, d, &before);
-		error = pr19262_engine_copy_run(copy, B_FALSE);
-		if (error == ECKSUM && c->zil_chain && !member &&
-		    !BP_IS_GANG(bp)) {
-			error = pr19262_engine_rebind_unwritten(spa, bp, d,
-			    c->birth);
-			pr19262_printf("PR19262_ZIL_TAIL v=%llu psize=%llu "
-			    "birth=%llu ready=%u alloc_txg=%llu rebind=%d\n",
-			    (u_longlong_t)DVA_GET_OFFSET(&bp->blk_dva[d]),
-			    (u_longlong_t)BP_GET_PSIZE(bp),
-			    (u_longlong_t)before.birth, before.ready,
-			    (u_longlong_t)before.catalog_txg, error);
-			if (error == 0)
-				st->unwritten++;
-		}
-		if (error == ESTALE) {
-			/*
-			 * Freed while being copied (a client free, and the
-			 * fence the admission schedules may already have
-			 * released it): the copy was abandoned by its
-			 * finish, nothing is left to convert.
-			 */
-			st->stale++;
-			error = 0;
-			continue;
-		}
-		if (error != 0)
-			break;
-		pr19262_engine_inspect(spa, bp, d, &after);
-		VERIFY3U(after.p, !=, before.p);
-		VERIFY3U(after.birth, ==, c->birth);
-		st->copied++;
-		st->old_bytes += before.psize;
-		st->new_bytes += after.psize;
-		c->pending += after.psize;
-		mutex_enter(&engine.lock);
-		st->peak_retired_bytes = MAX(st->peak_retired_bytes,
-		    engine.retired);
-		mutex_exit(&engine.lock);
+		/* The copy runs with its group: one flush and journal round. */
+		engine_convert_entry_t *g = &c->group[c->group_count++];
+		g->copy = copy;
+		g->bp = *bp;
+		g->d = d;
+		g->member = member;
+		g->zil_chain = c->zil_chain;
+		pr19262_engine_inspect(spa, bp, d, &g->before);
+		c->group_asize += asize;
+		c->group_psize += psize;
+		grouped = B_TRUE;
 	}
 out:
-	pr19262_engine_rele(h);
+	/* The hold keeps the block's owners until its copies are counted. */
+	if (grouped)
+		c->group_holds[c->group_hold_count++] = h;
+	else
+		pr19262_engine_rele(h);
+	/* A log chain is copied block by block, as the chain is followed. */
+	if (grouped && error == 0 && (c->zil_chain ||
+	    c->group_count >= c->group_max ||
+	    c->group_psize >= engine_convert_group_bytes))
+		error = engine_convert_drain(c);
 	return (error);
 }
 
@@ -654,8 +750,8 @@ engine_convert_visit(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 		return (0);
 	int error = engine_convert_bp(c, bp);
 	/* A full or starved batch ends this pass; the caller fences first. */
-	if (error == 0 && ((c->batch != 0 && c->pending >= c->batch) ||
-	    c->starved))
+	if (error == 0 && ((c->batch != 0 &&
+	    c->pending + c->group_asize >= c->batch) || c->starved))
 		error = ERESTART;
 	/* A slice holds the open txg: past its time it yields here. */
 	if (error == 0 && gethrtime() >= c->slice_end) {
@@ -829,6 +925,9 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		return (EINVAL);
 	engine_convert_t c = { .spa = spa, .birth = birth, .batch = batch,
 	    .stats = stats };
+	/* A block's DVAs join one group: room for all past the cap. */
+	c.group_max = MAX(1, MIN(zfs_pr19262_convert_group, 1024));
+	uint_t group_capacity = c.group_max + SPA_DVAS_PER_BP;
 	vdev_raidz_layout_for_birth(engine.vd, birth, NULL, &c.parity);
 	dsl_pool_t *dp = spa->spa_dsl_pool;
 	/*
@@ -849,6 +948,9 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		    (u_longlong_t)admit.growth);
 		return (ENOSPC);
 	}
+	c.group = kmem_alloc(group_capacity * sizeof (*c.group), KM_SLEEP);
+	c.group_holds = kmem_alloc(group_capacity * sizeof (*c.group_holds),
+	    KM_SLEEP);
 	int error = 0;
 	/* A sweep spans passes: it resumes where a full batch stopped it. */
 	uint64_t sweep_copied = 0, sweep_busy = 0;
@@ -884,6 +986,8 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 			c.slice_end = gethrtime() +
 			    MSEC2NSEC(engine_convert_slice_ms);
 			error = engine_convert_slice(&c);
+			/* The slice's copies finish under its hold. */
+			int ran = engine_convert_drain(&c);
 			if (error == ERESTART) {
 				error = 0;
 				partial = !c.yielded;
@@ -894,8 +998,17 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 				    "step=traverse error=%d pass=%llu\n",
 				    error, (u_longlong_t)pass);
 			}
-			if (swept) {
+			if (error == 0 && ran != 0) {
+				pr19262_printf("PR19262_CONVERT_PASS_ERROR "
+				    "step=copy error=%d pass=%llu\n",
+				    ran, (u_longlong_t)pass);
+				error = ran;
+			}
+			if (swept && error == 0) {
 				error = engine_convert_zil(&c);
+				ran = engine_convert_drain(&c);
+				if (error == 0)
+					error = ran;
 				if (error != 0)
 					pr19262_printf(
 					    "PR19262_CONVERT_PASS_ERROR "
@@ -974,6 +1087,9 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 		    c.admitted_p, c.admitted_m, c.admitted_j);
 	if (c.gang != NULL)
 		kmem_free(c.gang, c.gang_capacity * sizeof (*c.gang));
+	VERIFY0(c.group_count);
+	kmem_free(c.group_holds, group_capacity * sizeof (*c.group_holds));
+	kmem_free(c.group, group_capacity * sizeof (*c.group));
 	pr19262_engine_admit_report(spa, "convert-end", &admit);
 	return (error);
 }

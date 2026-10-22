@@ -104,6 +104,7 @@ void pr19262_engine_journal_ub_committed(spa_t *, const uberblock_t *);
 void pr19262_engine_journal_fault(uint_t);
 int pr19262_engine_journal_roll(spa_t *);
 void pr19262_engine_journal_roll_fault(uint_t);
+void pr19262_engine_journal_group_fault(uint_t);
 int pr19262_engine_journal_wait_error(void);
 void pr19262_engine_init(void);
 void pr19262_engine_fini(void);
@@ -141,6 +142,7 @@ void pr19262_engine_io_rele(zio_t *);
 int pr19262_engine_copy_begin(spa_t *, const blkptr_t *, int, uint64_t,
     void **);
 int pr19262_engine_copy_run(void *, boolean_t);
+void pr19262_engine_copy_group(void **, uint_t, int *);
 int pr19262_engine_rebind_unwritten(spa_t *, const blkptr_t *, int, uint64_t);
 zio_t *pr19262_engine_physical_io(spa_t *, blkptr_t *, vdev_t *,
     uint64_t, abd_t *, uint64_t, zio_type_t, uint64_t, void *);

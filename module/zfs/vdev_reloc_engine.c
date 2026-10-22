@@ -113,6 +113,8 @@ typedef struct engine_j_segment {
 } engine_j_segment_t;
 
 static int engine_journal_bind_copy(engine_copy_t *);
+static void engine_journal_bind_copies(engine_copy_t **, uint_t,
+    const boolean_t *, int *);
 static void engine_journal_test_event(spa_t *, const blkptr_t *, int);
 static void engine_journal_fold(spa_t *, uint64_t);
 static uint_t engine_store_tolerated(void);
@@ -1635,23 +1637,30 @@ engine_copy_io(engine_copy_t *c, engine_version_t *b, abd_t *abd,
 	return (error);
 }
 
-static int
-engine_copy_finish(engine_copy_t *c, int error, boolean_t ready)
+/* A copy freed meanwhile is stale; otherwise its stage takes ready. */
+static boolean_t
+engine_copy_settle(engine_copy_t *c, int *error, boolean_t ready)
 {
 	mutex_enter(&engine.lock);
 	engine_owner_t *e = c->owner;
 	VERIFY(e->copying);
 	VERIFY3P(e->cur, ==, c->source);
 	VERIFY0(c->stage->leases);
-	if (error == 0 && e->retired)
-		error = ESTALE;
-	boolean_t journal_attempted = error == 0 && engine.persistent;
-	if (error == 0)
+	if (*error == 0 && e->retired)
+		*error = ESTALE;
+	boolean_t journal_attempted = *error == 0 && engine.persistent;
+	if (*error == 0)
 		c->stage->ready = ready;
 	mutex_exit(&engine.lock);
-	if (journal_attempted)
-		error = engine_journal_bind_copy(c);
+	return (journal_attempted);
+}
+
+/* Publish the bound stage, or keep or return it, and end the copy. */
+static int
+engine_copy_publish(engine_copy_t *c, int error, boolean_t journal_attempted)
+{
 	mutex_enter(&engine.lock);
+	engine_owner_t *e = c->owner;
 	if (error == 0 && e->retired)
 		error = ESTALE;
 	if (error == 0) {
@@ -1691,6 +1700,15 @@ engine_copy_finish(engine_copy_t *c, int error, boolean_t ready)
 	return (error);
 }
 
+static int
+engine_copy_finish(engine_copy_t *c, int error, boolean_t ready)
+{
+	boolean_t journal_attempted = engine_copy_settle(c, &error, ready);
+	if (journal_attempted)
+		error = engine_journal_bind_copy(c);
+	return (engine_copy_publish(c, error, journal_attempted));
+}
+
 int
 pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 {
@@ -1725,6 +1743,74 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 		error = engine_quorum_result(&q);
 	}
 	return (engine_copy_finish(c, error, B_TRUE));
+}
+
+/*
+ * Copy a group of extents with each step issued for all of them at once:
+ * the reads, the writes, the verifying reads, then one flush of every
+ * member before one write of all their journal frames and one head.  A
+ * copy run alone pays the three flush rounds by itself.  errors[i]
+ * receives each copy's result; every handle is consumed.
+ */
+void
+pr19262_engine_copy_group(void **handles, uint_t n, int *errors)
+{
+	engine_copy_t **cv = (engine_copy_t **)handles;
+	spa_t *spa = engine.spa;
+	abd_t **source = kmem_alloc(n * sizeof (abd_t *), KM_SLEEP);
+	abd_t **verify = kmem_alloc(n * sizeof (abd_t *), KM_SLEEP);
+	zio_t **zio = kmem_alloc(n * sizeof (zio_t *), KM_SLEEP);
+	boolean_t *attempted = kmem_alloc(n * sizeof (boolean_t), KM_SLEEP);
+	for (uint_t i = 0; i < n; i++) {
+		errors[i] = 0;
+		source[i] = abd_alloc_for_io(cv[i]->psize, B_FALSE);
+		verify[i] = abd_alloc_for_io(cv[i]->psize, B_FALSE);
+	}
+	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+	/* Read the sources, write the stages, read the stages back. */
+	for (uint_t step = 0; step < 3; step++) {
+		for (uint_t i = 0; i < n; i++) {
+			engine_copy_t *c = cv[i];
+			zio[i] = errors[i] != 0 ? NULL :
+			    pr19262_engine_physical_io(spa, &c->original,
+			    engine.vd, c->owner->v,
+			    step == 2 ? verify[i] : source[i], c->psize,
+			    step == 1 ? ZIO_TYPE_WRITE : ZIO_TYPE_READ,
+			    spa_last_synced_txg(spa) + 1,
+			    step == 0 ? c->source : c->stage);
+		}
+		for (uint_t i = 0; i < n; i++)
+			if (zio[i] != NULL)
+				errors[i] = zio_wait(zio[i]);
+	}
+	boolean_t any = B_FALSE;
+	for (uint_t i = 0; i < n; i++) {
+		if (errors[i] == 0 && abd_cmp(source[i], verify[i]) != 0)
+			errors[i] = ECKSUM;
+		any |= errors[i] == 0;
+		abd_free(source[i]);
+		abd_free(verify[i]);
+	}
+	/* Flush data before publishing its J bindings: every member at once. */
+	if (any && engine.persistent) {
+		engine_quorum_t q = { 0 };
+		engine_members_flush(spa, &q);
+		int error = engine_quorum_result(&q);
+		for (uint_t i = 0; i < n; i++)
+			if (errors[i] == 0)
+				errors[i] = error;
+	}
+	spa_config_exit(spa, SCL_ZIO, FTAG);
+	for (uint_t i = 0; i < n; i++)
+		attempted[i] = engine_copy_settle(cv[i], &errors[i], B_TRUE);
+	engine_journal_bind_copies(cv, n, attempted, errors);
+	for (uint_t i = 0; i < n; i++)
+		errors[i] = engine_copy_publish(cv[i], errors[i],
+		    attempted[i]);
+	kmem_free(attempted, n * sizeof (boolean_t));
+	kmem_free(zio, n * sizeof (zio_t *));
+	kmem_free(verify, n * sizeof (abd_t *));
+	kmem_free(source, n * sizeof (abd_t *));
 }
 
 int

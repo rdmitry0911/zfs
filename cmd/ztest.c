@@ -16120,6 +16120,9 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 	}
 	if (getenv("PR19262_ENGINE_COLD_CONVERT") != NULL) {
 		VERIFY(write);
+		/* A group of copy frames dies with half of them on disk. */
+		if (getenv("PR19262_ENGINE_COLD_GROUP_CUT") != NULL)
+			pr19262_engine_journal_group_fault(1);
 		pr19262_convert_finish(spa, parity);
 	}
 	if (getenv("PR19262_ENGINE_COLD_FENCE") != NULL) {

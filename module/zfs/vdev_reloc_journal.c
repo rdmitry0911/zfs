@@ -14,6 +14,8 @@
 static uint_t engine_journal_fault_stage;
 static uint64_t engine_journal_fault_seq;
 static uint_t engine_journal_roll_fault;
+/* Test hook: a group of frames is cut after the first half landed. */
+static uint_t engine_journal_group_fault;
 static uint_t engine_journal_roll_phase;
 static int engine_journal_repair(spa_t *);
 static int engine_journal_read_head(spa_t *, abd_t *, boolean_t);
@@ -54,6 +56,14 @@ engine_journal_roll_stop(uint_t stage)
 		pr19262_flush();
 		pr19262_exit(80 + stage);
 	}
+}
+
+void
+pr19262_engine_journal_group_fault(uint_t stage)
+{
+	mutex_enter(&engine.journal_lock);
+	engine_journal_group_fault = stage;
+	mutex_exit(&engine.journal_lock);
 }
 
 void
@@ -120,27 +130,37 @@ engine_journal_page(uint64_t kind, uint64_t seq)
 	return (abd);
 }
 
+/* Write consecutive frames to every member at once, then flush each. */
+static int
+engine_journal_write_pages(spa_t *spa, const engine_member_page_t *pv,
+    uint_t n)
+{
+	engine_quorum_t q = { 0 };
+	uint_t children = engine.vd->vdev_children;
+	int *errors = kmem_alloc(children * sizeof (int), KM_SLEEP);
+	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+	engine_members_write(spa, pv, n, B_TRUE, B_FALSE, errors);
+	spa_config_exit(spa, SCL_ZIO, FTAG);
+	for (uint_t c = 0; c < children; c++)
+		engine_quorum_add(&q, errors[c]);
+	kmem_free(errors, children * sizeof (int));
+	return (engine_quorum_result(&q));
+}
+
 static int
 engine_journal_write(spa_t *spa, uint64_t page, abd_t *abd)
 {
 	engine_quorum_t q = { 0 };
-	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	/*
 	 * Without a crash or fault hook armed, every member writes and then
 	 * flushes at once.  The hooks act on the first member alone, so they
 	 * keep the member-by-member order they were written for.
 	 */
 	if (engine_journal_fault_stage == 0 && engine_journal_roll_fault == 0) {
-		uint_t children = engine.vd->vdev_children;
-		int *errors = kmem_alloc(children * sizeof (int), KM_SLEEP);
 		engine_member_page_t pg = { engine.journal_arena, page, abd };
-		engine_members_write(spa, &pg, 1, B_TRUE, B_FALSE, errors);
-		for (uint_t c = 0; c < children; c++)
-			engine_quorum_add(&q, errors[c]);
-		kmem_free(errors, children * sizeof (int));
-		spa_config_exit(spa, SCL_ZIO, FTAG);
-		return (engine_quorum_result(&q));
+		return (engine_journal_write_pages(spa, &pg, 1));
 	}
+	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	for (uint64_t i = 0; i < engine.vd->vdev_children; i++) {
 		vdev_t *vd = engine.vd->vdev_child[i];
 		uint64_t *w = abd_to_buf(abd);
@@ -1048,6 +1068,179 @@ engine_journal_bind_copy(engine_copy_t *c)
 	/* The copy handle already pins its owner and source version. */
 	engine_hold_t h = { .count = 1, .owner = { c->owner } };
 	return (engine_journal_bind_impl(engine.spa, &h, c->stage));
+}
+
+/* One copy's BIND frame at seq; the chain hash is set when sealed. */
+static abd_t *
+engine_journal_bind_frame(engine_owner_t *e, engine_version_t *b,
+    uint64_t seq)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	abd_t *page = engine_journal_page(ENGINE_J_BIND, seq);
+	uint64_t *w = abd_to_buf(page);
+	w[6] = e->incarnation; w[7] = e->v; w[8] = e->size;
+	w[9] = e->allocation_txg; w[10] = b->p; w[11] = b->size;
+	w[12] = b->birth; w[13] = b->width; w[14] = b->parity;
+	w[15] = b->generation; w[16] = e->created; w[17] = b->ready;
+	engine_version_t *old = b;
+	for (engine_version_t *p = e->versions; p != NULL; p = p->next)
+		if (p->generation < old->generation)
+			old = p;
+	w[24] = old->p; w[25] = old->size; w[26] = old->birth;
+	w[27] = old->width; w[28] = old->parity;
+	w[29] = old->generation;
+	return (page);
+}
+
+/*
+ * Bind a group of copies with one write of their frames and one head.
+ * The frames take consecutive sequence numbers, each chained to the one
+ * before, as single binds would have written them; recovery replays the
+ * longest valid prefix past the head, so a group cut short publishes
+ * the copies whose frames landed, and every copy's data was flushed
+ * before any frame was written.  Only copies with attempted[i] are bound;
+ * errors[i] receives each one's result.
+ */
+static void
+engine_journal_bind_copies(engine_copy_t **cv, uint_t n,
+    const boolean_t *attempted, int *errors)
+{
+	spa_t *spa = engine.spa;
+	/* The crash and fault hooks act on single frames: keep them so. */
+	if (engine_journal_fault_stage != 0 || engine_journal_roll_fault != 0) {
+		for (uint_t i = 0; i < n; i++)
+			if (attempted[i])
+				errors[i] = engine_journal_bind_copy(cv[i]);
+		return;
+	}
+	uint_t m = 0;
+	mutex_enter(&engine.lock);
+	for (uint_t i = 0; i < n; i++) {
+		if (!attempted[i])
+			continue;
+		engine_owner_t *e = cv[i]->owner;
+		ASSERT(e->copying);
+		if (!engine.persistent)
+			errors[i] = ENOENT;
+		else if (e->aborted || engine_find(e->v) != e)
+			errors[i] = ESTALE;
+		else
+			e->journal_touched = B_TRUE;
+		m += errors[i] == 0;
+	}
+	mutex_exit(&engine.lock);
+	if (m == 0)
+		return;
+	engine_member_page_t *pv = kmem_alloc(m * sizeof (*pv), KM_SLEEP);
+	uint_t *index = kmem_alloc(m * sizeof (uint_t), KM_SLEEP);
+	mutex_enter(&engine.journal_lock);
+	int error = 0;
+	if (engine.journal_repair) {
+		error = engine_journal_repair(spa);
+		engine.journal_repair = error != 0;
+	}
+	uint_t next = 0;
+	while (error == 0 && next < n) {
+		mutex_enter(&engine.lock);
+		error = engine.journal_error;
+		if (error == 0 && engine.journal_seq + 3 >=
+		    engine.journal_bytes / ENGINE_STORE_PAGE) {
+			mutex_exit(&engine.lock);
+			error = engine_journal_grow(spa);
+			mutex_enter(&engine.lock);
+		}
+		uint64_t last = engine.journal_bytes / ENGINE_STORE_PAGE;
+		if (error == 0 && !engine.journal_ready)
+			error = EAGAIN;
+		/* A grown segment has room for a frame; never spin on none. */
+		if (error == 0 && engine.journal_seq + 3 >= last)
+			error = ENOSPC;
+		if (error != 0) {
+			mutex_exit(&engine.lock);
+			break;
+		}
+		/* As many frames as this segment holds before it must grow. */
+		uint64_t first = engine.journal_seq + 1, seq = first - 1;
+		uint_t k = 0;
+		for (; next < n && seq + 3 < last; next++) {
+			if (!attempted[next] || errors[next] != 0)
+				continue;
+			engine_copy_t *c = cv[next];
+			engine_owner_t *e = c->owner;
+			if (e->aborted || engine_find(e->v) != e) {
+				errors[next] = ESTALE;
+				continue;
+			}
+			VERIFY0(c->stage->journal_seq);
+			seq++;
+			pv[k].arena = engine.journal_arena;
+			pv[k].page = seq + 1;
+			pv[k].abd = engine_journal_bind_frame(e, c->stage, seq);
+			c->stage->leases++;
+			index[k++] = next;
+		}
+		zio_cksum_t hash = engine.journal_hash;
+		mutex_exit(&engine.lock);
+		if (k == 0)
+			continue;
+		for (uint_t j = 0; j < k; j++) {
+			uint64_t *w = abd_to_buf(pv[j].abd);
+			memcpy(w + 20, &hash, sizeof (hash));
+			engine_journal_seal(pv[j].abd);
+			memcpy(&hash, w + ENGINE_J_HASH, sizeof (hash));
+		}
+		if (engine_journal_group_fault != 0 && k >= 2) {
+			uint_t landed = (k + 1) / 2;
+			error = engine_journal_write_pages(spa, pv, landed);
+			pr19262_printf("PR19262_J_GROUP_CUT head=%llu "
+			    "first=%llu landed=%u frames=%u error=%d\n",
+			    (u_longlong_t)(first - 1), (u_longlong_t)first,
+			    landed, k, error);
+			pr19262_flush();
+			pr19262_exit(97);
+		}
+		error = engine_journal_write_pages(spa, pv, k);
+		if (error == 0) {
+			error = engine_journal_head(spa, seq, &hash,
+			    ENGINE_J_NORMAL, NULL);
+		}
+		mutex_enter(&engine.lock);
+		for (uint_t j = 0; j < k; j++) {
+			engine_copy_t *c = cv[index[j]];
+			c->stage->leases--;
+			abd_free(pv[j].abd);
+			if (error != 0) {
+				errors[index[j]] = error;
+				continue;
+			}
+			c->stage->journal_seq = first + j;
+			engine_journal_fold(spa, c->owner->catalog_txg);
+			pr19262_printf("PR19262_J_BIND seq=%llu v=%llu p=%llu "
+			    "arena=%llu\n", (u_longlong_t)(first + j),
+			    (u_longlong_t)c->owner->v,
+			    (u_longlong_t)c->stage->p,
+			    (u_longlong_t)engine.journal_arena);
+		}
+		if (error == 0) {
+			engine.journal_seq = seq;
+			engine.journal_hash = hash;
+			engine.journal_tail->seq = seq;
+			engine.journal_tail->hash = hash;
+		}
+		mutex_exit(&engine.lock);
+	}
+	/* What the loop did not reach shares the error that stopped it. */
+	for (uint_t i = next; i < n; i++)
+		if (attempted[i] && errors[i] == 0)
+			errors[i] = error;
+	mutex_enter(&engine.lock);
+	if (error != 0)
+		engine.journal_error = error;
+	cv_broadcast(&engine.changed);
+	mutex_exit(&engine.lock);
+	mutex_exit(&engine.journal_lock);
+	kmem_free(index, m * sizeof (uint_t));
+	kmem_free(pv, m * sizeof (*pv));
 }
 
 int
