@@ -12588,19 +12588,45 @@ typedef struct pr19262_j_replay {
 	uint64_t count;
 } pr19262_j_replay_t;
 
+/*
+ * The overlapping soak fills the pool on purpose (its writers count
+ * ENOSPC and wait for frees); a test step inside that window does the
+ * same.  Outside it ENOSPC is a failure.
+ */
+static void
+pr19262_overlap_enospc(spa_t *spa, const char *site, int error,
+    uint_t retries)
+{
+	VERIFY3S(error, ==, ENOSPC);
+	VERIFY(pr19262_soak_overlap && !pr19262_soak_converted);
+	VERIFY3U(retries, <, 1000);
+	(void) printf("PR19262_OVERLAP_ENOSPC site=%s retry=%u\n", site,
+	    retries + 1);
+	txg_wait_synced(spa_get_dsl(spa), 0);
+}
+
 static dmu_tx_t *
 pr19262_journal_clone_tx(objset_t *os, uint64_t object, uint64_t offset,
     uint64_t length, uint64_t blksz, const blkptr_t *bps, size_t nbps)
 {
-	dmu_buf_t *bonus;
-	VERIFY0(dmu_bonus_hold(os, object, FTAG, &bonus));
-	dmu_buf_impl_t *db = (dmu_buf_impl_t *)bonus;
-	dmu_tx_t *tx = dmu_tx_create(os);
-	DB_DNODE_ENTER(db);
-	dmu_tx_hold_clone_by_dnode(tx, DB_DNODE(db), offset, length, blksz);
-	DB_DNODE_EXIT(db);
-	dmu_buf_rele(bonus, FTAG);
-	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	dmu_tx_t *tx;
+	for (uint_t retries = 0; ; retries++) {
+		dmu_buf_t *bonus;
+		VERIFY0(dmu_bonus_hold(os, object, FTAG, &bonus));
+		dmu_buf_impl_t *db = (dmu_buf_impl_t *)bonus;
+		tx = dmu_tx_create(os);
+		DB_DNODE_ENTER(db);
+		dmu_tx_hold_clone_by_dnode(tx, DB_DNODE(db), offset, length,
+		    blksz);
+		DB_DNODE_EXIT(db);
+		dmu_buf_rele(bonus, FTAG);
+		int error = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (error == 0)
+			break;
+		dmu_tx_abort(tx);
+		pr19262_overlap_enospc(dmu_objset_spa(os), "clone", error,
+		    retries);
+	}
 	VERIFY0(dmu_brt_clone(os, object, offset, length, tx, bps, nbps));
 	return (tx);
 }
@@ -14411,9 +14437,15 @@ pr19262_convert_test(spa_t *spa)
 	VERIFY0(dmu_read_l0_bps(w.os, w.object, 8 * PR19262_LIVE_BLOCK,
 	    2 * PR19262_LIVE_BLOCK, bps, &nbps));
 	VERIFY3U(nbps, ==, 2);
-	tx = dmu_tx_create(w.os);
-	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
-	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	for (uint_t retries = 0; ; retries++) {
+		tx = dmu_tx_create(w.os);
+		dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+		int error = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (error == 0)
+			break;
+		dmu_tx_abort(tx);
+		pr19262_overlap_enospc(spa, "clone-object", error, retries);
+	}
 	w.clone = dmu_object_alloc(w.os, DMU_OT_UINT64_OTHER,
 	    PR19262_LIVE_BLOCK, DMU_OT_NONE, 0, tx);
 	dmu_tx_commit(tx);
