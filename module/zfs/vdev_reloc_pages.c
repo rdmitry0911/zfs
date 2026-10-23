@@ -110,6 +110,11 @@ static struct {
 	engine_mnode_t **cache;
 	uint8_t *bits;
 	uint64_t capacity;
+	/*
+	 * Every page below it is allocated: a single free lowers it, a bulk
+	 * change of the bits resets it to 0.
+	 */
+	uint64_t free_hint;
 	engine_marena_t *arenas;
 	engine_mref_t directory;
 	uint64_t pending[4];
@@ -192,6 +197,7 @@ engine_pages_add_arena(uint64_t p, uint64_t pages, const uint8_t *init,
 	engine_pages.cache = cache;
 	engine_pages.bits = bits;
 	engine_pages.capacity = count;
+	engine_pages.free_hint = 0;
 	mutex_exit(&engine.lock);
 	if (old != 0) {
 		kmem_free(old_cache, old * sizeof (*cache));
@@ -405,6 +411,29 @@ engine_mget(engine_mbatch_t *b, const engine_mref_t *ref,
 	return (0);
 }
 
+/*
+ * The lowest free page, or the capacity: from the hint on, so a store's
+ * new pages cost no scan of the whole arena space.
+ */
+static uint64_t
+engine_pages_free_index(void)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	uint64_t hint = MIN(engine_pages.free_hint, engine_pages.capacity);
+#ifdef ZFS_DEBUG
+	for (uint64_t i = 0; i < hint; i++)
+		VERIFY(engine_pages.bits[i] != 0);
+#endif
+	for (uint64_t i = hint; i < engine_pages.capacity; i++)
+		if (engine_pages.bits[i] == 0)
+			return (i);
+	/* A missed hint update costs a scan, never a growth. */
+	for (uint64_t i = 0; i < hint; i++)
+		if (engine_pages.bits[i] == 0)
+			return (i);
+	return (engine_pages.capacity);
+}
+
 static int
 engine_mnew(engine_mbatch_t *b, uint64_t type, uint64_t level,
     engine_mnode_t **result)
@@ -417,9 +446,7 @@ engine_mnew(engine_mbatch_t *b, uint64_t type, uint64_t level,
 			return (error);
 	}
 	mutex_enter(&engine.lock);
-	for (index = 0; index < engine_pages.capacity; index++)
-		if (engine_pages.bits[index] == 0)
-			break;
+	index = engine_pages_free_index();
 	if (index == engine_pages.capacity) {
 		mutex_exit(&engine.lock);
 		int error = engine_pages_grow(b);
@@ -428,6 +455,7 @@ engine_mnew(engine_mbatch_t *b, uint64_t type, uint64_t level,
 		return (engine_mnew(b, type, level, result));
 	}
 	engine_pages.bits[index] = 1;
+	engine_pages.free_hint = index + 1;
 	if (index < ENGINE_STORE_PAGES)
 		engine.bitmap[index] = 1;
 	mutex_exit(&engine.lock);
@@ -666,6 +694,7 @@ engine_mrelease(engine_mbatch_t *b, engine_mnode_t *n)
 	VERIFY3P(engine_pages.cache[index], ==, n);
 	mutex_enter(&engine.lock);
 	engine_pages.bits[index] = 0;
+	engine_pages.free_hint = MIN(engine_pages.free_hint, index);
 	if (index < ENGINE_STORE_PAGES)
 		engine.bitmap[index] = 0;
 	mutex_exit(&engine.lock);
@@ -1530,6 +1559,7 @@ engine_pages_gc(spa_t *spa, uint64_t *freed)
 			if (!engine_pages.bits[i] || m.marked[i])
 				continue;
 			engine_pages.bits[i] = 0;
+			engine_pages.free_hint = MIN(engine_pages.free_hint, i);
 			if (i < ENGINE_STORE_PAGES)
 				engine.bitmap[i] = 0;
 			if (engine_pages.cache[i] != NULL) {
@@ -1901,6 +1931,7 @@ engine_pages_finish(spa_t *spa, engine_marena_t *a, uint64_t generation)
 			memset(engine_pages.bits + a->first, 0, a->pages);
 			engine_pages.bits[a->first] = 1;
 			engine_pages.bits[a->first + 1] = 1;
+			engine_pages.free_hint = 0;
 			a->formatted = B_TRUE;
 		}
 		error = engine_pages_directory_write(spa, a, generation,
@@ -1984,6 +2015,7 @@ engine_pages_remove_pending(engine_marena_t *a)
 	engine_pages.cache = cache;
 	engine_pages.bits = bits;
 	engine_pages.capacity = count;
+	engine_pages.free_hint = 0;
 	engine_pages.arenas = a->next;
 	kmem_free(a, sizeof (*a));
 }
@@ -2162,6 +2194,7 @@ engine_pages_pending_inspect(spa_t *spa, engine_marena_t *a)
 			directory = NULL;
 		}
 		memcpy(engine_pages.bits + a->first, bits, a->pages);
+		engine_pages.free_hint = 0;
 		engine_pages.serial = serial;
 	}
 	kmem_free(bits, a->pages);
@@ -3350,6 +3383,7 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 			memcpy(bitmap, reserved, ENGINE_STORE_PAGES);
 			memcpy(engine_pages.bits, reserved,
 			    engine_pages.capacity);
+			engine_pages.free_hint = 0;
 			fnvlist_add_uint64(nv, "page-reservation-generation",
 			    latest);
 		}
@@ -3416,6 +3450,7 @@ engine_pages_install(nvlist_t *nv)
 		return (error);
 	engine_pages_tree_clear();
 	memcpy(engine_pages.bits, engine.bitmap, ENGINE_STORE_PAGES);
+	engine_pages.free_hint = 0;
 	memcpy(&engine_pages.root, tree, sizeof (engine_pages.root));
 	engine_pages.generation = generation;
 	uint64_t reserved;
