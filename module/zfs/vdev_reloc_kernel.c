@@ -263,7 +263,8 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    "parity=%llu owners=%llu legacy=%llu weak=%llu retired=%llu "
 	    "certified=%llu floor=%llu journal_segments=%llu pages=%llu "
 	    "copied=%llu passes=%llu error=%d versions=%llu "
-	    "store_checked=%llu store_check_failures=%llu\n", state, pool,
+	    "store_checked=%llu store_check_failures=%llu "
+	    "pages_evicted=%llu\n", state, pool,
 	    active, (u_longlong_t)parity, (u_longlong_t)c.owners,
 	    (u_longlong_t)c.legacy_bytes, (u_longlong_t)c.weak_current,
 	    (u_longlong_t)c.retired_bytes, (u_longlong_t)c.certified,
@@ -272,7 +273,8 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    (u_longlong_t)copied, (u_longlong_t)passes, error,
 	    (u_longlong_t)(c.current_versions + c.retired_versions),
 	    (u_longlong_t)engine_store_checked,
-	    (u_longlong_t)engine_store_check_failures);
+	    (u_longlong_t)engine_store_check_failures,
+	    (u_longlong_t)engine_pages_evicted);
 	return (n);
 }
 
@@ -292,4 +294,6 @@ ZFS_MODULE_PARAM(zfs, zfs_pr19262_, convert_group, UINT, ZMOD_RW,
 	"Private pr19262 engine: copies per data flush and journal round");
 ZFS_MODULE_PARAM(zfs, zfs_pr19262_, store_verify, INT, ZMOD_RW,
 	"Private pr19262 engine: check incremental catalog stores (tests)");
+ZFS_MODULE_PARAM(zfs, zfs_pr19262_, page_cache, U64, ZMOD_RW,
+	"Private pr19262 engine: clean catalog leaves kept in memory (0: all)");
 #endif	/* _KERNEL */

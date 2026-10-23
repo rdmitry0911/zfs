@@ -54,6 +54,8 @@ typedef struct engine_mnode {
 	uint64_t *data;
 	boolean_t dirty;
 	boolean_t sealed;
+	/* The batch generation that last used the page: eviction order. */
+	uint64_t used;
 } engine_mnode_t;
 
 static engine_mnode_t *
@@ -398,6 +400,7 @@ engine_mget(engine_mbatch_t *b, const engine_mref_t *ref,
 	    (!(n->dirty && h->generation == b->generation) &&
 	    memcmp(&h->hash, &ref->hash, sizeof (h->hash)) != 0))
 		return (ECKSUM);
+	n->used = b->generation;
 	*result = n;
 	return (0);
 }
@@ -436,6 +439,7 @@ engine_mnew(engine_mbatch_t *b, uint64_t type, uint64_t level,
 	h->generation = b->generation;
 	h->pool = spa_guid(b->spa); h->top = engine.vd->vdev_guid;
 	n->dirty = B_TRUE;
+	n->used = b->generation;
 	VERIFY3P(engine_pages.cache[index], ==, NULL);
 	engine_pages.cache[index] = n;
 	b->pages++;
@@ -2418,6 +2422,69 @@ engine_pages_expire_tombstones(const uint64_t *keys, uint_t count)
 #define	ENGINE_MIRROR	0
 #endif
 
+/*
+ * Clean leaves kept in memory, in pages (0: all); debug ztest keeps few,
+ * so its witnesses read leaves back all the time.
+ */
+#if defined(ZFS_DEBUG) && !defined(_KERNEL)
+static uint64_t zfs_pr19262_page_cache = 256;
+#else
+static uint64_t zfs_pr19262_page_cache = 16384;
+#endif
+
+static uint64_t engine_pages_evicted;
+
+static boolean_t
+engine_pages_evictable(engine_mnode_t *n)
+{
+	return (n != NULL && !n->dirty && n->sealed &&
+	    engine_mheader(n)->type == ENGINE_M_LEAF);
+}
+
+/*
+ * After a stored root: clean leaves beyond the budget leave memory, least
+ * recently used first, down to three quarters of it.  Branches, blobs and
+ * directories stay; a later lookup reads an evicted leaf back and checks
+ * it against its reference like any page.
+ */
+static uint_t
+engine_pages_evict(void)
+{
+	ASSERT(MUTEX_HELD(&engine.store_lock));
+	uint64_t budget = zfs_pr19262_page_cache;
+	const char *env = pr19262_env("PR19262_PAGE_CACHE");
+	if (env != NULL)
+		budget = pr19262_strtoull(env, NULL, 10);
+	if (budget == 0)
+		return (0);
+	uint64_t n = 0;
+	for (uint64_t i = 0; i < engine_pages.capacity; i++)
+		n += engine_pages_evictable(engine_pages.cache[i]);
+	if (n <= budget)
+		return (0);
+	uint64_t *ages = pr19262_zalloc(n * 2 * sizeof (uint64_t), KM_SLEEP);
+	uint64_t at = 0;
+	for (uint64_t i = 0; i < engine_pages.capacity; i++) {
+		engine_mnode_t *node = engine_pages.cache[i];
+		if (!engine_pages_evictable(node))
+			continue;
+		ages[2 * at] = node->used;
+		ages[2 * at + 1] = i;
+		at++;
+	}
+	VERIFY3U(at, ==, n);
+	qsort(ages, n, 2 * sizeof (uint64_t), engine_dirty_compare);
+	uint64_t drop = n - (budget - budget / 4);
+	for (uint64_t j = 0; j < drop; j++) {
+		uint64_t i = ages[2 * j + 1];
+		engine_mnode_free(engine_pages.cache[i]);
+		engine_pages.cache[i] = NULL;
+	}
+	engine_pages_evicted += drop;
+	kmem_free(ages, n * 2 * sizeof (uint64_t));
+	return ((uint_t)drop);
+}
+
 /* Check incremental catalog stores against the full rows (tests). */
 static int zfs_pr19262_store_verify = 0;
 static uint64_t engine_store_checked;
@@ -2695,7 +2762,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 	b->generation = ++engine_pages.generation;
 	engine_mref_t tree = engine_pages.root;
 	engine_mcursor_t cur = { .b = b };
-	uint_t after = 0;
+	uint_t after = 0, evicted = 0;
 	uint64_t live = engine_pages.live;
 	if (snap->all) {
 		/* The rows the last store wrote, walked from its tree. */
@@ -2949,6 +3016,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			if (engine_mdirty(b, n))
 				n->dirty = B_FALSE;
 		}
+		evicted = engine_pages_evict();
 		uint64_t d[16] = { ENGINE_STORE_MAGIC,
 		    engine.vd->vdev_guid, engine.arena, engine.arena_bytes,
 		    root.p, 1, ub->ub_txg, size, 0, 0, 0, 0,
@@ -2966,13 +3034,13 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		pr19262_printf("PR19262_PAGED_SYNC txg=%llu newpages=%u "
 		    "changes=%u deletes=%u tombstones=%u expired=%u rows=%u "
 		    "root=%llu generation=%llu levels=%llu allocated=%llu "
-		    "cached=%llu joins=%u dirty=%u all=%u\n",
+		    "cached=%llu joins=%u dirty=%u all=%u evicted=%u\n",
 		    (u_longlong_t)ub->ub_txg, b->pages, b->changes, b->deletes,
 		    b->tombstones, expired, (uint_t)live, (u_longlong_t)root.p,
 		    (u_longlong_t)b->generation,
 		    (u_longlong_t)engine_pages.levels, (u_longlong_t)allocated,
 		    (u_longlong_t)cached, b->joins, snap->count,
-		    (uint_t)snap->all);
+		    (uint_t)snap->all, evicted);
 	}
 	if (expired_keys != NULL)
 		kmem_free(expired_keys, expired * 2 * sizeof (uint64_t));
