@@ -124,6 +124,8 @@ static struct {
 	uint64_t generation;
 	engine_mrow_t *rows;
 	uint_t count;
+	/* Rows in the stored tree, tombstones not counted. */
+	uint64_t live;
 	/* Tree height: one leaf level plus the branch levels above it. */
 	uint64_t levels;
 	/* Highest control serial each member holds; stale ones resilver. */
@@ -864,6 +866,7 @@ engine_pages_tree_clear(void)
 		    MAX(1, engine_pages.count) * sizeof (engine_mrow_t));
 	engine_pages.rows = NULL;
 	engine_pages.count = 0;
+	engine_pages.live = 0;
 	memset(&engine_pages.root, 0, sizeof (engine_pages.root));
 	engine_pages.root.p = UINT64_MAX;
 }
@@ -2415,6 +2418,29 @@ engine_pages_expire_tombstones(const uint64_t *keys, uint_t count)
 #define	ENGINE_MIRROR	0
 #endif
 
+/* Check incremental catalog stores against the full rows (tests). */
+static int zfs_pr19262_store_verify = 0;
+static uint64_t engine_store_checked;
+static uint64_t engine_store_check_failures;
+
+static void
+engine_store_check_failed(const char *cond, int line)
+{
+	engine_store_check_failures++;
+	cmn_err(CE_WARN, "pr19262: catalog store check failed: %s "
+	    "(line %d, failures %llu)", cond, line,
+	    (u_longlong_t)engine_store_check_failures);
+}
+
+/* Debug ztest stops at a failed check; a verifying kernel warns. */
+#define	ENGINE_STORE_CHECK(cond)					\
+	do {								\
+		if (ENGINE_MIRROR)					\
+			VERIFY(cond);					\
+		else if (!(cond))					\
+			engine_store_check_failed(#cond, __LINE__);	\
+	} while (0)
+
 /*
  * An in-order walk of a stored tree's rows, tombstones skipped: what the
  * last store wrote, read from the cached pages.  The tree is a previous
@@ -2502,6 +2528,57 @@ engine_mcursor_next(engine_mcursor_t *c)
 	return (error != 0 ? error : engine_mcursor_skip(c));
 }
 
+/*
+ * At the first row at or past the key, tombstones skipped.  A branch
+ * child's high is its last key, so the first child whose high is not
+ * before the key holds the row.
+ */
+static int
+engine_mcursor_seek(engine_mcursor_t *c, const engine_mref_t *root,
+    const uint64_t key[4])
+{
+	c->depth = 0;
+	if (root->p == UINT64_MAX)
+		return (0);
+	const engine_mref_t *ref = root;
+	for (;;) {
+		if (c->depth == ENGINE_M_DEPTH)
+			return (ENGINE_EINVAL(39));
+		engine_mnode_t *n;
+		int error = engine_mget(c->b, ref, &n);
+		if (error != 0)
+			return (error);
+		engine_mheader_t *h = engine_mheader(n);
+		if (h->count == 0 || (h->type != ENGINE_M_LEAF &&
+		    h->type != ENGINE_M_BRANCH))
+			return (ENGINE_EINVAL(40));
+		boolean_t leaf = h->type == ENGINE_M_LEAF;
+		engine_mrow_t *rows = engine_mpayload(n);
+		engine_mchild_t *children = engine_mpayload(n);
+		uint_t lo = 0, hi = h->count;
+		while (lo < hi) {
+			uint_t mid = lo + (hi - lo) / 2;
+			if (engine_mkey_compare(leaf ? rows[mid].key :
+			    children[mid].high, key) < 0)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		uint_t d = c->depth++;
+		c->node[d] = n;
+		if (lo == h->count) {
+			/* All of it is before the key: past its last row. */
+			c->at[d] = h->count - 1;
+			error = engine_mcursor_step(c);
+			return (error != 0 ? error : engine_mcursor_skip(c));
+		}
+		c->at[d] = lo;
+		if (leaf)
+			return (engine_mcursor_skip(c));
+		ref = &children[lo].ref;
+	}
+}
+
 static int
 engine_mcursor_open(engine_mcursor_t *c, const engine_mref_t *root)
 {
@@ -2512,94 +2589,173 @@ engine_mcursor_open(engine_mcursor_t *c, const engine_mref_t *root)
 	return (error != 0 ? error : engine_mcursor_skip(c));
 }
 
+/*
+ * One step of a store's merge of the last tree's rows (at the cursor) with
+ * its own, in key order: an old row alone leaves, as a tombstone while a
+ * journal segment may still bind a released journaled owner; an equal row
+ * stays; a new or changed row goes in.
+ */
+static int
+engine_pages_merge(engine_mbatch_t *b, engine_mref_t *tree,
+    engine_mcursor_t *cur, const engine_mrow_t *old, int order,
+    const engine_mrow_t *rows, uint_t *after, uint64_t *live)
+{
+	int error = 0;
+	if (order < 0) {
+		engine_mrow_t removed = *old;
+		ENGINE_STORE_CHECK(*live > 0);
+		*live -= *live > 0;
+		error = engine_mcursor_next(cur);
+		if (error != 0)
+			return (error);
+		if (engine_pages_tombstone_needed(&removed)) {
+			removed.data[6] = 3;
+			b->tombstones++;
+			return (engine_mput(b, tree, &removed));
+		}
+		return (engine_mdel(b, tree, removed.key));
+	}
+	if (order == 0 && memcmp(old, &rows[*after],
+	    sizeof (engine_mrow_t)) == 0) {
+#if defined(ZFS_DEBUG) && !defined(_KERNEL)
+		/* Debug ztest proves the walk: a no-op insert. */
+		uint64_t changes = b->changes;
+		error = engine_mput(b, tree, &rows[*after]);
+		VERIFY(error != 0 || b->changes == changes);
+#endif
+		(*after)++;
+		return (error != 0 ? error : engine_mcursor_next(cur));
+	}
+	if (order == 0)
+		error = engine_mcursor_next(cur);
+	else
+		(*live)++;
+	if (error == 0)
+		error = engine_mput(b, tree, &rows[(*after)++]);
+	return (error);
+}
+
+/* Debug ztest: a seek lands where the last store's rows say. */
+static void
+engine_pages_mirror_seek(const engine_mcursor_t *c, const uint64_t key[4])
+{
+	uint_t lo = 0, hi = engine_pages.count;
+	while (lo < hi) {
+		uint_t mid = lo + (hi - lo) / 2;
+		if (engine_mkey_compare(engine_pages.rows[mid].key, key) < 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	const engine_mrow_t *r = engine_mcursor_row(c);
+	VERIFY((r == NULL) == (lo == engine_pages.count));
+	VERIFY(r == NULL || memcmp(r, &engine_pages.rows[lo],
+	    sizeof (*r)) == 0);
+}
+
+/* Is the row one of the owner's a snapshot entry names? */
+static boolean_t
+engine_mrow_of(const engine_mrow_t *r, const uint64_t *k)
+{
+	return (r->key[0] == 1 && r->key[1] == k[0] && r->key[2] == k[1]);
+}
+
+/*
+ * A store of this txg's root.  With snap->all the rows are every listed
+ * owner's and the whole last tree is walked; otherwise they are only the
+ * rows of the listed owners the snapshot names, and the store seeks each
+ * named owner's rows in the last tree.  Debug ztest passes the full rows
+ * (full) with an incremental store and checks the new tree against them.
+ */
 static int
 engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
-    engine_mrow_t *rows, uint_t count, const engine_dirty_snap_t *snap,
-    uint64_t desc[16])
+    engine_mrow_t *rows, uint_t count, engine_mrow_t *full, uint_t full_count,
+    const engine_dirty_snap_t *snap, uint64_t desc[16])
 {
 	ASSERT(MUTEX_HELD(&engine.store_lock));
+	VERIFY(full == NULL || !snap->all);
 	engine_pages_init();
-	if (engine_pages.pending[1] != 0) {
-		int error = engine_pages_reconcile(spa, B_TRUE);
-		if (error != 0) {
-			kmem_free(rows, MAX(1, count) * sizeof (*rows));
-			return (error);
-		}
-	}
-	if (count > engine_pages_row_limit()) {
-		kmem_free(rows, MAX(1, count) * sizeof (*rows));
-		return (ENGINE_EINVAL(9));
-	}
 	int error = 0;
-	if (engine_pages.generation == UINT64_MAX) {
+	if (engine_pages.pending[1] != 0)
+		error = engine_pages_reconcile(spa, B_TRUE);
+	/* An incremental store bounds its rows by the tree's plus its own. */
+	if (error == 0 && (snap->all ? count : engine_pages.live + count) >
+	    engine_pages_row_limit())
+		error = ENGINE_EINVAL(9);
+	if (error == 0 && engine_pages.generation == UINT64_MAX)
+		error = EOVERFLOW;
+	if (error != 0) {
 		kmem_free(rows, MAX(1, count) * sizeof (*rows));
-		return (EOVERFLOW);
+		if (full != NULL)
+			kmem_free(full, MAX(1, full_count) * sizeof (*full));
+		return (error);
 	}
 	engine_mbatch_t *b = kmem_zalloc(sizeof (*b), KM_SLEEP);
 	b->spa = spa;
 	b->generation = ++engine_pages.generation;
 	engine_mref_t tree = engine_pages.root;
-	/* The rows the last store wrote, walked from its tree. */
 	engine_mcursor_t cur = { .b = b };
-	error = engine_mcursor_open(&cur, &engine_pages.root);
-	uint_t before = 0, after = 0;
-	while (error == 0) {
-		const engine_mrow_t *old = engine_mcursor_row(&cur);
-		if (ENGINE_MIRROR) {
-			VERIFY3U(before, <=, engine_pages.count);
-			VERIFY((old == NULL) == (before == engine_pages.count));
-			VERIFY(old == NULL || memcmp(old,
-			    &engine_pages.rows[before], sizeof (*old)) == 0);
-		}
-		if (old == NULL && after == count)
-			break;
-		int order = old == NULL ? 1 : (after == count ? -1 :
-		    engine_mkey_compare(old->key, rows[after].key));
-		/* Debug ztest: no row changes but a marked owner's. */
-		if (ENGINE_MIRROR && order != 0)
-			VERIFY(engine_dirty_covers(snap,
-			    order < 0 ? old->key : rows[after].key));
-		if (ENGINE_MIRROR && order == 0 && memcmp(old, &rows[after],
-		    sizeof (engine_mrow_t)) != 0)
-			VERIFY(engine_dirty_covers(snap, old->key));
-		if (order < 0) {
-			engine_mrow_t removed = *old;
-			before++;
-			error = engine_mcursor_next(&cur);
-			/*
-			 * A released journaled owner leaves a tombstone row
-			 * while a journal segment may still bind it; every
-			 * other dead row is deleted.
-			 */
-			if (error != 0) {
+	uint_t after = 0;
+	uint64_t live = engine_pages.live;
+	if (snap->all) {
+		/* The rows the last store wrote, walked from its tree. */
+		error = engine_mcursor_open(&cur, &engine_pages.root);
+		uint_t before = 0;
+		while (error == 0) {
+			const engine_mrow_t *old = engine_mcursor_row(&cur);
+			if (ENGINE_MIRROR) {
+				VERIFY3U(before, <=, engine_pages.count);
+				VERIFY((old == NULL) ==
+				    (before == engine_pages.count));
+				VERIFY(old == NULL || memcmp(old,
+				    &engine_pages.rows[before],
+				    sizeof (*old)) == 0);
+			}
+			if (old == NULL && after == count)
 				break;
-			} else if (engine_pages_tombstone_needed(&removed)) {
-				removed.data[6] = 3;
-				error = engine_mput(b, &tree, &removed);
-				b->tombstones++;
-			} else {
-				error = engine_mdel(b, &tree, removed.key);
-			}
-		} else if (order == 0 && memcmp(old, &rows[after],
-		    sizeof (engine_mrow_t)) == 0) {
-#if defined(ZFS_DEBUG) && !defined(_KERNEL)
-			/* Debug ztest proves the walk: a no-op insert. */
-			uint64_t changes = b->changes;
-			error = engine_mput(b, &tree, &rows[after]);
-			VERIFY(error != 0 || b->changes == changes);
-#endif
-			before++;
-			after++;
-			if (error == 0)
-				error = engine_mcursor_next(&cur);
-		} else {
-			if (order == 0) {
-				before++;
-				error = engine_mcursor_next(&cur);
-			}
-			if (error == 0)
-				error = engine_mput(b, &tree, &rows[after++]);
+			int order = old == NULL ? 1 : (after == count ? -1 :
+			    engine_mkey_compare(old->key, rows[after].key));
+			/* Debug ztest: no row changes but a marked owner's. */
+			if (ENGINE_MIRROR && order != 0)
+				VERIFY(engine_dirty_covers(snap,
+				    order < 0 ? old->key : rows[after].key));
+			if (ENGINE_MIRROR && order == 0 && memcmp(old,
+			    &rows[after], sizeof (engine_mrow_t)) != 0)
+				VERIFY(engine_dirty_covers(snap, old->key));
+			before += order <= 0;
+			error = engine_pages_merge(b, &tree, &cur, old, order,
+			    rows, &after, &live);
 		}
+		if (error == 0 && ENGINE_MIRROR)
+			VERIFY3U(live, ==, count);
+		live = count;
+	} else {
+		/* Each named owner's rows in the last tree, and its own. */
+		for (uint_t i = 0; error == 0 && i < snap->count; i++) {
+			const uint64_t *k = &snap->keys[4 * i];
+			uint64_t start[4] = { 1, k[0], k[1], 0 };
+			error = engine_mcursor_seek(&cur, &engine_pages.root,
+			    start);
+			if (error == 0 && ENGINE_MIRROR)
+				engine_pages_mirror_seek(&cur, start);
+			while (error == 0) {
+				const engine_mrow_t *old =
+				    engine_mcursor_row(&cur);
+				boolean_t mine = old != NULL &&
+				    engine_mrow_of(old, k);
+				boolean_t own = after < count &&
+				    engine_mrow_of(&rows[after], k);
+				if (!mine && !own)
+					break;
+				int order = !mine ? 1 : (!own ? -1 :
+				    engine_mkey_compare(old->key,
+				    rows[after].key));
+				error = engine_pages_merge(b, &tree, &cur,
+				    old, order, rows, &after, &live);
+			}
+		}
+		if (error == 0)
+			VERIFY3U(after, ==, count);
 	}
 	/* Tombstones whose journal segments are gone leave the tree. */
 	uint_t expired = 0;
@@ -2608,6 +2764,25 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		uint64_t key[4] = { 1, expired_keys[2 * i],
 		    expired_keys[2 * i + 1], 0 };
 		error = engine_mdel(b, &tree, key);
+	}
+	/* The incremental tree holds exactly the full rows. */
+	if (error == 0 && full != NULL) {
+		engine_mcursor_t check = { .b = b };
+		uint_t at = 0;
+		boolean_t same = B_TRUE;
+		const engine_mrow_t *r;
+		error = engine_mcursor_open(&check, &tree);
+		while (error == 0 && same &&
+		    (r = engine_mcursor_row(&check)) != NULL) {
+			same = at < full_count &&
+			    memcmp(r, &full[at++], sizeof (*r)) == 0;
+			error = engine_mcursor_next(&check);
+		}
+		if (error == 0) {
+			ENGINE_STORE_CHECK(same && at == full_count &&
+			    live == full_count);
+			engine_store_checked++;
+		}
 	}
 	if (error == 0)
 		error = engine_mseal(b, &tree);
@@ -2753,10 +2928,14 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			engine_pages.rows = NULL;
 			engine_pages.count = 0;
 		}
-		if (ENGINE_MIRROR) {
+		if (ENGINE_MIRROR && snap->all) {
 			engine_pages.rows = rows; rows = NULL;
 			engine_pages.count = count;
+		} else if (ENGINE_MIRROR) {
+			engine_pages.rows = full; full = NULL;
+			engine_pages.count = full_count;
 		}
+		engine_pages.live = live;
 		engine_pages.root = tree;
 		engine_pages.levels = 0;
 		if (tree.p != UINT64_MAX) {
@@ -2787,12 +2966,13 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		pr19262_printf("PR19262_PAGED_SYNC txg=%llu newpages=%u "
 		    "changes=%u deletes=%u tombstones=%u expired=%u rows=%u "
 		    "root=%llu generation=%llu levels=%llu allocated=%llu "
-		    "cached=%llu joins=%u\n",
+		    "cached=%llu joins=%u dirty=%u all=%u\n",
 		    (u_longlong_t)ub->ub_txg, b->pages, b->changes, b->deletes,
-		    b->tombstones, expired, count, (u_longlong_t)root.p,
+		    b->tombstones, expired, (uint_t)live, (u_longlong_t)root.p,
 		    (u_longlong_t)b->generation,
 		    (u_longlong_t)engine_pages.levels, (u_longlong_t)allocated,
-		    (u_longlong_t)cached, b->joins);
+		    (u_longlong_t)cached, b->joins, snap->count,
+		    (uint_t)snap->all);
 	}
 	if (expired_keys != NULL)
 		kmem_free(expired_keys, expired * 2 * sizeof (uint64_t));
@@ -2802,6 +2982,8 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		kmem_free(blobs, nb * sizeof (*blobs));
 	if (rows != NULL)
 		kmem_free(rows, MAX(1, count) * sizeof (*rows));
+	if (full != NULL)
+		kmem_free(full, MAX(1, full_count) * sizeof (*full));
 	kmem_free(b, sizeof (*b));
 	return (error);
 }
@@ -3172,6 +3354,7 @@ engine_pages_install(nvlist_t *nv)
 	if (nvlist_lookup_uint64(nv, "page-reservation-generation",
 	    &reserved) == 0)
 		engine_pages.generation = MAX(generation, reserved);
+	engine_pages.live = count;
 	if (ENGINE_MIRROR) {
 		engine_pages.rows = rows; engine_pages.count = count;
 	} else {

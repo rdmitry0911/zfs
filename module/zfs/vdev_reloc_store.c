@@ -287,6 +287,14 @@ engine_dirty_compare(const void *a, const void *b)
 	return (0);
 }
 
+/* Is the owner in a root of this txg? */
+static boolean_t
+engine_store_listed(const engine_owner_t *e, const uberblock_t *ub)
+{
+	return (!e->aborted && e->catalog_txg <= ub->ub_txg &&
+	    !e->journal_pending);
+}
+
 static void
 engine_dirty_snapshot(const uberblock_t *ub, engine_dirty_snap_t *s)
 {
@@ -306,8 +314,8 @@ engine_dirty_snapshot(const uberblock_t *ub, engine_dirty_snap_t *s)
 		k[0] = e->v;
 		k[1] = e->incarnation;
 		k[2] = e->dirty_seq;
-		/* Not listed yet: the owner stays marked until it is. */
-		k[3] = !(e->catalog_txg > ub->ub_txg || e->journal_pending);
+		/* Not listed: the owner stays marked until it is or goes. */
+		k[3] = engine_store_listed(e, ub);
 	}
 	for (uint_t i = 0; i < s->gone; i++, k += 4) {
 		k[0] = engine.gone[2 * i];
@@ -316,6 +324,10 @@ engine_dirty_snapshot(const uberblock_t *ub, engine_dirty_snap_t *s)
 		k[3] = 1;
 	}
 	qsort(s->keys, s->count, 4 * sizeof (uint64_t), engine_dirty_compare);
+	/* An incremental store visits each owner once. */
+	for (uint_t i = 1; i < s->count; i++)
+		VERIFY(engine_dirty_compare(&s->keys[4 * (i - 1)],
+		    &s->keys[4 * i]) < 0);
 }
 
 static void
@@ -323,6 +335,19 @@ engine_dirty_free(engine_dirty_snap_t *s)
 {
 	kmem_free(s->keys, MAX(1, s->count) * 4 * sizeof (uint64_t));
 	s->keys = NULL;
+}
+
+/* The listed owner of a snapshot entry; NULL if gone or not listed. */
+static engine_owner_t *
+engine_dirty_owner(const engine_dirty_snap_t *s, uint_t i)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	const uint64_t *k = &s->keys[4 * i];
+	if (k[2] == 0 || k[3] == 0)
+		return (NULL);
+	engine_owner_t *e = engine_find(k[0]);
+	VERIFY(e != NULL && e->incarnation == k[1]);
+	return (e);
 }
 
 /* Does the snapshot name the owner of this row key? */
@@ -408,24 +433,80 @@ engine_store_range(void *arg, uint64_t start, uint64_t size)
 	r->values[r->count++] = size;
 }
 
+static uint_t
+engine_store_owner_count(const engine_owner_t *e)
+{
+	uint_t n = 1;
+	for (engine_version_t *b = e->versions; b != NULL; b = b->next)
+		n += b != e->cur && b->retired;
+	return (n);
+}
+
 /*
- * The paged catalog's rows of this root, straight from the owners, with
- * the snapshot's inclusion and retirement stamping: every sync lists
- * every owner, so no nvlist per owner.
+ * A listed owner's rows: the current version, then every other retired
+ * one.  The first root that lists a retirement stamps its txg; with stamp
+ * false (the checking full rows after an incremental store's own) there
+ * must be nothing left to stamp.
+ */
+static uint_t
+engine_store_owner_rows(engine_owner_t *e, const uberblock_t *ub,
+    boolean_t stamp, engine_mrow_t *rows)
+{
+	if (e->retired && e->retired_txg == 0) {
+		ENGINE_STORE_CHECK(stamp);
+		if (stamp)
+			e->retired_txg = ub->ub_txg;
+	}
+	uint64_t identity[] = { e->v, e->size, e->allocation_txg,
+	    e->incarnation, e->created, e->retired_at,
+	    e->retired ? 1 : (e->checkpoint_only ? 2 : 0),
+	    e->catalog_txg };
+	uint_t at = 0;
+	engine_version_t *b = e->cur;
+	for (;;) {
+		if (b == e->cur || b->retired) {
+			if (b != e->cur && b->retired_txg == 0) {
+				ENGINE_STORE_CHECK(stamp);
+				if (stamp)
+					b->retired_txg = ub->ub_txg;
+			}
+			uint64_t values[] = { b->p, b->size, b->birth,
+			    b->width, b->parity, b->ready, b->retired,
+			    b->generation };
+			engine_mrow_fill(&rows[at++], identity, values,
+			    b == e->cur);
+		}
+		/* Current first, then all other retired versions. */
+		b = b == e->cur ? e->versions : b->next;
+		if (b == e->cur)
+			b = b->next;
+		if (b == NULL)
+			break;
+	}
+	return (at);
+}
+
+/*
+ * The paged catalog's rows of this root, straight from the owners: every
+ * listed owner's (all) or the listed owners' a snapshot names.
  */
 static int
-engine_store_rows(const uberblock_t *ub, engine_mrow_t **out, uint_t *count)
+engine_store_rows(const uberblock_t *ub, const engine_dirty_snap_t *s,
+    boolean_t stamp, engine_mrow_t **out, uint_t *count)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
 	uint64_t total = 0;
-	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-	    e = AVL_NEXT(&engine.owners, e)) {
-		if (e->aborted || e->catalog_txg > ub->ub_txg ||
-		    e->journal_pending)
-			continue;
-		total++;
-		for (engine_version_t *b = e->versions; b != NULL; b = b->next)
-			total += b != e->cur && b->retired;
+	if (s == NULL) {
+		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
+		    e = AVL_NEXT(&engine.owners, e))
+			if (engine_store_listed(e, ub))
+				total += engine_store_owner_count(e);
+	} else {
+		for (uint_t i = 0; i < s->count; i++) {
+			engine_owner_t *e = engine_dirty_owner(s, i);
+			if (e != NULL)
+				total += engine_store_owner_count(e);
+		}
 	}
 	/* The arena limit is checked by the store, once it is open. */
 	if (total > UINT_MAX)
@@ -433,34 +514,18 @@ engine_store_rows(const uberblock_t *ub, engine_mrow_t **out, uint_t *count)
 	engine_mrow_t *rows = pr19262_zalloc(MAX(1, total) * sizeof (*rows),
 	    KM_SLEEP);
 	uint_t at = 0;
-	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-	    e = AVL_NEXT(&engine.owners, e)) {
-		if (e->aborted || e->catalog_txg > ub->ub_txg ||
-		    e->journal_pending)
-			continue;
-		if (e->retired && e->retired_txg == 0)
-			e->retired_txg = ub->ub_txg;
-		uint64_t identity[] = { e->v, e->size, e->allocation_txg,
-		    e->incarnation, e->created, e->retired_at,
-		    e->retired ? 1 : (e->checkpoint_only ? 2 : 0),
-		    e->catalog_txg };
-		engine_version_t *b = e->cur;
-		for (;;) {
-			if (b == e->cur || b->retired) {
-				if (b != e->cur && b->retired_txg == 0)
-					b->retired_txg = ub->ub_txg;
-				uint64_t values[] = { b->p, b->size, b->birth,
-				    b->width, b->parity, b->ready, b->retired,
-				    b->generation };
-				engine_mrow_fill(&rows[at++], identity, values,
-				    b == e->cur);
-			}
-			/* Current first, then all other retired versions. */
-			b = b == e->cur ? e->versions : b->next;
-			if (b == e->cur)
-				b = b->next;
-			if (b == NULL)
-				break;
+	if (s == NULL) {
+		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
+		    e = AVL_NEXT(&engine.owners, e))
+			if (engine_store_listed(e, ub))
+				at += engine_store_owner_rows(e, ub, stamp,
+				    rows + at);
+	} else {
+		for (uint_t i = 0; i < s->count; i++) {
+			engine_owner_t *e = engine_dirty_owner(s, i);
+			if (e != NULL)
+				at += engine_store_owner_rows(e, ub, stamp,
+				    rows + at);
 		}
 	}
 	VERIFY3U(at, ==, total);
@@ -596,11 +661,25 @@ noinline static int
 engine_store_paged(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
-	engine_mrow_t *rows = NULL;
-	uint_t count = 0;
-	int error = engine_store_rows(ub, &rows, &count);
 	engine_dirty_snap_t snap;
 	engine_dirty_snapshot(ub, &snap);
+	/*
+	 * After engage or import every listed owner's rows; otherwise only
+	 * those of the owners the snapshot names.  Debug ztest, or a kernel
+	 * with store_verify set, builds the full rows as well and checks the
+	 * tree against them.
+	 */
+	engine_mrow_t *rows = NULL, *full = NULL;
+	uint_t count = 0, full_count = 0;
+	int error = engine_store_rows(ub, snap.all ? NULL : &snap, B_TRUE,
+	    &rows, &count);
+	if (error == 0 && !snap.all &&
+	    (ENGINE_MIRROR || zfs_pr19262_store_verify != 0)) {
+		error = engine_store_rows(ub, NULL, B_FALSE, &full,
+		    &full_count);
+		if (error != 0)
+			kmem_free(rows, MAX(1, count) * sizeof (*rows));
+	}
 	uint64_t revision = engine.revision;
 	mutex_exit(&engine.lock);
 	if (error != 0) {
@@ -609,7 +688,8 @@ engine_store_paged(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 		return (error);
 	}
 	uint64_t desc[16];
-	error = engine_pages_store(spa, ub, nv, rows, count, &snap, desc);
+	error = engine_pages_store(spa, ub, nv, rows, count, full, full_count,
+	    &snap, desc);
 	fnvlist_free(nv);
 	if (error == 0) {
 		mutex_enter(&engine.lock);
