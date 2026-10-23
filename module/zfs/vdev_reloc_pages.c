@@ -1558,6 +1558,40 @@ engine_pages_mark_io(engine_mmarker_t *m, engine_mnode_t *n, uint64_t p,
 	engine_mnode_free(probe);
 }
 
+/*
+ * A leaf reached by a plain sweep (no rewrite, no audit): its reference
+ * names its page and it has no children, so it is marked unread; an
+ * evicted leaf would otherwise be read back by every fence's GC.  Debug
+ * ztest reads it and checks that it is a leaf.
+ */
+static int
+engine_pages_mark_leaf(engine_mmarker_t *m, const engine_mref_t *ref)
+{
+	uint64_t index;
+	if (ref->p == UINT64_MAX || engine_mref_empty(ref))
+		return (0);
+	if (!engine_mindex(ref->p, &index))
+		return (ENGINE_EINVAL(11));
+#if defined(ZFS_DEBUG) && !defined(_KERNEL)
+	engine_mnode_t *n = engine_pages.cache[index];
+	boolean_t owned = B_FALSE;
+	if (n == NULL || n->dirty || !n->sealed ||
+	    memcmp(&engine_mheader(n)->hash, &ref->hash,
+	    sizeof (ref->hash)) != 0) {
+		int error = engine_mread(m->spa, ref, &n);
+		if (error != 0)
+			return (error);
+		owned = B_TRUE;
+	}
+	VERIFY3U(engine_mheader(n)->type, ==, ENGINE_M_LEAF);
+	VERIFY0(engine_mheader(n)->level);
+	if (owned)
+		engine_mnode_free(n);
+#endif
+	m->marked[index] = 1;
+	return (0);
+}
+
 /* Mark every page reachable from a blob chain or a page-tree reference. */
 static int
 engine_pages_mark_ref(engine_mmarker_t *m, const engine_mref_t *ref)
@@ -1584,9 +1618,14 @@ engine_pages_mark_ref(engine_mmarker_t *m, const engine_mref_t *ref)
 	int error = 0;
 	engine_pages_mark_io(m, n, ref->p, &ref->hash);
 	if (h->type == ENGINE_M_BRANCH) {
+		/* A level-1 branch's children are leaves. */
+		boolean_t leaves = h->level == 1 && m->target < 0 &&
+		    m->audit_ok == NULL;
 		engine_mchild_t *children = engine_mpayload(n);
 		for (uint_t i = 0; error == 0 && i < h->count; i++)
-			error = engine_pages_mark_ref(m, &children[i].ref);
+			error = leaves ?
+			    engine_pages_mark_leaf(m, &children[i].ref) :
+			    engine_pages_mark_ref(m, &children[i].ref);
 	} else if (h->type == ENGINE_M_BLOB) {
 		engine_mref_t next;
 		memcpy(&next, h->reserved, sizeof (next));
