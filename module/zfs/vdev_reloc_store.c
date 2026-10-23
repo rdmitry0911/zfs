@@ -180,13 +180,19 @@ engine_store_io_at(vdev_t *vd, uint64_t arena, uint64_t page,
 	zio_t *zio;
 	int error = engine_store_zio(NULL, vd, arena, page, pages, abd,
 	    write, &zio);
-	return (error != 0 ? error : zio_wait(zio));
+	if (error == 0)
+		error = zio_wait(zio);
+	if (error != 0)
+		atomic_inc_64(&engine_io_errors);
+	return (error);
 }
 
 /* A member's result: the first error, which an absence does not mask. */
 static void
 engine_member_error(int *member, int error)
 {
+	if (error != 0)
+		atomic_inc_64(&engine_io_errors);
 	if (error != 0 && (*member == 0 || error != ENXIO))
 		*member = error;
 }

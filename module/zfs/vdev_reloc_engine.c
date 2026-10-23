@@ -136,6 +136,9 @@ typedef struct engine_quorum {
 	int error;
 } engine_quorum_t;
 
+/* Any raw I/O error invalidates the control-slot cache. */
+static uint64_t engine_io_errors;
+
 /* One page of a raw step that every member of the vdev writes. */
 typedef struct engine_member_page {
 	uint64_t arena;
@@ -150,6 +153,7 @@ engine_quorum_add(engine_quorum_t *q, int error)
 {
 	if (error == 0)
 		return;
+	atomic_inc_64(&engine_io_errors);
 	q->failures++;
 	q->absent += error == ENXIO;
 	if (q->error == 0 || error != ENXIO)

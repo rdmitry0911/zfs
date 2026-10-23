@@ -94,7 +94,21 @@ typedef struct engine_marena {
 	boolean_t formatted;
 	boolean_t directory_flushed;
 	boolean_t pending;
+	/* Auxiliary arenas have their own consecutive publication serials. */
+	uint64_t serial;
+	uint64_t slot_serial[2];
+	uint8_t *slots;
+	uint64_t cache_errors;
+	uint64_t cache_config;
 } engine_marena_t;
+
+static struct {
+	uint64_t reads;
+	uint64_t writes;
+	uint64_t skipped;
+	uint64_t cached;
+	uint64_t checked;
+} engine_slot_cost;
 
 typedef struct engine_mcontrol {
 	uint64_t serial;
@@ -188,6 +202,7 @@ engine_pages_add_arena(uint64_t p, uint64_t pages, const uint8_t *init,
 		bits[old] = bits[old + 1] = 1;
 	engine_marena_t *a = kmem_zalloc(sizeof (*a), KM_SLEEP);
 	a->p = p; a->first = old; a->pages = pages; a->pending = pending;
+	a->slots = kmem_zalloc(2 * pages, KM_SLEEP);
 	engine_mnode_t **old_cache = engine_pages.cache;
 	uint8_t *old_bits = engine_pages.bits;
 	ASSERT(!MUTEX_HELD(&engine.lock));
@@ -1005,6 +1020,7 @@ engine_pages_clear(void)
 	while (engine_pages.arenas != NULL) {
 		engine_marena_t *a = engine_pages.arenas;
 		engine_pages.arenas = a->next;
+		kmem_free(a->slots, 2 * a->pages);
 		kmem_free(a, sizeof (*a));
 	}
 	if (engine_pages.directory_pages != NULL) {
@@ -1124,6 +1140,8 @@ static int
 engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
     uint64_t generation, uint64_t serial, const engine_mcontrol_t *control)
 {
+	a->serial = serial;
+	engine_slot_cost.writes += engine.vd->vdev_children;
 	engine_mnode_t *n = engine_mnode_alloc();
 	engine_mheader_t *h = engine_mheader(n);
 	uint_t slot = serial % 2;
@@ -1149,7 +1167,6 @@ engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
 	engine_mhash(n, &h->hash);
 	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
 	engine_quorum_t q = { 0 };
-	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	/*
 	 * Without a cut or error hook, every member writes the slot and then
 	 * flushes at once: a reader takes the highest serial of any member,
@@ -1197,21 +1214,49 @@ engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
 		    engine_pages.publishing_active)
 			engine_pages_fault(15, generation, c, slot);
 	}
-	spa_config_exit(spa, SCL_ZIO, FTAG);
 	abd_free(abd);
+	if (q.failures == 0) {
+		uint64_t errors = atomic_load_64(&engine_io_errors);
+		if (a->cache_errors != errors ||
+		    a->cache_config != spa->spa_config_generation)
+			a->slot_serial[0] = a->slot_serial[1] = 0;
+		memcpy(a->slots + slot * a->pages, engine_mpayload(n),
+		    a->pages);
+		a->slot_serial[slot] = serial;
+		a->cache_errors = errors;
+		a->cache_config = spa->spa_config_generation;
+	} else {
+		a->slot_serial[0] = a->slot_serial[1] = 0;
+	}
 	engine_mnode_free(n);
 	return (engine_quorum_result(&q));
+}
+
+/* Only our own writes, flushed on every member, establish this cache. */
+static boolean_t
+engine_pages_slots_cached(spa_t *spa, engine_marena_t *a)
+{
+	if (a->cache_errors != atomic_load_64(&engine_io_errors) ||
+	    a->cache_config != spa->spa_config_generation) {
+		a->slot_serial[0] = a->slot_serial[1] = 0;
+	}
+	return (a->slot_serial[0] != 0 && a->slot_serial[1] != 0 &&
+	    pr19262_env("PR19262_M_A_FIRST_READ_EIO") == NULL);
 }
 
 static int
 engine_pages_reserve_control(spa_t *spa, uint64_t generation,
     const engine_mcontrol_t *control)
 {
+	/* Keep topology stable through checks and publication. */
+	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	int error = engine_pages_control_repair(spa, control);
 	if (error != 0)
-		return (error);
-	if (engine_pages.serial == UINT64_MAX)
-		return (EOVERFLOW);
+		goto out;
+	if (engine_pages.serial == UINT64_MAX) {
+		error = EOVERFLOW;
+		goto out;
+	}
 	uint64_t serial = ++engine_pages.serial;
 	error = 0;
 	for (engine_marena_t *a = engine_pages.arenas; a != NULL;
@@ -1220,7 +1265,25 @@ engine_pages_reserve_control(spa_t *spa, uint64_t generation,
 			continue;
 		if (engine_pages.publishing_active && a->p == engine.arena)
 			engine_pages_fault(16, generation, 0, serial % 2);
-		int e = engine_pages_reserve_arena(spa, a, generation, serial,
+		/* The initial arena is last; always publish its control. */
+		if (a->p != engine.arena && !a->pending &&
+		    engine_pages.pending[1] == 0 &&
+		    !engine_pages.publishing_active &&
+		    engine_pages_slots_cached(spa, a) &&
+		    memcmp(a->slots, engine_pages.bits + a->first,
+		    a->pages) == 0 &&
+		    memcmp(a->slots + a->pages, engine_pages.bits + a->first,
+		    a->pages) == 0) {
+			engine_slot_cost.skipped++;
+			continue;
+		}
+		if (a->serial == UINT64_MAX) {
+			error = EOVERFLOW;
+			break;
+		}
+		/* A gap would drop the old mask before the floor is durable. */
+		uint64_t local = a->p == engine.arena ? serial : a->serial + 1;
+		int e = engine_pages_reserve_arena(spa, a, generation, local,
 		    control);
 		if (e != 0)
 			error = e;
@@ -1233,6 +1296,8 @@ engine_pages_reserve_control(spa_t *spa, uint64_t generation,
 		engine_pages.floor = control->floor;
 		engine_pages.certified = control->certified;
 	}
+out:
+	spa_config_exit(spa, SCL_ZIO, FTAG);
 	return (error);
 }
 
@@ -1294,6 +1359,7 @@ engine_pages_slots_read(spa_t *spa, const engine_marena_t *a,
     engine_mnode_t **n, int *errors)
 {
 	uint_t children = engine.vd->vdev_children;
+	engine_slot_cost.reads += 2 * children;
 	zio_t **root = kmem_zalloc(2 * children * sizeof (zio_t *), KM_SLEEP);
 	abd_t **abd = kmem_zalloc(2 * children * sizeof (abd_t *), KM_SLEEP);
 	for (uint_t i = 0; i < 2 * children; i++) {
@@ -1310,8 +1376,7 @@ engine_pages_slots_read(spa_t *spa, const engine_marena_t *a,
 	}
 	for (uint_t i = 0; i < 2 * children; i++) {
 		int e = zio_wait(root[i]);
-		if (errors[i] == 0)
-			errors[i] = e;
+		engine_member_error(&errors[i], e);
 		abd_free(abd[i]);
 	}
 	kmem_free(abd, 2 * children * sizeof (abd_t *));
@@ -1438,6 +1503,7 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 	uint64_t top = 0;
 	for (uint_t i = 0; i < 2 * children; i++)
 		top = MAX(top, serials[i]);
+	a->serial = MAX(a->serial, top);
 	for (uint_t i = 0; i < 2 * children; i++) {
 		if (serials[i] == 0 || serials[i] + 1 < top)
 			continue;
@@ -1532,9 +1598,40 @@ engine_pages_control_repair(spa_t *spa, const engine_mcontrol_t *proposed)
 		uint8_t *bits = pr19262_zalloc(a->pages, KM_SLEEP);
 		engine_mcontrol_t *selected = a->p == engine.arena ?
 		    &control : NULL;
-		int error = engine_pages_reservations_arena(spa, a, bits,
-		    &generation, &serial, selected,
-		    B_TRUE);
+		int error = 0;
+		if (engine_pages_slots_cached(spa, a)) {
+			for (uint_t s = 0; s < 2; s++) {
+				if (a->serial - a->slot_serial[s] > 1)
+					continue;
+				for (uint64_t i = 0; i < a->pages; i++)
+					bits[i] |= a->slots[s * a->pages + i];
+			}
+			serial = MAX(serial, a->serial);
+			if (selected != NULL)
+				*selected = engine_pages.control;
+			engine_slot_cost.cached++;
+#if defined(ZFS_DEBUG) && !defined(_KERNEL)
+			/* Check each cache hit against disk in debug ztest. */
+			uint8_t *disk = kmem_zalloc(a->pages, KM_SLEEP);
+			uint64_t before = a->serial;
+			engine_mcontrol_t actual = { 0 };
+			error = engine_pages_reservations_arena(spa, a, disk,
+			    &generation, &serial, selected != NULL ?
+			    &actual : NULL, B_TRUE);
+			if (error == 0) {
+				VERIFY3U(a->serial, ==, before);
+				VERIFY0(memcmp(bits, disk, a->pages));
+				if (selected != NULL)
+					VERIFY(engine_mcontrol_same(selected,
+					    &actual));
+				engine_slot_cost.checked++;
+			}
+			kmem_free(disk, a->pages);
+#endif
+		} else {
+			error = engine_pages_reservations_arena(spa, a, bits,
+			    &generation, &serial, selected, B_TRUE);
+		}
 		mutex_enter(&engine.lock);
 		for (uint64_t i = 0; error == 0 && i < a->pages; i++)
 			if (bits[i] && !engine_pages.bits[a->first + i] &&
@@ -1811,7 +1908,7 @@ engine_pages_members(spa_t *spa, int target, uint64_t *ok,
 			    &engine_mheader(dir)->hash);
 		if (ok == NULL)
 			continue;
-		/* Control slots: the current serial or the one before it. */
+		/* Each arena's current serial or the one before it. */
 		engine_mnode_t *probe = engine_mnode_alloc();
 		abd_t *pabd = abd_get_from_buf(probe->data, ENGINE_STORE_PAGE);
 		for (uint_t slot = 0; slot < 2; slot++) {
@@ -1829,7 +1926,7 @@ engine_pages_members(spa_t *spa, int target, uint64_t *ok,
 					    memcmp(&computed, &h->hash,
 					    sizeof (computed)) == 0 &&
 					    h->high[1] + 1 >=
-					    engine_pages.control.serial;
+					    a->serial;
 				}
 				if (valid)
 					ok[c]++;
@@ -1864,6 +1961,9 @@ engine_pages_audit_print(spa_t *spa, const char *label, const uint64_t *ok,
 static int
 engine_pages_resilver(spa_t *spa, uint_t child, uint64_t *pages)
 {
+	/* An audit can find silent damage without a reported I/O error. */
+	for (engine_marena_t *a = engine_pages.arenas; a != NULL; a = a->next)
+		a->slot_serial[0] = a->slot_serial[1] = 0;
 	int error = engine_pages_members(spa, child, NULL, NULL, pages);
 	if (error == 0) {
 		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
@@ -2207,6 +2307,7 @@ engine_pages_remove_pending(engine_marena_t *a)
 	engine_pages.capacity = count;
 	engine_pages.free_hint = 0;
 	engine_pages.arenas = a->next;
+	kmem_free(a->slots, 2 * a->pages);
 	kmem_free(a, sizeof (*a));
 }
 
@@ -2465,6 +2566,66 @@ engine_pages_probe_hash(void *data, uint64_t size, uint64_t result[4])
 	memcpy(result, &hash, sizeof (hash));
 }
 
+#ifndef _KERNEL
+/* Real slot I/O: skipping must not erase the predecessor on a shrink. */
+static int
+engine_pages_slots_witness(spa_t *spa)
+{
+	engine_mbatch_t b = { .spa = spa,
+	    .generation = engine_pages.generation + 1 };
+	int error = engine_pages_grow(&b);
+	if (error != 0)
+		return (error);
+	engine_marena_t *a = engine_pages.arenas;
+	VERIFY3U(a->p, !=, engine.arena);
+	VERIFY0(engine_pages.bits[a->first + 3]);
+	/* A reserved, unwritten page is enough to test the durable masks. */
+	engine_pages.bits[a->first + 3] = 1;
+	VERIFY0(engine_pages_reserve(spa, b.generation));
+	VERIFY0(engine_pages_reserve(spa, b.generation));
+	uint64_t local = a->serial, global = engine_pages.serial;
+	uint64_t skipped = engine_slot_cost.skipped;
+	for (uint_t i = 0; i < 4; i++)
+		VERIFY0(engine_pages_reserve(spa, b.generation));
+	VERIFY3U(a->serial, ==, local);
+	VERIFY3U(engine_pages.serial, ==, global + 4);
+	VERIFY3U(engine_slot_cost.skipped, >=, skipped + 4);
+	engine_pages.bits[a->first + 3] = 0;
+	engine_pages.free_hint = 0;
+	boolean_t relaxed = engine_pages.gc_relaxed;
+	engine_pages.gc_relaxed = B_TRUE;
+	uint8_t *disk = kmem_zalloc(a->pages, KM_SLEEP);
+	uint64_t generation = 0, serial = 0;
+	VERIFY0(engine_pages_reserve(spa, b.generation));
+	VERIFY3U(a->serial, ==, local + 1);
+	VERIFY0(engine_pages_reservations_arena(spa, a, disk,
+	    &generation, &serial, NULL, B_TRUE));
+	VERIFY3U(disk[3], ==, 1);
+	memset(disk, 0, a->pages);
+	VERIFY0(engine_pages_reserve(spa, b.generation));
+	VERIFY3U(a->serial, ==, local + 2);
+	VERIFY0(engine_pages_reservations_arena(spa, a, disk,
+	    &generation, &serial, NULL, B_TRUE));
+	VERIFY0(disk[3]);
+	engine_pages.gc_relaxed = relaxed;
+	kmem_free(disk, a->pages);
+	/* Any observed I/O error must send the next reserve back to disk. */
+	uint64_t reads = engine_slot_cost.reads;
+	atomic_inc_64(&engine_io_errors);
+	VERIFY0(engine_pages_reserve(spa, b.generation));
+	VERIFY3U(engine_slot_cost.reads, >, reads);
+	pr19262_printf("PR19262_M_SLOTS PASS gap=4 retained_first=1 "
+	    "released_second=1 error_invalidated=1 local=%llu global=%llu "
+	    "skipped=%llu cached=%llu checked=%llu\n",
+	    (u_longlong_t)a->serial, (u_longlong_t)engine_pages.serial,
+	    (u_longlong_t)engine_slot_cost.skipped,
+	    (u_longlong_t)engine_slot_cost.cached,
+	    (u_longlong_t)engine_slot_cost.checked);
+	pr19262_flush();
+	return (0);
+}
+#endif
+
 /* Private userspace witness: execute the real operation, including errors. */
 static int
 engine_pages_growth_probe(spa_t *spa, boolean_t advance,
@@ -2476,6 +2637,13 @@ engine_pages_growth_probe(spa_t *spa, boolean_t advance,
 		return (ENOTSUP);
 	}
 	int error = 0;
+#ifndef _KERNEL
+	if (pr19262_env("PR19262_M_SLOTS_WITNESS") != NULL) {
+		error = engine_pages_slots_witness(spa);
+		if (error != 0)
+			return (error);
+	}
+#endif
 	if (advance) {
 		if (engine_pages.generation == UINT64_MAX)
 			error = EOVERFLOW;

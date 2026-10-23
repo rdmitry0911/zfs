@@ -266,7 +266,9 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    "store_checked=%llu store_check_failures=%llu "
 	    "pages_evicted=%llu stores=%llu store_pages=%llu "
 	    "store_runs=%llu store_tree_ms=%llu store_reserve_ms=%llu "
-	    "store_write_ms=%llu store_flush_ms=%llu\n", state, pool,
+	    "store_write_ms=%llu store_flush_ms=%llu slot_reads=%llu "
+	    "slot_writes=%llu slot_skipped=%llu slot_cached=%llu\n",
+	    state, pool,
 	    active, (u_longlong_t)parity, (u_longlong_t)c.owners,
 	    (u_longlong_t)c.legacy_bytes, (u_longlong_t)c.weak_current,
 	    (u_longlong_t)c.retired_bytes, (u_longlong_t)c.certified,
@@ -283,7 +285,11 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    (u_longlong_t)(engine_store_cost.tree / MSEC2NSEC(1)),
 	    (u_longlong_t)(engine_store_cost.reserve / MSEC2NSEC(1)),
 	    (u_longlong_t)(engine_store_cost.write / MSEC2NSEC(1)),
-	    (u_longlong_t)(engine_store_cost.flush / MSEC2NSEC(1)));
+	    (u_longlong_t)(engine_store_cost.flush / MSEC2NSEC(1)),
+	    (u_longlong_t)engine_slot_cost.reads,
+	    (u_longlong_t)engine_slot_cost.writes,
+	    (u_longlong_t)engine_slot_cost.skipped,
+	    (u_longlong_t)engine_slot_cost.cached);
 	return (n);
 }
 
