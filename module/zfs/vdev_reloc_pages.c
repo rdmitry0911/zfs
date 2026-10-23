@@ -1150,7 +1150,29 @@ engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
 	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
 	engine_quorum_t q = { 0 };
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
-	for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
+	/*
+	 * Without a cut or error hook, every member writes the slot and then
+	 * flushes at once: a reader takes the highest serial of any member,
+	 * so which members hold the new one after a crash does not matter.
+	 * The hooks cut after the first member and keep the member order.
+	 */
+	boolean_t hooked = pr19262_env("PR19262_M_PAGE_FAULT") != NULL ||
+	    pr19262_env("PR19262_M_ACTIVE_ERROR") != NULL;
+	if (!hooked) {
+		uint_t children = engine.vd->vdev_children;
+		int *errors = kmem_alloc(children * sizeof (int), KM_SLEEP);
+		engine_member_page_t pv = { .arena = a->p, .page = slot,
+		    .abd = abd };
+		engine_members_write(spa, &pv, 1, B_TRUE, B_FALSE, errors,
+		    NULL);
+		for (uint_t c = 0; c < children; c++) {
+			engine_quorum_add(&q, errors[c]);
+			if (errors[c] == 0 && a->p == engine.arena)
+				engine_pages.member_serial[c] = serial;
+		}
+		kmem_free(errors, children * sizeof (int));
+	}
+	for (uint_t c = 0; hooked && c < engine.vd->vdev_children; c++) {
 		int e = EIO;
 		if (!engine_pages_active_error(a, c, slot, "write", serial))
 			e = engine_store_io_at(engine.vd->vdev_child[c], a->p,
@@ -1261,17 +1283,55 @@ engine_mcontrol_same(const engine_mcontrol_t *a, const engine_mcontrol_t *b)
 	return (memcmp(a, b, sizeof (*a)) == 0);
 }
 
+/*
+ * Both control slots of an arena on every member, read at once: slot s of
+ * member c lands in n[s * children + c] and its result in errors[] (ENXIO:
+ * the member is absent).  A reader that went member by member paid a
+ * round trip per page.
+ */
+static void
+engine_pages_slots_read(spa_t *spa, const engine_marena_t *a,
+    engine_mnode_t **n, int *errors)
+{
+	uint_t children = engine.vd->vdev_children;
+	zio_t **root = kmem_zalloc(2 * children * sizeof (zio_t *), KM_SLEEP);
+	abd_t **abd = kmem_zalloc(2 * children * sizeof (abd_t *), KM_SLEEP);
+	for (uint_t i = 0; i < 2 * children; i++) {
+		uint_t slot = i / children, c = i % children;
+		zio_t *zio;
+		n[i] = engine_mnode_alloc();
+		abd[i] = abd_get_from_buf(n[i]->data, ENGINE_STORE_PAGE);
+		root[i] = zio_root(spa, NULL, NULL, ZIO_FLAG_CANFAIL);
+		errors[i] = engine_store_zio(root[i], engine.vd->vdev_child[c],
+		    a->p + slot * ENGINE_STORE_PAGE * children, 0, 1, abd[i],
+		    B_FALSE, &zio);
+		if (errors[i] == 0)
+			zio_nowait(zio);
+	}
+	for (uint_t i = 0; i < 2 * children; i++) {
+		int e = zio_wait(root[i]);
+		if (errors[i] == 0)
+			errors[i] = e;
+		abd_free(abd[i]);
+	}
+	kmem_free(abd, 2 * children * sizeof (abd_t *));
+	kmem_free(root, 2 * children * sizeof (zio_t *));
+}
+
 static int
 engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
     uint8_t *bitmap, uint64_t *generation, uint64_t *serial_high,
     engine_mcontrol_t *control, boolean_t strict)
 {
-	engine_mnode_t *n = engine_mnode_alloc();
-	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
 	boolean_t found = B_FALSE;
 	boolean_t conflict = B_FALSE;
 	int error = 0;
 	uint_t children = engine.vd->vdev_children;
+	/* Every slot of every member first, then each in the same order. */
+	engine_mnode_t **slots = kmem_zalloc(2 * children *
+	    sizeof (engine_mnode_t *), KM_SLEEP);
+	int *read = kmem_zalloc(2 * children * sizeof (int), KM_SLEEP);
+	engine_pages_slots_read(spa, a, slots, read);
 	/* Masks by (slot, member): only the two latest serials are unioned. */
 	uint64_t *serials = pr19262_zalloc(2 * children * sizeof (uint64_t),
 	    KM_SLEEP);
@@ -1282,6 +1342,7 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 		for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
 			uint64_t p = a->p + slot * ENGINE_STORE_PAGE *
 			    engine.vd->vdev_children;
+			engine_mnode_t *n = slots[slot * children + c];
 			const char *hidden =
 			    pr19262_env("PR19262_M_A_FIRST_READ_EIO");
 			if (!engine_m_read_injected && a->p == engine.arena &&
@@ -1294,8 +1355,7 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 					error = EIO;
 				continue;
 			}
-			int e = engine_store_io_at(engine.vd->vdev_child[c],
-			    p, 0, 1, abd, B_FALSE);
+			int e = read[slot * children + c];
 			if (e != 0) {
 				/* Absent members count against the quorum. */
 				if (e == ENXIO)
@@ -1396,8 +1456,10 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 	kmem_free(serials, 2 * children * sizeof (uint64_t));
 	kmem_free(masks, 2 * children * a->pages);
 	kmem_free(absent, children * sizeof (boolean_t));
-	abd_free(abd);
-	engine_mnode_free(n);
+	for (uint_t i = 0; i < 2 * children; i++)
+		engine_mnode_free(slots[i]);
+	kmem_free(read, 2 * children * sizeof (int));
+	kmem_free(slots, 2 * children * sizeof (engine_mnode_t *));
 	if (error != 0)
 		return (error);
 	return (conflict ? ECKSUM : (found ? 0 : ENOENT));
