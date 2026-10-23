@@ -267,7 +267,17 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    "pages_evicted=%llu stores=%llu store_pages=%llu "
 	    "store_runs=%llu store_tree_ms=%llu store_reserve_ms=%llu "
 	    "store_write_ms=%llu store_flush_ms=%llu slot_reads=%llu "
-	    "slot_writes=%llu slot_skipped=%llu slot_cached=%llu\n",
+	    "slot_writes=%llu slot_skipped=%llu slot_cached=%llu "
+	    "copy_groups=%llu copy_blocks=%llu copy_bytes=%llu "
+	    "copy_setup_ms=%llu copy_read_ms=%llu copy_write_ms=%llu "
+	    "copy_verify_ms=%llu copy_check_ms=%llu copy_flush_ms=%llu "
+	    "copy_settle_ms=%llu copy_journal_ms=%llu copy_publish_ms=%llu "
+	    "copy_total_ms=%llu "
+	    "j_bind_calls=%llu j_bind_pages=%llu j_bind_write_ms=%llu "
+	    "j_bind_flush_ms=%llu j_head_calls=%llu j_head_write_ms=%llu "
+	    "j_head_flush_ms=%llu j_forward_calls=%llu "
+	    "j_forward_write_ms=%llu j_forward_flush_ms=%llu "
+	    "j_rolls=%llu j_roll_ms=%llu j_lock_ms=%llu j_seal_ms=%llu\n",
 	    state, pool,
 	    active, (u_longlong_t)parity, (u_longlong_t)c.owners,
 	    (u_longlong_t)c.legacy_bytes, (u_longlong_t)c.weak_current,
@@ -289,7 +299,37 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    (u_longlong_t)engine_slot_cost.reads,
 	    (u_longlong_t)engine_slot_cost.writes,
 	    (u_longlong_t)engine_slot_cost.skipped,
-	    (u_longlong_t)engine_slot_cost.cached);
+	    (u_longlong_t)engine_slot_cost.cached,
+	    (u_longlong_t)atomic_load_64(&engine_copy_cost.groups),
+	    (u_longlong_t)atomic_load_64(&engine_copy_cost.blocks),
+	    (u_longlong_t)atomic_load_64(&engine_copy_cost.bytes),
+#define	ENGINE_COST_MS(field) \
+	    (u_longlong_t)(atomic_load_64(&(field)) / MSEC2NSEC(1))
+	    ENGINE_COST_MS(engine_copy_cost.setup),
+	    ENGINE_COST_MS(engine_copy_cost.io[0]),
+	    ENGINE_COST_MS(engine_copy_cost.io[1]),
+	    ENGINE_COST_MS(engine_copy_cost.io[2]),
+	    ENGINE_COST_MS(engine_copy_cost.check),
+	    ENGINE_COST_MS(engine_copy_cost.flush),
+	    ENGINE_COST_MS(engine_copy_cost.settle),
+	    ENGINE_COST_MS(engine_copy_cost.journal),
+	    ENGINE_COST_MS(engine_copy_cost.publish),
+	    ENGINE_COST_MS(engine_copy_cost.total),
+	    (u_longlong_t)atomic_load_64(&engine_journal_cost.calls[0]),
+	    (u_longlong_t)atomic_load_64(&engine_journal_cost.pages[0]),
+	    ENGINE_COST_MS(engine_journal_cost.write[0]),
+	    ENGINE_COST_MS(engine_journal_cost.flush[0]),
+	    (u_longlong_t)atomic_load_64(&engine_journal_cost.calls[1]),
+	    ENGINE_COST_MS(engine_journal_cost.write[1]),
+	    ENGINE_COST_MS(engine_journal_cost.flush[1]),
+	    (u_longlong_t)atomic_load_64(&engine_journal_cost.calls[2]),
+	    ENGINE_COST_MS(engine_journal_cost.write[2]),
+	    ENGINE_COST_MS(engine_journal_cost.flush[2]),
+	    (u_longlong_t)atomic_load_64(&engine_journal_cost.rolls),
+	    ENGINE_COST_MS(engine_journal_cost.roll),
+	    ENGINE_COST_MS(engine_journal_cost.lock),
+	    ENGINE_COST_MS(engine_journal_cost.seal));
+#undef ENGINE_COST_MS
 	return (n);
 }
 

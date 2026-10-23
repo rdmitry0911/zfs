@@ -99,6 +99,21 @@ typedef struct engine_copy {
 	uint64_t psize;
 } engine_copy_t;
 
+/* Group wall time, partitioned at the real I/O and publication steps. */
+static struct {
+	uint64_t groups;
+	uint64_t blocks;
+	uint64_t bytes;
+	uint64_t setup;
+	uint64_t io[3];
+	uint64_t check;
+	uint64_t flush;
+	uint64_t settle;
+	uint64_t journal;
+	uint64_t publish;
+	uint64_t total;
+} engine_copy_cost;
+
 typedef struct engine_j_segment {
 	struct engine_j_segment *next;
 	uint64_t arena;
@@ -1851,6 +1866,9 @@ void
 pr19262_engine_copy_group(void **handles, uint_t n,
     const boolean_t *speculative, int *errors)
 {
+	hrtime_t start = gethrtime();
+	uint64_t bytes = 0;
+	hrtime_t io[3];
 	engine_copy_t **cv = (engine_copy_t **)handles;
 	spa_t *spa = engine.spa;
 	abd_t **source = kmem_alloc(n * sizeof (abd_t *), KM_SLEEP);
@@ -1859,12 +1877,15 @@ pr19262_engine_copy_group(void **handles, uint_t n,
 	boolean_t *attempted = kmem_alloc(n * sizeof (boolean_t), KM_SLEEP);
 	for (uint_t i = 0; i < n; i++) {
 		errors[i] = 0;
+		bytes += cv[i]->psize;
 		source[i] = abd_alloc_for_io(cv[i]->psize, B_FALSE);
 		verify[i] = abd_alloc_for_io(cv[i]->psize, B_FALSE);
 	}
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+	hrtime_t setup = gethrtime();
 	/* Read the sources, write the stages, read the stages back. */
 	for (uint_t step = 0; step < 3; step++) {
+		hrtime_t before = gethrtime();
 		for (uint_t i = 0; i < n; i++) {
 			engine_copy_t *c = cv[i];
 			zio[i] = errors[i] != 0 ? NULL :
@@ -1880,7 +1901,9 @@ pr19262_engine_copy_group(void **handles, uint_t n,
 		for (uint_t i = 0; i < n; i++)
 			if (zio[i] != NULL)
 				errors[i] = zio_wait(zio[i]);
+		io[step] = gethrtime() - before;
 	}
+	hrtime_t readback = gethrtime();
 	boolean_t any = B_FALSE;
 	for (uint_t i = 0; i < n; i++) {
 		if (errors[i] == 0 && abd_cmp(source[i], verify[i]) != 0)
@@ -1889,6 +1912,7 @@ pr19262_engine_copy_group(void **handles, uint_t n,
 		abd_free(source[i]);
 		abd_free(verify[i]);
 	}
+	hrtime_t checked = gethrtime();
 	/* Flush data before publishing its J bindings: every member at once. */
 	if (any && engine.persistent) {
 		engine_quorum_t q = { 0 };
@@ -1899,9 +1923,12 @@ pr19262_engine_copy_group(void **handles, uint_t n,
 				errors[i] = error;
 	}
 	spa_config_exit(spa, SCL_ZIO, FTAG);
+	hrtime_t flushed = gethrtime();
 	for (uint_t i = 0; i < n; i++)
 		attempted[i] = engine_copy_settle(cv[i], &errors[i], B_TRUE);
+	hrtime_t settled = gethrtime();
 	engine_journal_bind_copies(cv, n, attempted, errors);
+	hrtime_t bound = gethrtime();
 	for (uint_t i = 0; i < n; i++)
 		errors[i] = engine_copy_publish(cv[i], errors[i],
 		    attempted[i]);
@@ -1909,6 +1936,19 @@ pr19262_engine_copy_group(void **handles, uint_t n,
 	kmem_free(zio, n * sizeof (zio_t *));
 	kmem_free(verify, n * sizeof (abd_t *));
 	kmem_free(source, n * sizeof (abd_t *));
+	hrtime_t end = gethrtime();
+	atomic_inc_64(&engine_copy_cost.groups);
+	atomic_add_64(&engine_copy_cost.blocks, n);
+	atomic_add_64(&engine_copy_cost.bytes, bytes);
+	atomic_add_64(&engine_copy_cost.setup, setup - start);
+	for (uint_t step = 0; step < 3; step++)
+		atomic_add_64(&engine_copy_cost.io[step], io[step]);
+	atomic_add_64(&engine_copy_cost.check, checked - readback);
+	atomic_add_64(&engine_copy_cost.flush, flushed - checked);
+	atomic_add_64(&engine_copy_cost.settle, settled - flushed);
+	atomic_add_64(&engine_copy_cost.journal, bound - settled);
+	atomic_add_64(&engine_copy_cost.publish, end - bound);
+	atomic_add_64(&engine_copy_cost.total, end - start);
 }
 
 int

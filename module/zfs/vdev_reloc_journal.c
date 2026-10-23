@@ -10,6 +10,18 @@
 #define	ENGINE_J_WORDS (ENGINE_STORE_PAGE / sizeof (uint64_t))
 #define	ENGINE_J_HASH (ENGINE_J_WORDS - 4)
 
+/* BIND, HEAD and FORWARD I/O; roll time includes its nested I/O. */
+static struct {
+	uint64_t calls[3];
+	uint64_t pages[3];
+	uint64_t write[3];
+	uint64_t flush[3];
+	uint64_t seal;
+	uint64_t rolls;
+	uint64_t roll;
+	uint64_t lock;
+} engine_journal_cost;
+
 
 static uint_t engine_journal_fault_stage;
 static uint64_t engine_journal_fault_seq;
@@ -89,11 +101,13 @@ pr19262_engine_journal_wait_error(void)
 static void
 engine_journal_seal(abd_t *abd)
 {
+	hrtime_t start = gethrtime();
 	uint64_t *w = abd_to_buf(abd);
 	memset(w + ENGINE_J_HASH, 0, sizeof (zio_cksum_t));
 	zio_cksum_t hash;
 	abd_checksum_sha256(abd, ENGINE_STORE_PAGE, NULL, &hash);
 	memcpy(w + ENGINE_J_HASH, &hash, sizeof (hash));
+	atomic_add_64(&engine_journal_cost.seal, gethrtime() - start);
 }
 
 static boolean_t
@@ -138,12 +152,20 @@ engine_journal_write_pages(spa_t *spa, const engine_member_page_t *pv,
 	engine_quorum_t q = { 0 };
 	uint_t children = engine.vd->vdev_children;
 	int *errors = kmem_alloc(children * sizeof (int), KM_SLEEP);
+	engine_store_cost_t cost = { 0 };
+	uint64_t kind = n == 0 ? 0 : ((uint64_t *)abd_to_buf(pv[0].abd))[1];
+	uint_t at = kind == ENGINE_J_BIND ? 0 :
+	    (kind == ENGINE_J_HEAD ? 1 : 2);
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
-	engine_members_write(spa, pv, n, B_TRUE, B_FALSE, errors, NULL);
+	engine_members_write(spa, pv, n, B_TRUE, B_FALSE, errors, &cost);
 	spa_config_exit(spa, SCL_ZIO, FTAG);
 	for (uint_t c = 0; c < children; c++)
 		engine_quorum_add(&q, errors[c]);
 	kmem_free(errors, children * sizeof (int));
+	atomic_inc_64(&engine_journal_cost.calls[at]);
+	atomic_add_64(&engine_journal_cost.pages[at], n);
+	atomic_add_64(&engine_journal_cost.write[at], cost.write);
+	atomic_add_64(&engine_journal_cost.flush[at], cost.flush);
 	return (engine_quorum_result(&q));
 }
 
@@ -381,13 +403,17 @@ static int
 engine_journal_grow(spa_t *spa)
 {
 	ASSERT(MUTEX_HELD(&engine.journal_lock));
+	hrtime_t start = gethrtime();
+	atomic_inc_64(&engine_journal_cost.rolls);
 	uint64_t arena = UINT64_MAX, epoch[2];
 	VERIFY0(random_get_pseudo_bytes((void *)epoch, sizeof (epoch)));
 	engine_j_segment_t *next;
 	int error = engine_journal_segment(arena, epoch,
 	    B_TRUE, B_FALSE, &next);
-	if (error != 0)
+	if (error != 0) {
+		atomic_add_64(&engine_journal_cost.roll, gethrtime() - start);
 		return (error);
+	}
 	engine_journal_roll_phase = 4;
 	error = engine_journal_head(spa, engine.journal_seq,
 	    &engine.journal_hash, ENGINE_J_PREPARE, next);
@@ -396,6 +422,7 @@ engine_journal_grow(spa_t *spa)
 		engine_journal_roll_stop(13);
 		error = engine_journal_finish_prepare(spa);
 	}
+	atomic_add_64(&engine_journal_cost.roll, gethrtime() - start);
 	return (error);
 }
 
@@ -1134,7 +1161,9 @@ engine_journal_bind_copies(engine_copy_t **cv, uint_t n,
 		return;
 	engine_member_page_t *pv = kmem_alloc(m * sizeof (*pv), KM_SLEEP);
 	uint_t *index = kmem_alloc(m * sizeof (uint_t), KM_SLEEP);
+	hrtime_t lock = gethrtime();
 	mutex_enter(&engine.journal_lock);
+	atomic_add_64(&engine_journal_cost.lock, gethrtime() - lock);
 	int error = 0;
 	if (engine.journal_repair) {
 		error = engine_journal_repair(spa);
