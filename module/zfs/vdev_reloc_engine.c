@@ -44,25 +44,28 @@ typedef struct engine_owner {
 	uint64_t catalog_txg;
 	uint64_t claimed_txg;
 	uint64_t queued_writers;
-	boolean_t journal_pending;
-	boolean_t journal_touched;
-	boolean_t checkpoint_only;
 	engine_version_t *versions;
 	engine_version_t *cur;
 	engine_pending_t *pending;
-	boolean_t copying;
 	uint64_t incarnation;
 	uint64_t holds;
 	uint64_t created;
 	uint64_t retired_at;
 	/* First durable catalog txg that listed the owner as retired. */
 	uint64_t retired_txg;
-	boolean_t retired;
-	boolean_t aborted;
-	boolean_t releasing;
 	/* On engine.dirty while its catalog rows may differ from the tree. */
 	list_node_t dirty_node;
 	uint64_t dirty_seq;
+	uint64_t admit_growth;
+	uint8_t journal_pending;
+	uint8_t journal_touched;
+	uint8_t checkpoint_only;
+	uint8_t copying;
+	uint8_t retired;
+	uint8_t aborted;
+	uint8_t releasing;
+	uint8_t admit_weak;
+	uint8_t admit_dirty;
 } engine_owner_t;
 
 typedef struct engine_hold {
@@ -114,6 +117,15 @@ static struct {
 	uint64_t total;
 } engine_copy_cost;
 
+static struct {
+	uint64_t rebuilds;
+	uint64_t rebuilt;
+	uint64_t walked;
+	uint64_t updates;
+	uint64_t checked;
+	uint64_t pages_checked;
+} engine_admit_cost;
+
 typedef struct engine_j_segment {
 	struct engine_j_segment *next;
 	uint64_t arena;
@@ -135,6 +147,8 @@ static void engine_journal_bind_copies(engine_copy_t **, uint_t,
     const boolean_t *, int *);
 static void engine_journal_test_event(spa_t *, const blkptr_t *, int);
 static void engine_journal_fold(spa_t *, uint64_t);
+static void engine_admit_owner_update(engine_owner_t *);
+static void engine_admit_owner_forget(engine_owner_t *);
 static uint_t engine_store_tolerated(void);
 /* Default converter batch the standing reserve keeps free. */
 #define	ENGINE_ADMIT_BATCH (8ULL << 20)
@@ -275,6 +289,9 @@ static struct {
 	uint64_t admit_reserve_legacy;
 	uint64_t admit_reserve_weak;
 	uint64_t admit_refreshed;
+	uint64_t admit_cached_parity;
+	/* Pending reserve changes form a suffix of the catalog dirty list. */
+	engine_owner_t *admit_first;
 	uint64_t admit_growth_peak;
 	uint64_t admit_space_rejections;
 	uint64_t admit_restarts;
@@ -296,6 +313,18 @@ static struct {
 	uint64_t gate_prints;
 } engine;
 
+static void
+engine_owner_unlist(engine_owner_t *e)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	if (list_link_active(&e->dirty_node)) {
+		if (engine.admit_first == e)
+			engine.admit_first = list_next(&engine.dirty, e);
+		list_remove(&engine.dirty, e);
+	}
+	e->admit_dirty = B_FALSE;
+}
+
 /*
  * The owner's catalog rows may no longer match the stored tree.  Every
  * change to a field a row carries, to the version list, or to what decides
@@ -307,8 +336,12 @@ engine_owner_dirty(engine_owner_t *e)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
 	e->dirty_seq = ++engine.dirty_next;
-	if (!list_link_active(&e->dirty_node))
-		list_insert_tail(&engine.dirty, e);
+	/* Keep reserve changes behind the already processed prefix. */
+	engine_owner_unlist(e);
+	list_insert_tail(&engine.dirty, e);
+	e->admit_dirty = B_TRUE;
+	if (engine.admit_first == NULL)
+		engine.admit_first = e;
 }
 
 /*
@@ -329,8 +362,8 @@ static void
 engine_owner_gone(engine_owner_t *e)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
-	if (list_link_active(&e->dirty_node))
-		list_remove(&engine.dirty, e);
+	engine_admit_owner_forget(e);
+	engine_owner_unlist(e);
 	if (engine.gone_count == engine.gone_capacity) {
 		uint_t cap = MAX(64, engine.gone_capacity * 2);
 		uint64_t *gone = pr19262_zalloc(cap * 2 * sizeof (uint64_t),
@@ -719,6 +752,7 @@ pr19262_engine_start(spa_t *spa)
 	engine.spa = spa;
 	engine.admit_batch = ENGINE_ADMIT_BATCH;
 	engine.admit_refreshed = UINT64_MAX;
+	engine.admit_cached_parity = UINT64_MAX;
 	/* The strongest layout present is the default conversion target. */
 	vdev_raidz_layout_for_birth(vd, spa_last_synced_txg(spa) + 1, NULL,
 	    &engine.admit_parity);

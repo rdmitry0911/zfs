@@ -20,19 +20,33 @@
 #define	ENGINE_ADMIT_SEGMENT_FRAMES \
 	(ENGINE_JOURNAL_BYTES / ENGINE_STORE_PAGE - 3)
 
+static boolean_t
+engine_admit_checking(void)
+{
+	if (ENGINE_MIRROR) {
+		const char *env = pr19262_env("PR19262_ADMIT_VERIFY");
+		return (env == NULL || strcmp(env, "0") != 0);
+	}
+	return (zfs_pr19262_store_verify != 0);
+}
+
 static uint64_t
 engine_admit_free_pages(void)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
-	uint64_t free = 0;
-	for (engine_marena_t *a = engine_pages.arenas; a != NULL;
-	    a = a->next) {
-		if (a->pending)
-			continue;
-		for (uint64_t i = 0; i < a->pages; i++)
-			free += engine_pages.bits[a->first + i] == 0;
+	if (engine_admit_checking()) {
+		uint64_t free = 0;
+		for (engine_marena_t *a = engine_pages.arenas; a != NULL;
+		    a = a->next) {
+			if (a->pending)
+				continue;
+			for (uint64_t i = 0; i < a->pages; i++)
+				free += engine_pages.bits[a->first + i] == 0;
+		}
+		ENGINE_STORE_CHECK(free == engine_pages.available);
+		atomic_inc_64(&engine_admit_cost.pages_checked);
 	}
-	return (free);
+	return (engine_pages.available);
 }
 
 static uint64_t
@@ -90,38 +104,101 @@ engine_admit_frames_total(void)
  * than the planned parity, a worst case for legacy space whose block sizes
  * are unknown until classified, and one converter batch.
  */
+static uint64_t
+engine_admit_owner_growth(const engine_owner_t *e, boolean_t *weak)
+{
+	vdev_t *vd = engine.vd;
+	engine_version_t *b = e->cur;
+	*weak = engine.admit_parity != 0 && b != NULL && !e->retired &&
+	    !e->aborted && b->parity < engine.admit_parity;
+	if (!*weak)
+		return (0);
+	uint64_t psize = vdev_asize_to_psize_txg(vd, b->size, b->birth);
+	uint64_t stronger = pr19262_vdev_asize_for_parity(vd, psize,
+	    b->width, engine.admit_parity);
+	return (stronger > b->size ? stronger - b->size : 0);
+}
+
+static void
+engine_admit_owner_forget(engine_owner_t *e)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	if (engine.admit_cached_parity == engine.admit_parity) {
+		VERIFY3U(engine.admit_reserve_growth, >=, e->admit_growth);
+		VERIFY3U(engine.admit_reserve_weak, >=, e->admit_weak);
+		engine.admit_reserve_growth -= e->admit_growth;
+		engine.admit_reserve_weak -= e->admit_weak;
+	}
+	e->admit_growth = 0;
+	e->admit_weak = B_FALSE;
+	engine.admit_refreshed = UINT64_MAX;
+}
+
+/* Refresh before a catalog-settled owner leaves the shared dirty queue. */
+static void
+engine_admit_owner_update(engine_owner_t *e)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	if (!e->admit_dirty ||
+	    engine.admit_cached_parity != engine.admit_parity)
+		return;
+	engine_admit_owner_forget(e);
+	boolean_t weak;
+	e->admit_growth = engine_admit_owner_growth(e, &weak);
+	e->admit_weak = weak;
+	e->admit_dirty = B_FALSE;
+	engine.admit_reserve_growth += e->admit_growth;
+	engine.admit_reserve_weak += e->admit_weak;
+	engine.admit_refreshed = UINT64_MAX;
+	atomic_inc_64(&engine_admit_cost.updates);
+}
+
 static void
 engine_admit_refresh(void)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
 	if (engine.admit_refreshed == engine.revision &&
-	    engine.admit_reserve != 0)
+	    engine.admit_first == NULL && engine.admit_reserve != 0 &&
+	    engine.admit_cached_parity == engine.admit_parity)
 		return;
-	vdev_t *vd = engine.vd;
-	uint64_t growth = 0, weak = 0;
-	if (engine.admit_parity != 0) {
+	if (engine.admit_cached_parity != engine.admit_parity) {
+		engine.admit_reserve_growth = engine.admit_reserve_weak = 0;
+		engine.admit_cached_parity = engine.admit_parity;
+		atomic_inc_64(&engine_admit_cost.rebuilds);
 		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
 		    e = AVL_NEXT(&engine.owners, e)) {
-			engine_version_t *b = e->cur;
-			if (b == NULL || e->retired || e->aborted ||
-			    b->parity >= engine.admit_parity)
-				continue;
-			uint64_t psize = vdev_asize_to_psize_txg(vd, b->size,
-			    b->birth);
-			uint64_t stronger = pr19262_vdev_asize_for_parity(vd,
-			    psize, b->width, engine.admit_parity);
-			if (stronger > b->size)
-				growth += stronger - b->size;
-			weak++;
+			e->admit_growth = e->admit_weak = 0;
+			e->admit_dirty = B_TRUE;
+			engine_admit_owner_update(e);
+			atomic_inc_64(&engine_admit_cost.rebuilt);
 		}
+	} else {
+		for (engine_owner_t *e = engine.admit_first; e != NULL;
+		    e = list_next(&engine.dirty, e)) {
+			engine_admit_owner_update(e);
+			atomic_inc_64(&engine_admit_cost.walked);
+		}
+	}
+	engine.admit_first = NULL;
+	if (engine_admit_checking()) {
+		uint64_t growth = 0, weak = 0;
+		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
+		    e = AVL_NEXT(&engine.owners, e)) {
+			boolean_t w;
+			growth += engine_admit_owner_growth(e, &w);
+			weak += w;
+			ENGINE_STORE_CHECK(!e->admit_dirty);
+		}
+		ENGINE_STORE_CHECK(growth == engine.admit_reserve_growth);
+		ENGINE_STORE_CHECK(weak == engine.admit_reserve_weak);
+		atomic_inc_64(&engine_admit_cost.checked);
 	}
 	uint64_t legacy = engine.admit_parity == 0 ? 0 :
 	    zfs_range_tree_space(engine.legacy) *
 	    ENGINE_ADMIT_LEGACY_GROWTH_PCT / 100;
-	engine.admit_reserve_growth = growth;
 	engine.admit_reserve_legacy = legacy;
-	engine.admit_reserve_weak = weak;
-	engine.admit_reserve = growth + legacy + engine.admit_batch;
+	engine.admit_reserve = engine.admit_reserve_growth + legacy +
+	    engine.admit_batch;
 	engine.admit_refreshed = engine.revision;
 }
 
@@ -380,6 +457,17 @@ pr19262_engine_admit_report(spa_t *spa, const char *label,
 	    (u_longlong_t)out->classes[2].peak_j,
 	    (u_longlong_t)out->restarts, (u_longlong_t)out->fence_requests,
 	    (u_longlong_t)out->fence_auto, (u_longlong_t)out->fence_waits);
+	pr19262_printf("PR19262_ADMIT_CACHE label=%s rebuilds=%llu "
+	    "rebuilt=%llu walked=%llu updates=%llu checked=%llu "
+	    "pages_checked=%llu verify=%u owner_size=%llu version_size=%llu\n",
+	    label, (u_longlong_t)atomic_load_64(&engine_admit_cost.rebuilds),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.rebuilt),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.walked),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.updates),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.checked),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.pages_checked),
+	    engine_admit_checking(), (u_longlong_t)sizeof (engine_owner_t),
+	    (u_longlong_t)sizeof (engine_version_t));
 	pr19262_flush();
 }
 

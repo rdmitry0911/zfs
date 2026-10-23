@@ -124,6 +124,8 @@ static struct {
 	engine_mnode_t **cache;
 	uint8_t *bits;
 	uint64_t capacity;
+	/* Only ACTIVE arenas contribute to admission's free-page budget. */
+	uint64_t available;
 	/*
 	 * Every page below it is allocated: a single free lowers it, a bulk
 	 * change of the bits resets it to 0.
@@ -213,6 +215,9 @@ engine_pages_add_arena(uint64_t p, uint64_t pages, const uint8_t *init,
 	engine_pages.bits = bits;
 	engine_pages.capacity = count;
 	engine_pages.free_hint = 0;
+	if (!pending)
+		for (uint64_t i = old; i < count; i++)
+			engine_pages.available += bits[i] == 0;
 	mutex_exit(&engine.lock);
 	if (old != 0) {
 		kmem_free(old_cache, old * sizeof (*cache));
@@ -228,6 +233,20 @@ engine_pages_init(void)
 		return;
 	VERIFY0(engine_pages_add_arena(engine.arena, ENGINE_STORE_PAGES,
 	    engine.bitmap, B_FALSE));
+}
+
+	/* Bootstrap restore only; live mutations maintain the count. */
+static void
+engine_pages_recount_free(void)
+{
+	uint64_t available = 0;
+	for (engine_marena_t *a = engine_pages.arenas; a != NULL; a = a->next) {
+		if (a->pending)
+			continue;
+		for (uint64_t i = 0; i < a->pages; i++)
+			available += engine_pages.bits[a->first + i] == 0;
+	}
+	engine_pages.available = available;
 }
 
 static void
@@ -478,6 +497,8 @@ engine_mnew(engine_mbatch_t *b, uint64_t type, uint64_t level,
 		return (engine_mnew(b, type, level, result));
 	}
 	engine_pages.bits[index] = 1;
+	VERIFY3U(engine_pages.available, >, 0);
+	engine_pages.available--;
 	engine_pages.free_hint = index + 1;
 	if (index < ENGINE_STORE_PAGES)
 		engine.bitmap[index] = 1;
@@ -771,6 +792,7 @@ engine_mrelease(engine_mbatch_t *b, engine_mnode_t *n)
 	VERIFY3P(engine_pages.cache[index], ==, n);
 	mutex_enter(&engine.lock);
 	engine_pages.bits[index] = 0;
+	engine_pages.available++;
 	engine_pages.free_hint = MIN(engine_pages.free_hint, index);
 	if (index < ENGINE_STORE_PAGES)
 		engine.bitmap[index] = 0;
@@ -1846,6 +1868,7 @@ engine_pages_gc(spa_t *spa, uint64_t *freed)
 			if (!engine_pages.bits[i] || m.marked[i])
 				continue;
 			engine_pages.bits[i] = 0;
+			engine_pages.available++;
 			engine_pages.free_hint = MIN(engine_pages.free_hint, i);
 			if (i < ENGINE_STORE_PAGES)
 				engine.bitmap[i] = 0;
@@ -2241,7 +2264,11 @@ engine_pages_finish(spa_t *spa, engine_marena_t *a, uint64_t generation)
 	/* Every ACTIVE carrier is durable before the RAM handoff. */
 	engine_pages.directory = a->candidate;
 	memset(engine_pages.pending, 0, sizeof (engine_pages.pending));
+	mutex_enter(&engine.lock);
 	a->pending = B_FALSE;
+	for (uint64_t i = 0; i < a->pages; i++)
+		engine_pages.available += engine_pages.bits[a->first + i] == 0;
+	mutex_exit(&engine.lock);
 	engine_pages_fault(14, generation, 0, a->p);
 	pr19262_printf("PR19262_M_GROW p=%llu pages=%llu capacity=%llu "
 	    "generation=%llu serial=%llu\n", (u_longlong_t)a->p,
@@ -2580,7 +2607,10 @@ engine_pages_slots_witness(spa_t *spa)
 	VERIFY3U(a->p, !=, engine.arena);
 	VERIFY0(engine_pages.bits[a->first + 3]);
 	/* A reserved, unwritten page is enough to test the durable masks. */
+	mutex_enter(&engine.lock);
 	engine_pages.bits[a->first + 3] = 1;
+	engine_pages.available--;
+	mutex_exit(&engine.lock);
 	VERIFY0(engine_pages_reserve(spa, b.generation));
 	VERIFY0(engine_pages_reserve(spa, b.generation));
 	uint64_t local = a->serial, global = engine_pages.serial;
@@ -2590,8 +2620,11 @@ engine_pages_slots_witness(spa_t *spa)
 	VERIFY3U(a->serial, ==, local);
 	VERIFY3U(engine_pages.serial, ==, global + 4);
 	VERIFY3U(engine_slot_cost.skipped, >=, skipped + 4);
+	mutex_enter(&engine.lock);
 	engine_pages.bits[a->first + 3] = 0;
+	engine_pages.available++;
 	engine_pages.free_hint = 0;
+	mutex_exit(&engine.lock);
 	boolean_t relaxed = engine_pages.gc_relaxed;
 	engine_pages.gc_relaxed = B_TRUE;
 	uint8_t *disk = kmem_zalloc(a->pages, KM_SLEEP);
@@ -3858,6 +3891,7 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 			memcpy(engine_pages.bits, reserved,
 			    engine_pages.capacity);
 			engine_pages.free_hint = 0;
+			engine_pages_recount_free();
 			fnvlist_add_uint64(nv, "page-reservation-generation",
 			    latest);
 		}
@@ -3925,6 +3959,7 @@ engine_pages_install(nvlist_t *nv)
 	engine_pages_tree_clear();
 	memcpy(engine_pages.bits, engine.bitmap, ENGINE_STORE_PAGES);
 	engine_pages.free_hint = 0;
+	engine_pages_recount_free();
 	memcpy(&engine_pages.root, tree, sizeof (engine_pages.root));
 	engine_pages.generation = generation;
 	uint64_t reserved;

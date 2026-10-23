@@ -516,8 +516,11 @@ engine_dirty_settle(const engine_dirty_snap_t *s)
 			continue;
 		engine_owner_t *e = engine_find(k[0]);
 		if (e != NULL && e->incarnation == k[1] &&
-		    e->dirty_seq == k[2] && list_link_active(&e->dirty_node))
-			list_remove(&engine.dirty, e);
+		    e->dirty_seq == k[2] && list_link_active(&e->dirty_node)) {
+			/* Settle its reserve before removing it. */
+			engine_admit_owner_update(e);
+			engine_owner_unlist(e);
+		}
 	}
 	VERIFY3U(engine.gone_count, >=, s->gone);
 	memmove(engine.gone, engine.gone + 2 * s->gone,
@@ -966,8 +969,7 @@ engine_store_clear(void)
 			e->versions = b->next;
 			kmem_free(b, sizeof (*b));
 		}
-		if (list_link_active(&e->dirty_node))
-			list_remove(&engine.dirty, e);
+		engine_owner_unlist(e);
 		avl_remove(&engine.owners, e);
 		kmem_free(e, sizeof (*e));
 	}
@@ -1046,6 +1048,8 @@ engine_store_clear(void)
 	engine.admit_space_rejections = 0;
 	engine.admit_batch = ENGINE_ADMIT_BATCH;
 	engine.admit_refreshed = UINT64_MAX;
+	engine.admit_cached_parity = UINT64_MAX;
+	engine.admit_first = NULL;
 	VERIFY(!engine.fence_pending);
 	engine.fence_quiesced = engine.fence_stalled = B_FALSE;
 	engine.fence_error = 0;
@@ -1612,6 +1616,7 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 		engine.certified = engine_pages.certified;
 		engine.admit_batch = ENGINE_ADMIT_BATCH;
 		engine.admit_refreshed = UINT64_MAX;
+		engine.admit_cached_parity = UINT64_MAX;
 		vdev_raidz_layout_for_birth(vd, ub->ub_txg + 1, NULL,
 		    &engine.admit_parity);
 		/* Open native space maps even for a read-only SPA. */

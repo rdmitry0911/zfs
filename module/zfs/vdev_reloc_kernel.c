@@ -277,7 +277,10 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    "j_bind_flush_ms=%llu j_head_calls=%llu j_head_write_ms=%llu "
 	    "j_head_flush_ms=%llu j_forward_calls=%llu "
 	    "j_forward_write_ms=%llu j_forward_flush_ms=%llu "
-	    "j_rolls=%llu j_roll_ms=%llu j_lock_ms=%llu j_seal_ms=%llu\n",
+	    "j_rolls=%llu j_roll_ms=%llu j_lock_ms=%llu j_seal_ms=%llu "
+	    "admit_rebuilds=%llu admit_rebuilt=%llu admit_walked=%llu "
+	    "admit_updates=%llu admit_checked=%llu pages_checked=%llu "
+	    "owner_size=%llu version_size=%llu pages_available=%llu\n",
 	    state, pool,
 	    active, (u_longlong_t)parity, (u_longlong_t)c.owners,
 	    (u_longlong_t)c.legacy_bytes, (u_longlong_t)c.weak_current,
@@ -328,7 +331,16 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    (u_longlong_t)atomic_load_64(&engine_journal_cost.rolls),
 	    ENGINE_COST_MS(engine_journal_cost.roll),
 	    ENGINE_COST_MS(engine_journal_cost.lock),
-	    ENGINE_COST_MS(engine_journal_cost.seal));
+	    ENGINE_COST_MS(engine_journal_cost.seal),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.rebuilds),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.rebuilt),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.walked),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.updates),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.checked),
+	    (u_longlong_t)atomic_load_64(&engine_admit_cost.pages_checked),
+	    (u_longlong_t)sizeof (engine_owner_t),
+	    (u_longlong_t)sizeof (engine_version_t),
+	    (u_longlong_t)engine_pages.available);
 #undef ENGINE_COST_MS
 	return (n);
 }
