@@ -15365,9 +15365,11 @@ typedef struct pr19262_dedup_walk {
 } pr19262_dedup_walk_t;
 
 /* Where the DDT keeps the shared block's entry, and with how many refs. */
-static void
+static uint64_t
 pr19262_dedup_probe(spa_t *spa, const blkptr_t *bp, uint_t round)
 {
+	/* A stored lookup updates histograms using the vdev deflate ratio. */
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
 	ddt_t *ddt = spa->spa_ddt[BP_GET_CHECKSUM(bp)];
 	ddt_key_t key;
 	ddt_key_fill(&key, bp);
@@ -15400,6 +15402,18 @@ pr19262_dedup_probe(spa_t *spa, const blkptr_t *bp, uint_t round)
 	    (u_longlong_t)spa->spa_dedup_table_quota,
 	    (u_longlong_t)ddt_get_ddt_dsize(spa), (int)BP_GET_DEDUP(bp),
 	    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(bp));
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+	return (found_refs);
+}
+
+static void
+pr19262_dedup_expect_refs(spa_t *spa, const blkptr_t *bp,
+    const char *label, uint64_t expected)
+{
+	uint64_t refs = pr19262_dedup_probe(spa, bp, 0);
+	(void) printf("PR19262_DEDUP_REFS phase=%s refs=%llu expected=%llu\n",
+	    label, (u_longlong_t)refs, (u_longlong_t)expected);
+	VERIFY3U(refs, ==, expected);
 }
 
 /* Count the blocks of the DDT objects by the vdev of their first DVA. */
@@ -15636,6 +15650,43 @@ pr19262_classes_free(objset_t *os, uint64_t object, uint64_t offset,
 	dmu_tx_commit(tx);
 }
 
+/* The old two salts produced equal untagged blocks at different indices. */
+static void
+pr19262_dedup_alias_control(objset_t *os)
+{
+	spa_t *spa = dmu_objset_spa(os);
+	uint64_t object[4];
+	void *payload = kmem_alloc(PR19262_LIVE_BLOCK, KM_SLEEP);
+	uint8_t c = pr19262_live_pattern(1) ^ 0x3d;
+	uint8_t a = pr19262_live_pattern(2) ^ 0x3c;
+	VERIFY3U(c, ==, a);
+	for (uint_t i = 0; i < 4; i++) {
+		object[i] = pr19262_classes_object(os, PR19262_LIVE_BLOCK);
+		dmu_tx_t *tx = pr19262_classes_assign(os, object[i], 0,
+		    PR19262_LIVE_BLOCK, B_FALSE);
+		memset(payload, i < 2 ? c : a, PR19262_LIVE_BLOCK);
+		dmu_write(os, object[i], 0, PR19262_LIVE_BLOCK, payload, tx, 0);
+		dmu_tx_commit(tx);
+	}
+	kmem_free(payload, PR19262_LIVE_BLOCK);
+	ztest_pe_settle(spa);
+	blkptr_t bp;
+	size_t nbps = 1;
+	VERIFY0(dmu_read_l0_bps(os, object[0], 0, PR19262_LIVE_BLOCK,
+	    &bp, &nbps));
+	VERIFY3U(nbps, ==, 1);
+	VERIFY(BP_GET_DEDUP(&bp));
+	pr19262_dedup_expect_refs(spa, &bp, "old-four", 4);
+	for (uint_t i = 0; i < 2; i++)
+		pr19262_classes_free(os, object[i], 0, PR19262_LIVE_BLOCK);
+	ztest_pe_settle(spa);
+	pr19262_dedup_expect_refs(spa, &bp, "old-pair-freed", 2);
+	for (uint_t i = 2; i < 4; i++)
+		pr19262_classes_free(os, object[i], 0, PR19262_LIVE_BLOCK);
+	ztest_pe_settle(spa);
+	pr19262_dedup_expect_refs(spa, &bp, "old-last-freed", 0);
+}
+
 /* Top-level vdev of DVA 0 for every L0 block; blocks spanning two vdevs. */
 static void
 pr19262_classes_placement(spa_t *spa, objset_t *os, uint64_t object,
@@ -15727,6 +15778,8 @@ pr19262_classes_prepare(spa_t *spa)
 	pr19262_classes_fill(os, b, PR19262_LIVE_BLOCK, 0,
 	    PR19262_DEDUP_BLOCKS, 0x3c);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
+	if (getenv("PR19262_DEDUP_ALIAS_CONTROL") != NULL)
+		pr19262_dedup_alias_control(os);
 	/*
 	 * The shared block watched for retirement must live on the target
 	 * vdev, but the allocator may place blocks on the native RAIDZ of a
@@ -15907,6 +15960,8 @@ pr19262_classes_verify(spa_t *spa, boolean_t readonly, boolean_t live)
 		pr19262_engine_inspect(spa, &pr19262_classes.dedup_bp, 0,
 		    &before);
 		VERIFY(!before.retired);
+		pr19262_dedup_expect_refs(spa, &pr19262_classes.dedup_bp,
+		    "tagged-before", 2);
 		uint64_t offset = pr19262_classes.dedup_block *
 		    PR19262_LIVE_BLOCK;
 		pr19262_classes_free(os, pr19262_classes.dedup_d, offset,
@@ -15916,6 +15971,8 @@ pr19262_classes_verify(spa_t *spa, boolean_t readonly, boolean_t live)
 		    &kept);
 		VERIFY(!kept.retired);
 		VERIFY3U(kept.incarnation, ==, before.incarnation);
+		pr19262_dedup_expect_refs(spa, &pr19262_classes.dedup_bp,
+		    "tagged-kept", 1);
 		pr19262_classes_expect(os, pr19262_classes.dedup_c,
 		    PR19262_LIVE_BLOCK, pr19262_classes.dedup_block, 1, 0x3d);
 		pr19262_classes_free(os, pr19262_classes.dedup_c, offset,
@@ -15955,6 +16012,8 @@ pr19262_classes_verify(spa_t *spa, boolean_t readonly, boolean_t live)
 			}
 		} while (++rounds < 64);
 		VERIFY(last.retired);
+		pr19262_dedup_expect_refs(spa, &pr19262_classes.dedup_bp,
+		    "tagged-retired", 0);
 		(void) printf("PR19262_DEDUP phase=freed shared_kept=%u "
 		    "last_retired=%u incarnation=%llu ratio=%llu rounds=%u "
 		    "forced=%u\n",
