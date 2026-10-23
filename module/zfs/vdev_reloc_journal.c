@@ -139,7 +139,7 @@ engine_journal_write_pages(spa_t *spa, const engine_member_page_t *pv,
 	uint_t children = engine.vd->vdev_children;
 	int *errors = kmem_alloc(children * sizeof (int), KM_SLEEP);
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
-	engine_members_write(spa, pv, n, B_TRUE, B_FALSE, errors);
+	engine_members_write(spa, pv, n, B_TRUE, B_FALSE, errors, NULL);
 	spa_config_exit(spa, SCL_ZIO, FTAG);
 	for (uint_t c = 0; c < children; c++)
 		engine_quorum_add(&q, errors[c]);

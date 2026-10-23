@@ -2999,6 +2999,8 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 {
 	ASSERT(MUTEX_HELD(&engine.store_lock));
 	VERIFY(full == NULL || !snap->all);
+	engine_store_cost_t cost = { 0 };
+	hrtime_t start = gethrtime(), reserving = start, reserved = start;
 	engine_pages_init();
 	int error = 0;
 	if (engine_pages.pending[1] != 0)
@@ -3162,6 +3164,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			next = engine_mreference(blobs[i]);
 		}
 		root = next;
+		reserving = gethrtime();
 		/* Independent of BIND errors; reserve before any page write. */
 		error = engine_pages_reserve(spa, b->generation);
 		/* Fence both legacy control slots before codec7 page writes. */
@@ -3169,6 +3172,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			error = engine_pages_reserve(spa, b->generation);
 		if (error == 0)
 			engine_pages_fault(2, b->generation, 0, UINT64_MAX);
+		reserved = gethrtime();
 	}
 	/*
 	 * Without a page-cut hook, every member writes all dirty pages and
@@ -3201,7 +3205,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			    KM_SLEEP);
 			spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 			engine_members_write(spa, pv, n, B_TRUE, B_TRUE,
-			    errors);
+			    errors, &cost);
 			spa_config_exit(spa, SCL_ZIO, FTAG);
 			for (uint_t c = 0; c < children; c++)
 				engine_quorum_add(&q, errors[c]);
@@ -3290,17 +3294,30 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			allocated += engine_pages.bits[i] != 0;
 			cached += engine_pages.cache[i] != NULL;
 		}
+		engine_store_cost.stores++;
+		engine_store_cost.pages += b->pages;
+		engine_store_cost.runs += cost.runs;
+		engine_store_cost.tree += reserving - start;
+		engine_store_cost.reserve += reserved - reserving;
+		engine_store_cost.write += cost.write;
+		engine_store_cost.flush += cost.flush;
 		pr19262_printf("PR19262_PAGED_SYNC txg=%llu newpages=%u "
 		    "changes=%u deletes=%u tombstones=%u expired=%u rows=%u "
 		    "root=%llu generation=%llu levels=%llu allocated=%llu "
 		    "cached=%llu joins=%u dirty=%u all=%u evicted=%u "
-		    "prefetched=%u\n",
+		    "prefetched=%u runs=%llu tree_us=%llu reserve_us=%llu "
+		    "write_us=%llu flush_us=%llu\n",
 		    (u_longlong_t)ub->ub_txg, b->pages, b->changes, b->deletes,
 		    b->tombstones, expired, (uint_t)live, (u_longlong_t)root.p,
 		    (u_longlong_t)b->generation,
 		    (u_longlong_t)engine_pages.levels, (u_longlong_t)allocated,
 		    (u_longlong_t)cached, b->joins, snap->count,
-		    (uint_t)snap->all, evicted, prefetched);
+		    (uint_t)snap->all, evicted, prefetched,
+		    (u_longlong_t)cost.runs,
+		    (u_longlong_t)((reserving - start) / USEC2NSEC(1)),
+		    (u_longlong_t)((reserved - reserving) / USEC2NSEC(1)),
+		    (u_longlong_t)(cost.write / USEC2NSEC(1)),
+		    (u_longlong_t)(cost.flush / USEC2NSEC(1)));
 	}
 	if (expired_keys != NULL)
 		kmem_free(expired_keys, expired * 2 * sizeof (uint64_t));

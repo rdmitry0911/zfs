@@ -264,7 +264,9 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    "certified=%llu floor=%llu journal_segments=%llu pages=%llu "
 	    "copied=%llu passes=%llu error=%d versions=%llu "
 	    "store_checked=%llu store_check_failures=%llu "
-	    "pages_evicted=%llu\n", state, pool,
+	    "pages_evicted=%llu stores=%llu store_pages=%llu "
+	    "store_runs=%llu store_tree_ms=%llu store_reserve_ms=%llu "
+	    "store_write_ms=%llu store_flush_ms=%llu\n", state, pool,
 	    active, (u_longlong_t)parity, (u_longlong_t)c.owners,
 	    (u_longlong_t)c.legacy_bytes, (u_longlong_t)c.weak_current,
 	    (u_longlong_t)c.retired_bytes, (u_longlong_t)c.certified,
@@ -274,7 +276,14 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    (u_longlong_t)(c.current_versions + c.retired_versions),
 	    (u_longlong_t)engine_store_checked,
 	    (u_longlong_t)engine_store_check_failures,
-	    (u_longlong_t)engine_pages_evicted);
+	    (u_longlong_t)engine_pages_evicted,
+	    (u_longlong_t)engine_store_cost.stores,
+	    (u_longlong_t)engine_store_cost.pages,
+	    (u_longlong_t)engine_store_cost.runs,
+	    (u_longlong_t)(engine_store_cost.tree / MSEC2NSEC(1)),
+	    (u_longlong_t)(engine_store_cost.reserve / MSEC2NSEC(1)),
+	    (u_longlong_t)(engine_store_cost.write / MSEC2NSEC(1)),
+	    (u_longlong_t)(engine_store_cost.flush / MSEC2NSEC(1)));
 	return (n);
 }
 

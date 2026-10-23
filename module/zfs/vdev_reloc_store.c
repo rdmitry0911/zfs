@@ -284,6 +284,22 @@ engine_member_runs(const engine_member_page_t *pv, uint_t n,
 }
 
 /*
+ * Where the catalog stores spend their time, summed over every stored
+ * root (the kernel status line reports it).
+ */
+typedef struct engine_store_cost {
+	uint64_t stores;
+	uint64_t pages;
+	uint64_t runs;
+	hrtime_t tree;
+	hrtime_t reserve;
+	hrtime_t write;
+	hrtime_t flush;
+} engine_store_cost_t;
+
+static engine_store_cost_t engine_store_cost;
+
+/*
  * One raw step on every member of the engine's vdev at once: every
  * member's page writes are issued before any is waited for, then every
  * member's flush.  The serial form wrote and flushed one member after
@@ -292,12 +308,15 @@ engine_member_runs(const engine_member_page_t *pv, uint_t n,
  * after its writes completed, and the call returns after every flush.
  * errors[c] receives each member's result for the caller's quorum; a
  * member whose writes failed is flushed only when flush_failed is set.
- * No pages: only the flushes.  The caller holds SCL_ZIO.
+ * No pages: only the flushes.  The caller holds SCL_ZIO.  cost, when
+ * set, receives the runs and the time of the writes and of the flushes.
  */
 static void
 engine_members_write(spa_t *spa, const engine_member_page_t *pv,
-    uint_t n, boolean_t flush, boolean_t flush_failed, int *errors)
+    uint_t n, boolean_t flush, boolean_t flush_failed, int *errors,
+    engine_store_cost_t *cost)
 {
+	hrtime_t start = gethrtime();
 	uint_t children = engine.vd->vdev_children;
 	zio_t **root = kmem_zalloc(children * sizeof (zio_t *), KM_SLEEP);
 	engine_member_run_t *runs = pr19262_zalloc(MAX(1, n) * sizeof (*runs),
@@ -329,6 +348,7 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
 		if (runs[i].owned)
 			abd_free(runs[i].abd);
 	kmem_free(runs, MAX(1, n) * sizeof (*runs));
+	hrtime_t written = gethrtime();
 	if (flush) {
 		for (uint_t c = 0; c < children; c++) {
 			if (errors[c] != 0 && !flush_failed)
@@ -344,6 +364,11 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
 		}
 	}
 	kmem_free(root, children * sizeof (zio_t *));
+	if (cost != NULL) {
+		cost->runs += nr;
+		cost->write += written - start;
+		cost->flush += gethrtime() - written;
+	}
 }
 
 /* Flush every member at once and count the results in q. */
@@ -352,7 +377,7 @@ engine_members_flush(spa_t *spa, engine_quorum_t *q)
 {
 	uint_t children = engine.vd->vdev_children;
 	int *errors = kmem_alloc(children * sizeof (int), KM_SLEEP);
-	engine_members_write(spa, NULL, 0, B_TRUE, B_TRUE, errors);
+	engine_members_write(spa, NULL, 0, B_TRUE, B_TRUE, errors, NULL);
 	for (uint_t c = 0; c < children; c++)
 		engine_quorum_add(q, errors[c]);
 	kmem_free(errors, children * sizeof (int));
