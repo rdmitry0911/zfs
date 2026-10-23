@@ -520,19 +520,59 @@ engine_mleaf_set(engine_mnode_t *n, const engine_mrow_t *rows, uint_t count)
 	memcpy(h->high, rows[count - 1].key, sizeof (h->high));
 }
 
+/* A page whose low key a branch rebuild knows without reading it. */
+typedef struct engine_mlow {
+	uint64_t p;
+	uint64_t low[4];
+} engine_mlow_t;
+
+static void
+engine_mlow_add(engine_mlow_t *known, uint_t *n, uint64_t p,
+    engine_mnode_t *node)
+{
+	known[*n].p = p;
+	memcpy(known[*n].low, engine_mheader(node)->low,
+	    sizeof (known[*n].low));
+	(*n)++;
+}
+
+/*
+ * A branch's low key is its first child's, exact (import checks it).  A
+ * rebuild knows it for the children it changed (in memory) and for the
+ * old first child (the old branch's low); only another first child, after
+ * a split or a removal, is read.  Debug ztest reads it always and checks.
+ */
 static int
 engine_mbranch_set(engine_mbatch_t *b, engine_mnode_t *n,
-    const engine_mchild_t *children, uint_t count)
+    const engine_mchild_t *children, uint_t count,
+    const engine_mlow_t *known, uint_t nknown)
 {
-	engine_mnode_t *first;
-	int error = engine_mget(b, &children[0].ref, &first);
-	if (error != 0)
-		return (error);
+	uint64_t low[4];
+	const uint64_t *found = NULL;
+	for (uint_t i = 0; found == NULL && i < nknown; i++)
+		if (known[i].p == children[0].ref.p)
+			found = known[i].low;
+#if defined(ZFS_DEBUG) && !defined(_KERNEL)
+	boolean_t check = B_TRUE;
+#else
+	boolean_t check = B_FALSE;
+#endif
+	if (found == NULL || check) {
+		engine_mnode_t *first;
+		int error = engine_mget(b, &children[0].ref, &first);
+		if (error != 0)
+			return (error);
+		if (found != NULL)
+			VERIFY0(memcmp(found, engine_mheader(first)->low,
+			    sizeof (low)));
+		found = engine_mheader(first)->low;
+	}
+	memcpy(low, found, sizeof (low));
 	engine_mheader_t *h = engine_mheader(n);
 	memset(engine_mpayload(n), 0, ENGINE_M_PAYLOAD);
 	memcpy(engine_mpayload(n), children, count * sizeof (*children));
 	h->count = count;
-	memcpy(h->low, engine_mheader(first)->low, sizeof (h->low));
+	memcpy(h->low, low, sizeof (h->low));
 	memcpy(h->high, children[count - 1].high, sizeof (h->high));
 	return (0);
 }
@@ -599,12 +639,15 @@ engine_minsert(engine_mbatch_t *b, const engine_mref_t *root,
 	engine_mchild_t *copy = pr19262_alloc((count + 1) * sizeof (*copy),
 	    KM_SLEEP);
 	memcpy(copy, children, count * sizeof (*copy));
+	engine_mlow_t known[3];
+	uint_t nknown = 0;
 	engine_mnode_t *child_node;
 	error = engine_mget(b, &child.left, &child_node);
 	if (error == 0) {
 		copy[at].ref = child.left;
 		memcpy(copy[at].high, engine_mheader(child_node)->high,
 		    sizeof (copy[at].high));
+		engine_mlow_add(known, &nknown, child.left.p, child_node);
 	}
 	uint_t total = count;
 	if (error == 0 && child.right.p != UINT64_MAX) {
@@ -616,9 +659,15 @@ engine_minsert(engine_mbatch_t *b, const engine_mref_t *root,
 			memcpy(copy[at + 1].high,
 			    engine_mheader(child_node)->high,
 			    sizeof (copy[at + 1].high));
+			engine_mlow_add(known, &nknown, child.right.p,
+			    child_node);
 			total++;
 		}
 	}
+	/* The old first child: the old branch's low. */
+	known[nknown].p = children[0].ref.p;
+	memcpy(known[nknown].low, h->low, sizeof (known[nknown].low));
+	nknown++;
 	engine_mnode_t *left, *right = NULL;
 	if (error == 0)
 		error = engine_mcow(b, old, &left);
@@ -626,10 +675,11 @@ engine_minsert(engine_mbatch_t *b, const engine_mref_t *root,
 		error = engine_mnew(b, ENGINE_M_BRANCH, h->level, &right);
 	if (error == 0) {
 		uint_t half = right != NULL ? total / 2 : total;
-		error = engine_mbranch_set(b, left, copy, half);
+		error = engine_mbranch_set(b, left, copy, half, known,
+		    nknown);
 		if (error == 0 && right != NULL)
 			error = engine_mbranch_set(b, right, copy + half,
-			    total - half);
+			    total - half, known, nknown);
 		if (error == 0) {
 			change->left = engine_mreference(left);
 			if (right != NULL)
@@ -682,7 +732,11 @@ engine_mput(engine_mbatch_t *b, engine_mref_t *root,
 	    sizeof (children[0].high));
 	memcpy(children[1].high, engine_mheader(right)->high,
 	    sizeof (children[1].high));
-	error = engine_mbranch_set(b, branch, children, 2);
+	engine_mlow_t known[2];
+	uint_t nknown = 0;
+	engine_mlow_add(known, &nknown, change.left.p, left);
+	engine_mlow_add(known, &nknown, change.right.p, right);
+	error = engine_mbranch_set(b, branch, children, 2, known, nknown);
 	if (error == 0) {
 		*root = engine_mreference(branch);
 		b->changes++;
@@ -815,13 +869,15 @@ engine_mremove(engine_mbatch_t *b, const engine_mref_t *root,
 		return (error);
 	engine_mchild_t *copy = kmem_alloc(count * sizeof (*copy), KM_SLEEP);
 	memcpy(copy, children, count * sizeof (*copy));
+	engine_mlow_t known[2];
+	uint_t nknown = 0;
+	engine_mnode_t *child_node = NULL;
 	uint_t total = count;
 	if (child.left.p == UINT64_MAX) {
 		memmove(copy + at, copy + at + 1,
 		    (count - at - 1) * sizeof (*copy));
 		total--;
 	} else {
-		engine_mnode_t *child_node;
 		error = engine_mget(b, &child.left, &child_node);
 		if (error == 0) {
 			copy[at].ref = child.left;
@@ -831,6 +887,12 @@ engine_mremove(engine_mbatch_t *b, const engine_mref_t *root,
 		if (error == 0 && h->level == 1 && total > 1)
 			error = engine_mjoin(b, copy, &total, at, child_node);
 	}
+	/* After any join: the changed child's low, then the old first's. */
+	if (error == 0 && child_node != NULL)
+		engine_mlow_add(known, &nknown, child.left.p, child_node);
+	known[nknown].p = children[0].ref.p;
+	memcpy(known[nknown].low, h->low, sizeof (known[nknown].low));
+	nknown++;
 	if (error == 0 && total == 0) {
 		change->left.p = UINT64_MAX;
 		change->changed = B_TRUE;
@@ -839,7 +901,8 @@ engine_mremove(engine_mbatch_t *b, const engine_mref_t *root,
 		engine_mnode_t *left;
 		error = engine_mcow(b, old, &left);
 		if (error == 0)
-			error = engine_mbranch_set(b, left, copy, total);
+			error = engine_mbranch_set(b, left, copy, total, known,
+			    nknown);
 		if (error == 0) {
 			change->left = engine_mreference(left);
 			change->changed = B_TRUE;
