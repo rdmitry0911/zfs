@@ -191,6 +191,98 @@ engine_member_error(int *member, int error)
 		*member = error;
 }
 
+/* Pages per merged write: 256 KiB. */
+#define	ENGINE_MEMBER_RUN	64
+
+typedef struct engine_member_run {
+	uint64_t arena;
+	uint64_t page;
+	uint64_t pages;
+	abd_t *abd;
+	boolean_t owned;
+} engine_member_run_t;
+
+static int
+engine_member_order(const void *a, const void *b)
+{
+	const uint64_t *x = a, *y = b;
+	for (int i = 0; i < 2; i++)
+		if (x[i] != y[i])
+			return (x[i] < y[i] ? -1 : 1);
+	return (0);
+}
+
+/*
+ * Would a raw write of these bytes at this member offset (below the
+ * labels) be the engine's own, as pr19262_engine_dispatch checks?  A run
+ * never crosses from one kind of extent into another.
+ */
+static boolean_t
+engine_member_run_ok(uint64_t offset, uint64_t bytes)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	uint64_t children = engine.vd->vdev_children;
+	return ((engine.store_extents != NULL &&
+	    zfs_range_tree_contains(engine.store_extents, offset * children,
+	    bytes * children)) ||
+	    (engine.journal_extents != NULL &&
+	    zfs_range_tree_contains(engine.journal_extents, offset * children,
+	    bytes * children)));
+}
+
+/*
+ * The pages in member-offset order, cut into runs of consecutive pages
+ * inside one kind of extent: a run of two or more gets one linear buffer,
+ * so every member writes it once instead of page by page (a store's new
+ * pages and a group's journal frames are mostly consecutive).  Each page
+ * validates on its own, so a torn run is some pages landed and some not,
+ * as with single writes.
+ */
+static uint_t
+engine_member_runs(const engine_member_page_t *pv, uint_t n,
+    engine_member_run_t *runs)
+{
+	uint64_t children = engine.vd->vdev_children;
+	uint64_t *order = pr19262_zalloc(MAX(1, n) * 2 * sizeof (uint64_t),
+	    KM_SLEEP);
+	for (uint_t i = 0; i < n; i++) {
+		order[2 * i] = pv[i].arena / children +
+		    pv[i].page * ENGINE_STORE_PAGE;
+		order[2 * i + 1] = i;
+	}
+	qsort(order, n, 2 * sizeof (uint64_t), engine_member_order);
+	uint_t r = 0;
+	mutex_enter(&engine.lock);
+	for (uint_t i = 0; i < n; ) {
+		uint_t j = i + 1;
+		while (j < n && j - i < ENGINE_MEMBER_RUN &&
+		    order[2 * j] == order[2 * i] + (j - i) *
+		    ENGINE_STORE_PAGE &&
+		    engine_member_run_ok(order[2 * i],
+		    (j - i + 1) * ENGINE_STORE_PAGE))
+			j++;
+		const engine_member_page_t *first = &pv[order[2 * i + 1]];
+		engine_member_run_t *run = &runs[r++];
+		run->arena = first->arena;
+		run->page = first->page;
+		run->pages = j - i;
+		run->owned = j - i > 1;
+		run->abd = first->abd;
+		if (run->owned) {
+			run->abd = abd_alloc_linear((j - i) * ENGINE_STORE_PAGE,
+			    B_TRUE);
+			for (uint_t k = i; k < j; k++)
+				abd_copy_off(run->abd, pv[order[2 * k + 1]].abd,
+				    (k - i) * ENGINE_STORE_PAGE, 0,
+				    ENGINE_STORE_PAGE);
+		}
+		i = j;
+	}
+	mutex_exit(&engine.lock);
+	kmem_free(order, MAX(1, n) * 2 * sizeof (uint64_t));
+	return (r);
+}
+
 /*
  * One raw step on every member of the engine's vdev at once: every
  * member's page writes are issued before any is waited for, then every
@@ -208,16 +300,20 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
 {
 	uint_t children = engine.vd->vdev_children;
 	zio_t **root = kmem_zalloc(children * sizeof (zio_t *), KM_SLEEP);
+	engine_member_run_t *runs = pr19262_zalloc(MAX(1, n) * sizeof (*runs),
+	    KM_SLEEP);
+	uint_t nr = n == 0 ? 0 : engine_member_runs(pv, n, runs);
 	for (uint_t c = 0; c < children; c++) {
 		errors[c] = 0;
-		if (n == 0)
+		if (nr == 0)
 			continue;
 		root[c] = zio_root(spa, NULL, NULL, ZIO_FLAG_CANFAIL);
-		for (uint_t i = 0; i < n; i++) {
+		for (uint_t i = 0; i < nr; i++) {
 			zio_t *zio;
 			int e = engine_store_zio(root[c],
-			    engine.vd->vdev_child[c], pv[i].arena, pv[i].page,
-			    1, pv[i].abd, B_TRUE, &zio);
+			    engine.vd->vdev_child[c], runs[i].arena,
+			    runs[i].page, runs[i].pages, runs[i].abd, B_TRUE,
+			    &zio);
 			if (e != 0)
 				engine_member_error(&errors[c], e);
 			else
@@ -229,6 +325,10 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
 			engine_member_error(&errors[c], zio_wait(root[c]));
 		root[c] = NULL;
 	}
+	for (uint_t i = 0; i < nr; i++)
+		if (runs[i].owned)
+			abd_free(runs[i].abd);
+	kmem_free(runs, MAX(1, n) * sizeof (*runs));
 	if (flush) {
 		for (uint_t c = 0; c < children; c++) {
 			if (errors[c] != 0 && !flush_failed)
