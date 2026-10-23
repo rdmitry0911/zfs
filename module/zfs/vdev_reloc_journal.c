@@ -538,7 +538,7 @@ engine_journal_apply(uint64_t *w)
 		    v, size);
 		if (legacy && (w[9] != 0 || w[24] != v || w[25] != size))
 			return (ENGINE_EINVAL(3));
-		e = kmem_zalloc(sizeof (*e), KM_SLEEP);
+		e = engine_owner_alloc(KM_SLEEP);
 		e->v = v; e->size = size; e->incarnation = w[6];
 		e->allocation_txg = w[9]; e->created = w[16];
 		e->catalog_txg = legacy ? 0 : UINT64_MAX;

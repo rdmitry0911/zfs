@@ -1082,7 +1082,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		    v[1] > engine.total - v[0] || engine_find(v[0]) != NULL ||
 		    v[7] > txg || v[3] > engine.next_incarnation)
 			ENGINE_REFUSE(16);
-		engine_owner_t *e = kmem_zalloc(sizeof (*e), KM_SLEEP);
+		engine_owner_t *e = engine_owner_alloc(KM_SLEEP);
 		e->v = v[0]; e->size = v[1]; e->allocation_txg = v[2];
 		e->incarnation = v[3]; e->created = v[4];
 		e->catalog_txg = v[7];
@@ -1391,7 +1391,7 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	nvlist_free(nv);
 	if (error == 0) {
 		engine.persistent = B_TRUE;
-	engine.store_all = B_TRUE;
+		engine.store_all = B_TRUE;
 		engine.spa = spa;
 		engine.stored_revision = engine.revision;
 		engine.durable_ub_txg = ub->ub_txg;

@@ -292,6 +292,19 @@ engine_owner_dirty(engine_owner_t *e)
 		list_insert_tail(&engine.dirty, e);
 }
 
+/*
+ * Every owner comes from here: a Linux list node is unlinked when it holds
+ * the list poison, not when it is zero, so the node needs its init.
+ */
+static engine_owner_t *
+engine_owner_alloc(int kmflag)
+{
+	engine_owner_t *e = kmem_zalloc(sizeof (*e), kmflag);
+	if (e != NULL)
+		list_link_init(&e->dirty_node);
+	return (e);
+}
+
 /* The owner leaves the engine: the next store drops its rows. */
 static void
 engine_owner_gone(engine_owner_t *e)
@@ -851,7 +864,7 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
 		goto out;
 	}
 	/* Reserve ticket memory without sleeping or issuing I/O. */
-	e = kmem_zalloc(sizeof (*e), KM_NOSLEEP);
+	e = engine_owner_alloc(KM_NOSLEEP);
 	b = kmem_zalloc(sizeof (*b), KM_NOSLEEP);
 	if (e == NULL || b == NULL) {
 		result = PR19262_ALLOC_NOMEM;
@@ -922,7 +935,7 @@ pr19262_engine_pair(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
 		error = ENOSPC;
 		goto out;
 	}
-	engine_owner_t *e = kmem_zalloc(sizeof (*e), KM_SLEEP);
+	engine_owner_t *e = engine_owner_alloc(KM_SLEEP);
 	e->v = v;
 	e->size = size;
 	e->allocation_txg = txg;
@@ -1044,7 +1057,7 @@ pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
 	if (e == NULL) {
 		VERIFY(zfs_range_tree_contains(engine.legacy, v, size));
 		zfs_range_tree_remove(engine.legacy, v, size);
-		e = kmem_zalloc(sizeof (*e), KM_SLEEP);
+		e = engine_owner_alloc(KM_SLEEP);
 		e->v = v;
 		e->size = size;
 		e->cur = engine_version_new(e, v, size, 0, B_TRUE);
@@ -1238,7 +1251,7 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 				h->error_site = 2;
 				continue;
 			}
-			e = kmem_zalloc(sizeof (*e), KM_SLEEP);
+			e = engine_owner_alloc(KM_SLEEP);
 			e->v = DVA_GET_OFFSET(dva);
 			e->size = size;
 			e->cur = engine_version_new(e, e->v, size,
