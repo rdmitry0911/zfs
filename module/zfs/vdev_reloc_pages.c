@@ -314,6 +314,50 @@ engine_mhash(engine_mnode_t *n, zio_cksum_t *hash)
 	*hash = computed;
 }
 
+/* Is the copy read into n the page ref names?  A foreign one is swapped. */
+static boolean_t
+engine_mpage_accept(spa_t *spa, const engine_mref_t *ref, engine_mnode_t *n)
+{
+	engine_mheader_t *h = engine_mheader(n);
+	boolean_t swap = h->magic == BSWAP_64(ENGINE_M_MAGIC);
+	if (h->magic != ENGINE_M_MAGIC && !swap)
+		return (B_FALSE);
+	zio_cksum_t hash;
+	engine_mhash(n, &hash);
+	if (memcmp(&hash, &ref->hash, sizeof (hash)) != 0)
+		return (B_FALSE);
+	if (swap)
+		byteswap_uint64_array(h, sizeof (*h));
+	if (h->p != ref->p || h->generation == 0 ||
+	    (ref->generation != 0 &&
+	    ref->generation != h->generation) ||
+	    h->pool != spa_guid(spa) ||
+	    h->top != engine.vd->vdev_guid ||
+	    memcmp(&h->hash, &ref->hash, sizeof (hash)) != 0 ||
+	    h->level > ENGINE_M_LEVELS ||
+	    (h->type != ENGINE_M_LEAF && h->type != ENGINE_M_BRANCH &&
+	    h->type != ENGINE_M_BLOB && h->type != ENGINE_M_DIRECTORY))
+		return (B_FALSE);
+	uint64_t stride = h->type == ENGINE_M_LEAF ?
+	    sizeof (engine_mrow_t) : sizeof (engine_mchild_t);
+	if ((h->type == ENGINE_M_DIRECTORY && (h->level != 0 ||
+	    h->count != 10 * sizeof (uint64_t))) ||
+	    (h->type == ENGINE_M_BLOB && (h->level != 0 ||
+	    h->count == 0 || h->count > ENGINE_M_PAYLOAD)) ||
+	    ((h->type == ENGINE_M_LEAF || h->type == ENGINE_M_BRANCH) &&
+	    (h->count == 0 ||
+	    h->count > ENGINE_M_PAYLOAD / stride ||
+	    (h->type == ENGINE_M_LEAF && h->level != 0) ||
+	    (h->type == ENGINE_M_BRANCH && h->level == 0))))
+		return (B_FALSE);
+	if (swap && h->type == ENGINE_M_DIRECTORY)
+		byteswap_uint64_array(engine_mpayload(n), h->count);
+	else if (swap && h->type != ENGINE_M_BLOB)
+		byteswap_uint64_array(engine_mpayload(n),
+		    h->count * stride);
+	return (B_TRUE);
+}
+
 static int
 engine_mread_ref(spa_t *spa, const engine_mref_t *ref,
     engine_mnode_t **result, boolean_t bootstrap)
@@ -329,45 +373,9 @@ engine_mread_ref(spa_t *spa, const engine_mref_t *ref,
 	int error = ECKSUM;
 	for (uint_t c = 0; c < engine.vd->vdev_children; c++) {
 		if (engine_store_io_at(engine.vd->vdev_child[c], ref->p,
-		    0, 1, abd, B_FALSE) != 0)
+		    0, 1, abd, B_FALSE) != 0 ||
+		    !engine_mpage_accept(spa, ref, n))
 			continue;
-		engine_mheader_t *h = engine_mheader(n);
-		boolean_t swap = h->magic == BSWAP_64(ENGINE_M_MAGIC);
-		if (h->magic != ENGINE_M_MAGIC && !swap)
-			continue;
-		zio_cksum_t hash;
-		engine_mhash(n, &hash);
-		if (memcmp(&hash, &ref->hash, sizeof (hash)) != 0)
-			continue;
-		if (swap)
-			byteswap_uint64_array(h, sizeof (*h));
-		if (h->p != ref->p || h->generation == 0 ||
-		    (ref->generation != 0 &&
-		    ref->generation != h->generation) ||
-		    h->pool != spa_guid(spa) ||
-		    h->top != engine.vd->vdev_guid ||
-		    memcmp(&h->hash, &ref->hash, sizeof (hash)) != 0 ||
-		    h->level > ENGINE_M_LEVELS ||
-		    (h->type != ENGINE_M_LEAF && h->type != ENGINE_M_BRANCH &&
-		    h->type != ENGINE_M_BLOB && h->type != ENGINE_M_DIRECTORY))
-			continue;
-		uint64_t stride = h->type == ENGINE_M_LEAF ?
-		    sizeof (engine_mrow_t) : sizeof (engine_mchild_t);
-		if ((h->type == ENGINE_M_DIRECTORY && (h->level != 0 ||
-		    h->count != 10 * sizeof (uint64_t))) ||
-		    (h->type == ENGINE_M_BLOB && (h->level != 0 ||
-		    h->count == 0 || h->count > ENGINE_M_PAYLOAD)) ||
-		    ((h->type == ENGINE_M_LEAF || h->type == ENGINE_M_BRANCH) &&
-		    (h->count == 0 ||
-		    h->count > ENGINE_M_PAYLOAD / stride ||
-		    (h->type == ENGINE_M_LEAF && h->level != 0) ||
-		    (h->type == ENGINE_M_BRANCH && h->level == 0))))
-			continue;
-		if (swap && h->type == ENGINE_M_DIRECTORY)
-			byteswap_uint64_array(engine_mpayload(n), h->count);
-		else if (swap && h->type != ENGINE_M_BLOB)
-			byteswap_uint64_array(engine_mpayload(n),
-			    h->count * stride);
 		error = 0;
 		break;
 	}
@@ -2690,6 +2698,103 @@ engine_mcursor_open(engine_mcursor_t *c, const engine_mref_t *root)
 }
 
 /*
+ * Before an incremental store's merge: the uncached pages its seeks will
+ * reach first, found through the cached branches, are read at once from
+ * the first member instead of one by one in the sync thread.  A copy the
+ * checks refuse, or a member that cannot read, leaves the page to the
+ * merge's own lookup, which tries every member.  Out of line: the page
+ * store's frame stays as it was.
+ */
+noinline static uint_t
+engine_pages_prefetch(engine_mbatch_t *b, const engine_dirty_snap_t *snap)
+{
+	ASSERT(MUTEX_HELD(&engine.store_lock));
+	if (engine_pages.root.p == UINT64_MAX || snap->count == 0)
+		return (0);
+	engine_mref_t *refs = pr19262_zalloc(snap->count * sizeof (*refs),
+	    KM_SLEEP);
+	uint_t n = 0;
+	uint64_t last = UINT64_MAX;
+	for (uint_t i = 0; i < snap->count; i++) {
+		const uint64_t *k = &snap->keys[4 * i];
+		uint64_t key[4] = { 1, k[0], k[1], 0 };
+		const engine_mref_t *ref = &engine_pages.root;
+		for (uint_t depth = 0; depth < ENGINE_M_DEPTH; depth++) {
+			uint64_t index;
+			if (!engine_mindex(ref->p, &index))
+				break;
+			engine_mnode_t *node = engine_pages.cache[index];
+			if (node == NULL) {
+				if (index != last)
+					refs[n++] = *ref;
+				last = index;
+				break;
+			}
+			engine_mheader_t *h = engine_mheader(node);
+			if (h->type != ENGINE_M_BRANCH || h->count == 0 ||
+			    h->generation != ref->generation)
+				break;
+			engine_mchild_t *children = engine_mpayload(node);
+			uint_t lo = 0, hi = h->count;
+			while (lo < hi) {
+				uint_t mid = lo + (hi - lo) / 2;
+				if (engine_mkey_compare(children[mid].high,
+				    key) < 0)
+					lo = mid + 1;
+				else
+					hi = mid;
+			}
+			if (lo == h->count)
+				break;
+			ref = &children[lo].ref;
+		}
+	}
+	uint_t installed = 0;
+	vdev_t *vd = engine.vd->vdev_child[0];
+	if (n != 0) {
+		engine_mnode_t **nodes = pr19262_zalloc(n * sizeof (*nodes),
+		    KM_SLEEP);
+		abd_t **abds = pr19262_zalloc(n * sizeof (*abds), KM_SLEEP);
+		int *errors = pr19262_zalloc(n * sizeof (*errors), KM_SLEEP);
+		spa_config_enter(b->spa, SCL_ZIO, FTAG, RW_READER);
+		zio_t *pio = zio_root(b->spa, NULL, NULL, ZIO_FLAG_CANFAIL);
+		for (uint_t j = 0; j < n; j++) {
+			nodes[j] = engine_mnode_alloc();
+			abds[j] = abd_get_from_buf(nodes[j]->data,
+			    ENGINE_STORE_PAGE);
+			zio_t *zio;
+			errors[j] = engine_store_zio(pio, vd, refs[j].p, 0, 1,
+			    abds[j], B_FALSE, &zio);
+			if (errors[j] == 0)
+				zio_nowait(zio);
+		}
+		/* A failed read shows in its page's checks, not here. */
+		(void) zio_wait(pio);
+		spa_config_exit(b->spa, SCL_ZIO, FTAG);
+		for (uint_t j = 0; j < n; j++) {
+			uint64_t index;
+			abd_free(abds[j]);
+			if (errors[j] == 0 &&
+			    engine_mindex(refs[j].p, &index) &&
+			    engine_pages.cache[index] == NULL &&
+			    engine_mpage_accept(b->spa, &refs[j], nodes[j])) {
+				nodes[j]->sealed = B_TRUE;
+				nodes[j]->used = b->generation;
+				engine_pages.cache[index] = nodes[j];
+				installed++;
+			} else {
+				engine_mnode_free(nodes[j]);
+			}
+		}
+		kmem_free(errors, n * sizeof (*errors));
+		kmem_free(abds, n * sizeof (*abds));
+		kmem_free(nodes, n * sizeof (*nodes));
+	}
+	kmem_free(refs, snap->count * sizeof (*refs));
+	return (installed);
+}
+
+/*
  * One step of a store's merge of the last tree's rows (at the cursor) with
  * its own, in key order: an old row alone leaves, as a tombstone while a
  * journal segment may still bind a released journaled owner; an equal row
@@ -2795,7 +2900,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 	b->generation = ++engine_pages.generation;
 	engine_mref_t tree = engine_pages.root;
 	engine_mcursor_t cur = { .b = b };
-	uint_t after = 0, evicted = 0;
+	uint_t after = 0, evicted = 0, prefetched = 0;
 	uint64_t live = engine_pages.live;
 	if (snap->all) {
 		/* The rows the last store wrote, walked from its tree. */
@@ -2830,6 +2935,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			VERIFY3U(live, ==, count);
 		live = count;
 	} else {
+		prefetched = engine_pages_prefetch(b, snap);
 		/* Each named owner's rows in the last tree, and its own. */
 		for (uint_t i = 0; error == 0 && i < snap->count; i++) {
 			const uint64_t *k = &snap->keys[4 * i];
@@ -3067,13 +3173,14 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 		pr19262_printf("PR19262_PAGED_SYNC txg=%llu newpages=%u "
 		    "changes=%u deletes=%u tombstones=%u expired=%u rows=%u "
 		    "root=%llu generation=%llu levels=%llu allocated=%llu "
-		    "cached=%llu joins=%u dirty=%u all=%u evicted=%u\n",
+		    "cached=%llu joins=%u dirty=%u all=%u evicted=%u "
+		    "prefetched=%u\n",
 		    (u_longlong_t)ub->ub_txg, b->pages, b->changes, b->deletes,
 		    b->tombstones, expired, (uint_t)live, (u_longlong_t)root.p,
 		    (u_longlong_t)b->generation,
 		    (u_longlong_t)engine_pages.levels, (u_longlong_t)allocated,
 		    (u_longlong_t)cached, b->joins, snap->count,
-		    (uint_t)snap->all, evicted);
+		    (uint_t)snap->all, evicted, prefetched);
 	}
 	if (expired_keys != NULL)
 		kmem_free(expired_keys, expired * 2 * sizeof (uint64_t));
