@@ -90,7 +90,7 @@ engine_kernel_worker(void *arg)
 	thread_exit();
 }
 
-/* zfs_pr19262_engine: start the engine (durable) on an imported pool. */
+/* Start a durable engine, or attach the driver to an imported one. */
 static int
 engine_kernel_engine_set(const char *val, zfs_kernel_param_t *kp)
 {
@@ -103,29 +103,53 @@ engine_kernel_engine_set(const char *val, zfs_kernel_param_t *kp)
 	int error = spa_open(name, &spa, FTAG);
 	if (error != 0)
 		return (-error);
-	if (pr19262_engine_active(spa)) {
-		spa_close(spa, FTAG);
-		return (-EEXIST);
-	}
-	mutex_enter(&engine.lock);
-	boolean_t busy = engine.spa != NULL;
-	mutex_exit(&engine.lock);
-	if (busy || !spa_writeable(spa) || !spa->spa_trust_config ||
-	    spa->spa_root_vdev->vdev_child[0]->vdev_ops != &vdev_raidz_ops) {
-		spa_close(spa, FTAG);
-		return (busy ? -EBUSY : -ENOTSUP);
-	}
-	pr19262_engine_start(spa);
-	pr19262_engine_store_enable(spa);
-	txg_wait_synced(spa_get_dsl(spa), 0);
 	mutex_enter(&engine_kernel.lock);
-	(void) strlcpy(engine_kernel.pool, name, sizeof (engine_kernel.pool));
-	(void) strlcpy(engine_kernel.state, "idle", ENGINE_KERNEL_STATE);
-	engine_kernel.error = 0;
+	if (engine_kernel.running) {
+		error = EBUSY;
+		goto out;
+	}
+	if (!spa_writeable(spa) || !spa->spa_trust_config) {
+		error = ENOTSUP;
+		goto out;
+	}
+	boolean_t active = pr19262_engine_active(spa);
+	if (active) {
+		if (!pr19262_engine_persistent(spa)) {
+			error = ENOTSUP;
+			goto out;
+		}
+	} else {
+		mutex_enter(&engine.lock);
+		boolean_t busy = engine.spa != NULL;
+		mutex_exit(&engine.lock);
+		if (busy || spa->spa_root_vdev->vdev_children == 0 ||
+		    spa->spa_root_vdev->vdev_child[0]->vdev_ops !=
+		    &vdev_raidz_ops) {
+			error = busy ? EBUSY : ENOTSUP;
+			goto out;
+		}
+		pr19262_engine_start(spa);
+		pr19262_engine_store_enable(spa);
+		txg_wait_synced(spa_get_dsl(spa), 0);
+	}
+	/* Reattaching the current driver must preserve its progress. */
+	if (!active || strcmp(engine_kernel.pool, name) != 0) {
+		(void) strlcpy(engine_kernel.pool, name,
+		    sizeof (engine_kernel.pool));
+		(void) strlcpy(engine_kernel.state, "idle",
+		    ENGINE_KERNEL_STATE);
+		engine_kernel.parity = engine_kernel.batch = 0;
+		engine_kernel.birth = engine_kernel.floor = 0;
+		engine_kernel.reclaimed = engine_kernel.released = 0;
+		engine_kernel.error = 0;
+		memset(&engine_kernel.stats, 0, sizeof (engine_kernel.stats));
+	}
+out:
 	mutex_exit(&engine_kernel.lock);
 	spa_close(spa, FTAG);
-	zfs_dbgmsg("pr19262 kernel engine started on %s", name);
-	return (0);
+	if (error == 0)
+		zfs_dbgmsg("pr19262 kernel engine ready on %s", name);
+	return (-error);
 }
 
 static int
