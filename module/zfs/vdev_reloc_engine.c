@@ -60,6 +60,9 @@ typedef struct engine_owner {
 	boolean_t retired;
 	boolean_t aborted;
 	boolean_t releasing;
+	/* On engine.dirty while its catalog rows may differ from the tree. */
+	list_node_t dirty_node;
+	uint64_t dirty_seq;
 } engine_owner_t;
 
 typedef struct engine_hold {
@@ -172,6 +175,17 @@ static struct {
 	uint64_t alloc_guarded;
 	avl_tree_t owners;
 	avl_tree_t tombstones;
+	/*
+	 * What the next catalog store has to look at: the owners whose rows
+	 * may differ from the stored tree, and the (V, incarnation) of owners
+	 * gone since; store_all when anything may differ (engage, import).
+	 */
+	list_t dirty;
+	uint64_t dirty_next;
+	uint64_t *gone;
+	uint_t gone_count;
+	uint_t gone_capacity;
+	boolean_t store_all;
 	zfs_range_tree_t *free;
 	zfs_range_tree_t *legacy;
 	zfs_range_tree_t *unusable;
@@ -262,6 +276,46 @@ static struct {
 	uint64_t hold_report_prints;
 	uint64_t gate_prints;
 } engine;
+
+/*
+ * The owner's catalog rows may no longer match the stored tree.  Every
+ * change to a field a row carries, to the version list, or to what decides
+ * whether the owner is listed marks the owner; debug ztest checks that no
+ * row of an unmarked owner changes.
+ */
+static void
+engine_owner_dirty(engine_owner_t *e)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	e->dirty_seq = ++engine.dirty_next;
+	if (!list_link_active(&e->dirty_node))
+		list_insert_tail(&engine.dirty, e);
+}
+
+/* The owner leaves the engine: the next store drops its rows. */
+static void
+engine_owner_gone(engine_owner_t *e)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	if (list_link_active(&e->dirty_node))
+		list_remove(&engine.dirty, e);
+	if (engine.gone_count == engine.gone_capacity) {
+		uint_t cap = MAX(64, engine.gone_capacity * 2);
+		uint64_t *gone = pr19262_zalloc(cap * 2 * sizeof (uint64_t),
+		    KM_SLEEP);
+		if (engine.gone != NULL) {
+			memcpy(gone, engine.gone,
+			    engine.gone_count * 2 * sizeof (uint64_t));
+			kmem_free(engine.gone,
+			    engine.gone_capacity * 2 * sizeof (uint64_t));
+		}
+		engine.gone = gone;
+		engine.gone_capacity = cap;
+	}
+	engine.gone[2 * engine.gone_count] = e->v;
+	engine.gone[2 * engine.gone_count + 1] = e->incarnation;
+	engine.gone_count++;
+}
 
 static engine_version_t *
 engine_version_new(engine_owner_t *e, uint64_t p, uint64_t size,
@@ -486,6 +540,8 @@ pr19262_engine_init(void)
 	cv_init(&engine.fence_cv, NULL, CV_DEFAULT, NULL);
 	avl_create(&engine.owners, engine_compare, sizeof (engine_owner_t),
 	    offsetof(engine_owner_t, avl));
+	list_create(&engine.dirty, sizeof (engine_owner_t),
+	    offsetof(engine_owner_t, dirty_node));
 	avl_create(&engine.tombstones, engine_tomb_compare,
 	    sizeof (engine_tomb_t), offsetof(engine_tomb_t, avl));
 }
@@ -500,6 +556,12 @@ pr19262_engine_fini(void)
 	VERIFY3P(engine.spa, ==, NULL);
 	VERIFY(avl_is_empty(&engine.owners));
 	avl_destroy(&engine.owners);
+	list_destroy(&engine.dirty);
+	if (engine.gone != NULL)
+		kmem_free(engine.gone,
+		    engine.gone_capacity * 2 * sizeof (uint64_t));
+	engine.gone = NULL;
+	engine.gone_count = engine.gone_capacity = 0;
 	engine_tombstones_clear();
 	avl_destroy(&engine.tombstones);
 	cv_destroy(&engine.changed);
@@ -811,6 +873,7 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
 	e->cur = e->versions = b;
 	zfs_range_tree_remove(engine.free, b->p, b->size);
 	avl_add(&engine.owners, e);
+	engine_owner_dirty(e);
 	engine.pairs++;
 	engine.revision++;
 	*offset = v.found;
@@ -869,6 +932,7 @@ pr19262_engine_pair(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
 	e->created = ++engine.sequence;
 	zfs_range_tree_remove(engine.free, e->cur->p, size);
 	avl_add(&engine.owners, e);
+	engine_owner_dirty(e);
 	engine.pairs++;
 out:
 	mutex_exit(&engine.lock);
@@ -893,6 +957,7 @@ engine_abort_done(engine_owner_t *e)
 		zfs_range_tree_add(engine.free, b->p, b->size);
 		kmem_free(b, sizeof (*b));
 	}
+	engine_owner_gone(e);
 	avl_remove(&engine.owners, e);
 	kmem_free(e, sizeof (*e));
 }
@@ -933,6 +998,7 @@ pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
 					e->retired_at = ++engine.sequence;
 					engine.retired += e->cur->size;
 					engine.revision++;
+					engine_owner_dirty(e);
 				}
 				retained = B_TRUE;
 				if (engine.abort_prints++ < 4)
@@ -942,6 +1008,7 @@ pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
 			}
 			VERIFY(!e->retired);
 			e->aborted = B_TRUE;
+			engine_owner_dirty(e);
 			engine.revision++;
 			engine.aborts++;
 			engine_abort_done(e);
@@ -983,9 +1050,11 @@ pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
 		e->cur = engine_version_new(e, v, size, 0, B_TRUE);
 		e->incarnation = ++engine.next_incarnation;
 		avl_add(&engine.owners, e);
+		engine_owner_dirty(e);
 	}
 	VERIFY3U(e->size, ==, size);
 	VERIFY(!e->retired && !e->aborted);
+	engine_owner_dirty(e);
 	if (checkpoint) {
 		e->checkpoint_only = B_TRUE;
 		engine.revision++;
@@ -1089,6 +1158,7 @@ pr19262_engine_checkpoint_discard(vdev_t *vd, uint64_t v, uint64_t size,
 			e->retired_at = ++engine.sequence;
 			engine.retired += e->cur->size;
 			engine.revision++;
+			engine_owner_dirty(e);
 		}
 		cursor = MIN(v + size, e->v + e->size);
 	}
@@ -1176,6 +1246,7 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 			e->incarnation = ++engine.next_incarnation;
 			zfs_range_tree_remove(engine.legacy, e->v, size);
 			avl_add(&engine.owners, e);
+			engine_owner_dirty(e);
 		}
 		boolean_t descendant = prior != NULL && prior->error == 0 &&
 		    prior->gang && gang_child && read;
@@ -1256,8 +1327,10 @@ pr19262_engine_io_rele(zio_t *zio)
 		VERIFY3U(b->writers, >, 0);
 		b->writers--;
 	}
-	if (zio->io_error == 0)
+	if (zio->io_error == 0 && !b->ready) {
 		b->ready = B_TRUE;
+		engine_owner_dirty(b->owner);
+	}
 	engine_owner_t *e = b->owner;
 	if (e->aborted)
 		engine_abort_done(e);
@@ -1649,8 +1722,10 @@ engine_copy_settle(engine_copy_t *c, int *error, boolean_t ready)
 	if (*error == 0 && e->retired)
 		*error = ESTALE;
 	boolean_t journal_attempted = *error == 0 && engine.persistent;
-	if (*error == 0)
+	if (*error == 0) {
 		c->stage->ready = ready;
+		engine_owner_dirty(c->owner);
+	}
 	mutex_exit(&engine.lock);
 	return (journal_attempted);
 }
@@ -1686,6 +1761,7 @@ engine_copy_publish(engine_copy_t *c, int error, boolean_t journal_attempted)
 		engine.copy_aborts++;
 		engine.revision++;
 	}
+	engine_owner_dirty(e);
 	VERIFY3U(c->source->leases, >, 0);
 	c->source->leases--;
 	VERIFY3U(e->holds, >, 0);

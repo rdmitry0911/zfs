@@ -2514,7 +2514,8 @@ engine_mcursor_open(engine_mcursor_t *c, const engine_mref_t *root)
 
 static int
 engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
-    engine_mrow_t *rows, uint_t count, uint64_t desc[16])
+    engine_mrow_t *rows, uint_t count, const engine_dirty_snap_t *snap,
+    uint64_t desc[16])
 {
 	ASSERT(MUTEX_HELD(&engine.store_lock));
 	engine_pages_init();
@@ -2554,6 +2555,13 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 			break;
 		int order = old == NULL ? 1 : (after == count ? -1 :
 		    engine_mkey_compare(old->key, rows[after].key));
+		/* Debug ztest: no row changes but a marked owner's. */
+		if (ENGINE_MIRROR && order != 0)
+			VERIFY(engine_dirty_covers(snap,
+			    order < 0 ? old->key : rows[after].key));
+		if (ENGINE_MIRROR && order == 0 && memcmp(old, &rows[after],
+		    sizeof (engine_mrow_t)) != 0)
+			VERIFY(engine_dirty_covers(snap, old->key));
 		if (order < 0) {
 			engine_mrow_t removed = *old;
 			before++;

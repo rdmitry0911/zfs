@@ -557,6 +557,7 @@ engine_journal_apply(uint64_t *w)
 		return (ENGINE_EINVAL(4));
 	}
 	e->journal_touched = B_TRUE;
+	engine_owner_dirty(e);
 	engine.next_incarnation = MAX(engine.next_incarnation, w[6]);
 	engine.sequence = MAX(engine.sequence, MAX(w[15], w[16]));
 	/*
@@ -1418,6 +1419,7 @@ pr19262_engine_journal_claim(spa_t *spa, uint64_t txg)
 		mutex_enter(&engine.lock);
 		e->journal_pending = B_FALSE;
 		e->claimed_txg = e->catalog_txg = txg;
+		engine_owner_dirty(e);
 		engine.revision++;
 		mutex_exit(&engine.lock);
 		spa->spa_claim_max_txg = MAX(spa->spa_claim_max_txg,

@@ -16,6 +16,7 @@ static void
 engine_version_unlink(engine_owner_t *e, engine_version_t *b)
 {
 	ASSERT(MUTEX_HELD(&engine.lock));
+	engine_owner_dirty(e);
 	engine_version_t **link = &e->versions;
 	while (*link != b) {
 		VERIFY3P(*link, !=, NULL);
@@ -168,6 +169,7 @@ engine_release_sync(void *arg, dmu_tx_t *tx)
 			r->bytes += b->size;
 			kmem_free(b, sizeof (*b));
 		}
+		engine_owner_gone(e);
 		avl_remove(&engine.owners, e);
 		/* Journal records of this identity may still be replayed. */
 		if (e->journal_touched)

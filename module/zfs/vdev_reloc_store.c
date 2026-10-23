@@ -97,6 +97,7 @@ pr19262_engine_store_enable(spa_t *spa)
 	engine.store_codec = 7;
 	engine.bitmap[0] = engine.bitmap[1] = 1;
 	engine.persistent = B_TRUE;
+	engine.store_all = B_TRUE;
 	engine.revision++;
 	zfs_range_tree_remove(engine.free, p,
 	    ENGINE_STORE_BYTES * engine.vd->vdev_children);
@@ -262,6 +263,112 @@ engine_store_io(vdev_t *vd, uint64_t page, uint64_t pages, abd_t *abd,
     boolean_t write)
 {
 	return (engine_store_io_at(vd, engine.arena, page, pages, abd, write));
+}
+
+/*
+ * The owners the dirty and gone lists name when a store takes its rows:
+ * (V, incarnation, mark, listed) each, in key order.  Debug ztest checks
+ * every row the store changes against them; a stored root settles them.
+ */
+typedef struct engine_dirty_snap {
+	uint64_t *keys;
+	uint_t count;
+	uint_t gone;
+	boolean_t all;
+} engine_dirty_snap_t;
+
+static int
+engine_dirty_compare(const void *a, const void *b)
+{
+	const uint64_t *x = a, *y = b;
+	for (int i = 0; i < 2; i++)
+		if (x[i] != y[i])
+			return (x[i] < y[i] ? -1 : 1);
+	return (0);
+}
+
+static void
+engine_dirty_snapshot(const uberblock_t *ub, engine_dirty_snap_t *s)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	uint_t n = 0;
+	for (engine_owner_t *e = list_head(&engine.dirty); e != NULL;
+	    e = list_next(&engine.dirty, e))
+		n++;
+	s->all = engine.store_all;
+	s->gone = engine.gone_count;
+	s->count = n + s->gone;
+	s->keys = pr19262_zalloc(MAX(1, s->count) * 4 * sizeof (uint64_t),
+	    KM_SLEEP);
+	uint64_t *k = s->keys;
+	for (engine_owner_t *e = list_head(&engine.dirty); e != NULL;
+	    e = list_next(&engine.dirty, e), k += 4) {
+		k[0] = e->v;
+		k[1] = e->incarnation;
+		k[2] = e->dirty_seq;
+		/* Not listed yet: the owner stays marked until it is. */
+		k[3] = !(e->catalog_txg > ub->ub_txg || e->journal_pending);
+	}
+	for (uint_t i = 0; i < s->gone; i++, k += 4) {
+		k[0] = engine.gone[2 * i];
+		k[1] = engine.gone[2 * i + 1];
+		k[2] = 0;
+		k[3] = 1;
+	}
+	qsort(s->keys, s->count, 4 * sizeof (uint64_t), engine_dirty_compare);
+}
+
+static void
+engine_dirty_free(engine_dirty_snap_t *s)
+{
+	kmem_free(s->keys, MAX(1, s->count) * 4 * sizeof (uint64_t));
+	s->keys = NULL;
+}
+
+/* Does the snapshot name the owner of this row key? */
+static boolean_t
+engine_dirty_covers(const engine_dirty_snap_t *s, const uint64_t key[4])
+{
+	if (s->all)
+		return (B_TRUE);
+	uint64_t want[2] = { key[1], key[2] };
+	uint_t lo = 0, hi = s->count;
+	while (lo < hi) {
+		uint_t mid = lo + (hi - lo) / 2;
+		int order = engine_dirty_compare(want, &s->keys[4 * mid]);
+		if (order == 0)
+			return (B_TRUE);
+		if (order < 0)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	return (B_FALSE);
+}
+
+/*
+ * A stored root covers the snapshot: its listed owners leave the dirty
+ * list unless marked again since, and its gone entries are done.
+ */
+static void
+engine_dirty_settle(const engine_dirty_snap_t *s)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
+	for (uint_t i = 0; i < s->count; i++) {
+		const uint64_t *k = &s->keys[4 * i];
+		if (k[2] == 0 || k[3] == 0)
+			continue;
+		engine_owner_t *e = engine_find(k[0]);
+		if (e != NULL && e->incarnation == k[1] &&
+		    e->dirty_seq == k[2] && list_link_active(&e->dirty_node))
+			list_remove(&engine.dirty, e);
+	}
+	VERIFY3U(engine.gone_count, >=, s->gone);
+	memmove(engine.gone, engine.gone + 2 * s->gone,
+	    (engine.gone_count - s->gone) * 2 * sizeof (uint64_t));
+	engine.gone_count -= s->gone;
+	if (s->all)
+		engine.store_all = B_FALSE;
 }
 
 #include "vdev_reloc_pages.c"
@@ -480,48 +587,54 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub, boolean_t owners)
 	return (nv);
 }
 
-static int
-engine_store_sync(spa_t *spa, uberblock_t *ub)
+/*
+ * A paged catalog root of this txg.  Entered under engine.lock, which it
+ * drops.  Out of line, so the page store runs on a small frame in the
+ * txg sync thread.
+ */
+noinline static int
+engine_store_paged(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 {
-	mutex_enter(&engine.lock);
-	if (engine.spa != spa || !engine.persistent) {
-		mutex_exit(&engine.lock);
-		return (0);
-	}
-	while (!engine.journal_formatted)
-		cv_wait(&engine.changed, &engine.lock);
-	if (pr19262_engine_store_ub(ub) && ub->ub_pr19262[6] == ub->ub_txg) {
-		mutex_exit(&engine.lock);
-		return (0);
-	}
-	boolean_t paged = engine.store_codec >= 6;
-	nvlist_t *nv = engine_store_snapshot(spa, ub, !paged);
-	if (paged) {
-		engine_mrow_t *rows;
-		uint_t count;
-		int error = engine_store_rows(ub, &rows, &count);
-		uint64_t revision = engine.revision;
-		mutex_exit(&engine.lock);
-		if (error != 0) {
-			fnvlist_free(nv);
-			return (error);
-		}
-		uint64_t desc[16];
-		error = engine_pages_store(spa, ub, nv, rows, count, desc);
+	ASSERT(MUTEX_HELD(&engine.lock));
+	engine_mrow_t *rows = NULL;
+	uint_t count = 0;
+	int error = engine_store_rows(ub, &rows, &count);
+	engine_dirty_snap_t snap;
+	engine_dirty_snapshot(ub, &snap);
+	uint64_t revision = engine.revision;
+	mutex_exit(&engine.lock);
+	if (error != 0) {
+		engine_dirty_free(&snap);
 		fnvlist_free(nv);
-		if (error == 0) {
-			mutex_enter(&engine.lock);
-			engine.stored_revision = revision;
-			memcpy(engine.stored_desc, desc, sizeof (desc));
-			mutex_exit(&engine.lock);
-			memcpy(ub->ub_pr19262, desc, sizeof (desc));
-			if (engine_store_crash_txg == ub->ub_txg) {
-				pr19262_flush();
-				pr19262_exit(77);
-			}
-		}
 		return (error);
 	}
+	uint64_t desc[16];
+	error = engine_pages_store(spa, ub, nv, rows, count, &snap, desc);
+	fnvlist_free(nv);
+	if (error == 0) {
+		mutex_enter(&engine.lock);
+		engine_dirty_settle(&snap);
+		engine.stored_revision = revision;
+		memcpy(engine.stored_desc, desc, sizeof (desc));
+		mutex_exit(&engine.lock);
+		memcpy(ub->ub_pr19262, desc, sizeof (desc));
+		if (engine_store_crash_txg == ub->ub_txg) {
+			pr19262_flush();
+			pr19262_exit(77);
+		}
+	}
+	engine_dirty_free(&snap);
+	return (error);
+}
+
+/*
+ * A packed (codec 5) catalog root of this txg.  Entered under engine.lock,
+ * which it drops.
+ */
+noinline static int
+engine_store_packed(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
+{
+	ASSERT(MUTEX_HELD(&engine.lock));
 	size_t size = 0;
 	char *packed = NULL;
 	VERIFY0(nvlist_pack(nv, &packed, &size, NV_ENCODE_XDR, KM_SLEEP));
@@ -595,6 +708,28 @@ engine_store_sync(spa_t *spa, uberblock_t *ub)
 	return (error);
 }
 
+
+static int
+engine_store_sync(spa_t *spa, uberblock_t *ub)
+{
+	mutex_enter(&engine.lock);
+	if (engine.spa != spa || !engine.persistent) {
+		mutex_exit(&engine.lock);
+		return (0);
+	}
+	while (!engine.journal_formatted)
+		cv_wait(&engine.changed, &engine.lock);
+	if (pr19262_engine_store_ub(ub) && ub->ub_pr19262[6] == ub->ub_txg) {
+		mutex_exit(&engine.lock);
+		return (0);
+	}
+	boolean_t paged = engine.store_codec >= 6;
+	nvlist_t *nv = engine_store_snapshot(spa, ub, !paged);
+	if (paged)
+		return (engine_store_paged(spa, ub, nv));
+	return (engine_store_packed(spa, ub, nv));
+}
+
 int
 pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
 {
@@ -620,9 +755,14 @@ engine_store_clear(void)
 			e->versions = b->next;
 			kmem_free(b, sizeof (*b));
 		}
+		if (list_link_active(&e->dirty_node))
+			list_remove(&engine.dirty, e);
 		avl_remove(&engine.owners, e);
 		kmem_free(e, sizeof (*e));
 	}
+	/* Whatever comes next starts from a whole store. */
+	engine.gone_count = 0;
+	engine.store_all = B_TRUE;
 	engine_tombstones_clear();
 	if (engine.free != NULL) {
 		zfs_range_tree_vacate(engine.free, NULL, NULL);
@@ -1251,6 +1391,7 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	nvlist_free(nv);
 	if (error == 0) {
 		engine.persistent = B_TRUE;
+	engine.store_all = B_TRUE;
 		engine.spa = spa;
 		engine.stored_revision = engine.revision;
 		engine.durable_ub_txg = ub->ub_txg;
