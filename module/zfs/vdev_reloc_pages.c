@@ -938,7 +938,25 @@ engine_mseal(engine_mbatch_t *b, engine_mref_t *ref)
 	if (ref->p == UINT64_MAX)
 		return (0);
 	engine_mnode_t *n;
-	int error = engine_mget(b, ref, &n);
+	int error;
+	/*
+	 * Only this batch's pages carry its generation; an older page is
+	 * sealed and its reference final, so it needs no lookup (an evicted
+	 * leaf under a changed branch would be read back).  Debug ztest
+	 * looks and checks.
+	 */
+	if (ref->generation != b->generation) {
+#if defined(ZFS_DEBUG) && !defined(_KERNEL)
+		error = engine_mget(b, ref, &n);
+		if (error != 0)
+			return (error);
+		engine_mref_t same = engine_mreference(n);
+		VERIFY(n->sealed);
+		VERIFY0(memcmp(&same, ref, sizeof (same)));
+#endif
+		return (0);
+	}
+	error = engine_mget(b, ref, &n);
 	if (error != 0)
 		return (error);
 	engine_mheader_t *h = engine_mheader(n);
