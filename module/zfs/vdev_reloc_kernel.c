@@ -292,6 +292,8 @@ ZFS_MODULE_VIRTUAL_PARAM_CALL(zfs, zfs_pr19262_, status,
 	"Private pr19262 engine: state and census");
 ZFS_MODULE_PARAM(zfs, zfs_pr19262_, convert_group, UINT, ZMOD_RW,
 	"Private pr19262 engine: copies per data flush and journal round");
+ZFS_MODULE_PARAM(zfs, zfs_pr19262_, convert_group_bytes, U64, ZMOD_RW,
+	"Private pr19262 engine: data bytes per data flush and journal round");
 ZFS_MODULE_PARAM(zfs, zfs_pr19262_, store_verify, INT, ZMOD_RW,
 	"Private pr19262 engine: check incremental catalog stores (tests)");
 ZFS_MODULE_PARAM(zfs, zfs_pr19262_, page_cache, U64, ZMOD_RW,
