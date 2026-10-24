@@ -1,18 +1,12 @@
 /* SPDX-License-Identifier: CDDL-1.0 */
-/*
- * Kernel driving of the private online-lifetime engine, included by the
- * converter when built into zfs.ko.  Module parameters start the engine on
- * an imported pool, run a conversion in a kernel thread, fence, and report
- * the census; nothing here is a supported interface.
- */
+/* Private kernel driver: each SPA owns its conversion job and progress. */
 #ifdef _KERNEL
 #include <sys/zfs_context.h>
 
 #define	ENGINE_KERNEL_STATE 16
 
-static struct {
+typedef struct engine_kernel {
 	kmutex_t lock;
-	char pool[ZFS_MAX_DATASET_NAME_LEN];
 	char state[ENGINE_KERNEL_STATE];
 	uint64_t parity;
 	uint64_t batch;
@@ -23,19 +17,28 @@ static struct {
 	uint64_t floor;
 	uint64_t reclaimed;
 	uint64_t released;
-} engine_kernel;
+} engine_kernel_t;
+
+/* A legacy parameter selects a pool to observe, never a worker to own. */
+static struct {
+	kmutex_t lock;
+	char pool[ZFS_MAX_DATASET_NAME_LEN];
+	char cached_status[PAGE_SIZE];
+} engine_selector;
 
 static void
 engine_kernel_init(void)
 {
-	mutex_init(&engine_kernel.lock, NULL, MUTEX_DEFAULT, NULL);
-	(void) strlcpy(engine_kernel.state, "idle", ENGINE_KERNEL_STATE);
+	mutex_init(&engine_selector.lock, NULL, MUTEX_DEFAULT, NULL);
+	(void) strlcpy(engine_selector.cached_status,
+	    "state=idle pool= active=0\n",
+	    sizeof (engine_selector.cached_status));
 }
 
 static void
 engine_kernel_fini(void)
 {
-	mutex_destroy(&engine_kernel.lock);
+	mutex_destroy(&engine_selector.lock);
 }
 
 /* One word from a module parameter write, without its trailing newline. */
@@ -51,46 +54,71 @@ engine_kernel_word(const char *val, char *out, size_t size)
 }
 
 static void
+engine_kernel_select(const char *name)
+{
+	mutex_enter(&engine_selector.lock);
+	if (strcmp(engine_selector.pool, name) != 0) {
+		(void) strlcpy(engine_selector.pool, name,
+		    sizeof (engine_selector.pool));
+		(void) strlcpy(engine_selector.cached_status,
+		    "state=idle pool= active=0\n",
+		    sizeof (engine_selector.cached_status));
+	}
+	mutex_exit(&engine_selector.lock);
+}
+
+static int engine_kernel_snapshot(spa_t *, char *);
+
+/* The unload path already owns the SPA; it must never reopen it by name. */
+static void
+engine_kernel_cache(spa_t *spa)
+{
+	char *buf = kmem_alloc(PAGE_SIZE, KM_SLEEP);
+	(void) engine_kernel_snapshot(spa, buf);
+	mutex_enter(&engine_selector.lock);
+	if (strcmp(engine_selector.pool, spa_name(spa)) == 0)
+		(void) strlcpy(engine_selector.cached_status, buf, PAGE_SIZE);
+	mutex_exit(&engine_selector.lock);
+	kmem_free(buf, PAGE_SIZE);
+}
+
+static void
 engine_kernel_worker(void *arg)
 {
-	(void) arg;
-	spa_t *spa;
+	spa_t *spa = arg;
+	engine_kernel_t *job = spa->spa_reloc->kernel;
 	uint64_t birth = 0, floor = 0, reclaimed = 0, released = 0;
-	pr19262_engine_convert_stats_t st;
-	memset(&st, 0, sizeof (st));
-	int error = spa_open(engine_kernel.pool, &spa, FTAG);
-	if (error == 0) {
-		error = pr19262_engine_epoch(spa, engine_kernel.parity, &birth);
-		if (error == 0)
-			error = pr19262_engine_convert(spa, birth,
-			    engine_kernel.batch, 4096, &st);
-		if (error == 0)
-			error = pr19262_engine_fence(spa, &floor, &reclaimed,
-			    &released, NULL);
-		if (error == 0)
-			error = pr19262_engine_certify(spa,
-			    engine_kernel.parity);
-		spa_close(spa, FTAG);
-	}
-	mutex_enter(&engine_kernel.lock);
-	engine_kernel.stats = st;
-	engine_kernel.birth = birth;
-	engine_kernel.floor = floor;
-	engine_kernel.reclaimed = reclaimed;
-	engine_kernel.released = released;
-	engine_kernel.error = error;
-	engine_kernel.running = B_FALSE;
-	(void) strlcpy(engine_kernel.state, error == 0 ? "converted" :
-	    "error", ENGINE_KERNEL_STATE);
-	mutex_exit(&engine_kernel.lock);
+	pr19262_engine_convert_stats_t st = { 0 };
+	/* convert_set transfers its open SPA reference to this worker. */
+	uint64_t parity = job->parity, batch = job->batch;
+	int error = pr19262_engine_epoch(spa, parity, &birth);
+	if (error == 0)
+		error = pr19262_engine_convert(spa, birth, batch, 4096, &st);
+	if (error == 0)
+		error = pr19262_engine_fence(spa, &floor, &reclaimed,
+		    &released, NULL);
+	if (error == 0)
+		error = pr19262_engine_certify(spa, parity);
+	mutex_enter(&job->lock);
+	job->stats = st;
+	job->birth = birth;
+	job->floor = floor;
+	job->reclaimed = reclaimed;
+	job->released = released;
+	job->error = error;
+	job->running = B_FALSE;
+	(void) strlcpy(job->state, error == 0 ? "converted" : "error",
+	    ENGINE_KERNEL_STATE);
+	mutex_exit(&job->lock);
 	zfs_dbgmsg("pr19262 kernel convert pool=%s parity=%llu birth=%llu "
-	    "copied=%llu error=%d", engine_kernel.pool,
-	    (u_longlong_t)engine_kernel.parity, (u_longlong_t)birth,
-	    (u_longlong_t)st.copied, error);
+	    "copied=%llu error=%d", spa_name(spa), (u_longlong_t)parity,
+	    (u_longlong_t)birth, (u_longlong_t)st.copied, error);
+	engine_kernel_cache(spa);
+	spa_close(spa, FTAG);
 	thread_exit();
 }
 
-/* Start a durable engine, or attach the driver to an imported one. */
+/* Start a durable engine, or select an already imported one. */
 static int
 engine_kernel_engine_set(const char *val, zfs_kernel_param_t *kp)
 {
@@ -103,52 +131,32 @@ engine_kernel_engine_set(const char *val, zfs_kernel_param_t *kp)
 	int error = spa_open(name, &spa, FTAG);
 	if (error != 0)
 		return (-error);
-	mutex_enter(&engine_kernel.lock);
-	if (engine_kernel.running) {
+	engine_kernel_t *job = spa->spa_reloc->kernel;
+	mutex_enter(&job->lock);
+	if (job->running) {
 		error = EBUSY;
 		goto out;
 	}
-	if (!spa_writeable(spa) || !spa->spa_trust_config) {
+	if (!spa_writeable(spa) || !spa->spa_trust_config ||
+	    engine_target_vdev(spa, 0) == NULL) {
 		error = ENOTSUP;
 		goto out;
 	}
-	boolean_t active = pr19262_engine_active(spa);
-	if (active) {
-		if (!pr19262_engine_persistent(spa)) {
+	if (pr19262_engine_active(spa)) {
+		if (!pr19262_engine_persistent(spa))
 			error = ENOTSUP;
-			goto out;
-		}
 	} else {
-		mutex_enter(&engine.lock);
-		boolean_t busy = engine.spa != NULL;
-		mutex_exit(&engine.lock);
-		if (busy || spa->spa_root_vdev->vdev_children == 0 ||
-		    spa->spa_root_vdev->vdev_child[0]->vdev_ops !=
-		    &vdev_raidz_ops) {
-			error = busy ? EBUSY : ENOTSUP;
-			goto out;
-		}
 		pr19262_engine_start(spa);
 		pr19262_engine_store_enable(spa);
 		txg_wait_synced(spa_get_dsl(spa), 0);
 	}
-	/* Reattaching the current driver must preserve its progress. */
-	if (!active || strcmp(engine_kernel.pool, name) != 0) {
-		(void) strlcpy(engine_kernel.pool, name,
-		    sizeof (engine_kernel.pool));
-		(void) strlcpy(engine_kernel.state, "idle",
-		    ENGINE_KERNEL_STATE);
-		engine_kernel.parity = engine_kernel.batch = 0;
-		engine_kernel.birth = engine_kernel.floor = 0;
-		engine_kernel.reclaimed = engine_kernel.released = 0;
-		engine_kernel.error = 0;
-		memset(&engine_kernel.stats, 0, sizeof (engine_kernel.stats));
-	}
 out:
-	mutex_exit(&engine_kernel.lock);
-	spa_close(spa, FTAG);
-	if (error == 0)
+	mutex_exit(&job->lock);
+	if (error == 0) {
+		engine_kernel_select(name);
 		zfs_dbgmsg("pr19262 kernel engine ready on %s", name);
+	}
+	spa_close(spa, FTAG);
 	return (-error);
 }
 
@@ -156,13 +164,13 @@ static int
 engine_kernel_engine_get(char *buf, zfs_kernel_param_t *kp)
 {
 	(void) kp;
-	mutex_enter(&engine_kernel.lock);
-	int n = scnprintf(buf, PAGE_SIZE, "%s\n", engine_kernel.pool);
-	mutex_exit(&engine_kernel.lock);
+	mutex_enter(&engine_selector.lock);
+	int n = scnprintf(buf, PAGE_SIZE, "%s\n", engine_selector.pool);
+	mutex_exit(&engine_selector.lock);
 	return (n);
 }
 
-/* zfs_pr19262_convert: "pool parity [batch_mib]" starts a conversion. */
+/* zfs_pr19262_convert: "pool parity [batch_mib]" starts that SPA's worker. */
 static int
 engine_kernel_convert_set(const char *val, zfs_kernel_param_t *kp)
 {
@@ -178,40 +186,56 @@ engine_kernel_convert_set(const char *val, zfs_kernel_param_t *kp)
 	int error = spa_open(name, &spa, FTAG);
 	if (error != 0)
 		return (-error);
-	boolean_t ok = pr19262_engine_active(spa) &&
-	    pr19262_engine_persistent(spa) && spa_writeable(spa);
-	spa_close(spa, FTAG);
-	if (!ok)
+	if (!pr19262_engine_active(spa) || !pr19262_engine_persistent(spa) ||
+	    !spa_writeable(spa)) {
+		spa_close(spa, FTAG);
 		return (-ENOTSUP);
-	mutex_enter(&engine_kernel.lock);
-	if (engine_kernel.running || strcmp(engine_kernel.pool, name) != 0) {
-		mutex_exit(&engine_kernel.lock);
+	}
+	engine_kernel_t *job = spa->spa_reloc->kernel;
+	mutex_enter(&job->lock);
+	if (job->running) {
+		mutex_exit(&job->lock);
+		spa_close(spa, FTAG);
 		return (-EBUSY);
 	}
-	engine_kernel.running = B_TRUE;
-	engine_kernel.parity = parity;
-	engine_kernel.batch = batch << 20;
-	engine_kernel.error = 0;
-	(void) strlcpy(engine_kernel.state, "running", ENGINE_KERNEL_STATE);
-	mutex_exit(&engine_kernel.lock);
-	(void) thread_create(NULL, 0, engine_kernel_worker, NULL, 0, &p0,
+	job->running = B_TRUE;
+	job->parity = parity;
+	job->batch = batch << 20;
+	job->error = 0;
+	(void) strlcpy(job->state, "running", ENGINE_KERNEL_STATE);
+	mutex_exit(&job->lock);
+	engine_kernel_select(name);
+	(void) thread_create(NULL, 0, engine_kernel_worker, spa, 0, &p0,
 	    TS_RUN, minclsyspri);
 	return (0);
+}
+
+static int
+engine_kernel_selected(char *name, spa_t **spa)
+{
+	mutex_enter(&engine_selector.lock);
+	(void) strlcpy(name, engine_selector.pool, ZFS_MAX_DATASET_NAME_LEN);
+	mutex_exit(&engine_selector.lock);
+	return (name[0] == '\0' ? ENOENT : spa_open(name, spa, FTAG));
 }
 
 static int
 engine_kernel_convert_get(char *buf, zfs_kernel_param_t *kp)
 {
 	(void) kp;
-	mutex_enter(&engine_kernel.lock);
-	int n = scnprintf(buf, PAGE_SIZE, "%s %llu %llu\n", engine_kernel.pool,
-	    (u_longlong_t)engine_kernel.parity,
-	    (u_longlong_t)(engine_kernel.batch >> 20));
-	mutex_exit(&engine_kernel.lock);
+	char name[ZFS_MAX_DATASET_NAME_LEN];
+	spa_t *spa;
+	if (engine_kernel_selected(name, &spa) != 0)
+		return (scnprintf(buf, PAGE_SIZE, "%s 0 0\n", name));
+	engine_kernel_t *job = spa->spa_reloc->kernel;
+	mutex_enter(&job->lock);
+	int n = scnprintf(buf, PAGE_SIZE, "%s %llu %llu\n", name,
+	    (u_longlong_t)job->parity, (u_longlong_t)(job->batch >> 20));
+	mutex_exit(&job->lock);
+	spa_close(spa, FTAG);
 	return (n);
 }
 
-/* zfs_pr19262_fence: one fence on the named pool. */
 static int
 engine_kernel_fence_set(const char *val, zfs_kernel_param_t *kp)
 {
@@ -223,16 +247,17 @@ engine_kernel_fence_set(const char *val, zfs_kernel_param_t *kp)
 	if (error != 0)
 		return (-error);
 	uint64_t floor, reclaimed, released;
-	error = pr19262_engine_fence(spa, &floor, &reclaimed, &released,
-	    NULL);
-	spa_close(spa, FTAG);
+	error = pr19262_engine_fence(spa, &floor, &reclaimed, &released, NULL);
 	if (error == 0) {
-		mutex_enter(&engine_kernel.lock);
-		engine_kernel.floor = floor;
-		engine_kernel.reclaimed = reclaimed;
-		engine_kernel.released = released;
-		mutex_exit(&engine_kernel.lock);
+		engine_kernel_t *job = spa->spa_reloc->kernel;
+		mutex_enter(&job->lock);
+		job->floor = floor;
+		job->reclaimed = reclaimed;
+		job->released = released;
+		mutex_exit(&job->lock);
+		engine_kernel_select(name);
 	}
+	spa_close(spa, FTAG);
 	return (-error);
 }
 
@@ -240,49 +265,74 @@ static int
 engine_kernel_fence_get(char *buf, zfs_kernel_param_t *kp)
 {
 	(void) kp;
-	mutex_enter(&engine_kernel.lock);
+	char name[ZFS_MAX_DATASET_NAME_LEN];
+	spa_t *spa;
+	if (engine_kernel_selected(name, &spa) != 0)
+		return (scnprintf(buf,
+		    PAGE_SIZE, "floor=0 reclaimed=0 released=0\n"));
+	engine_kernel_t *job = spa->spa_reloc->kernel;
+	mutex_enter(&job->lock);
 	int n = scnprintf(buf, PAGE_SIZE, "floor=%llu reclaimed=%llu "
-	    "released=%llu\n", (u_longlong_t)engine_kernel.floor,
-	    (u_longlong_t)engine_kernel.reclaimed,
-	    (u_longlong_t)engine_kernel.released);
-	mutex_exit(&engine_kernel.lock);
+	    "released=%llu\n", (u_longlong_t)job->floor,
+	    (u_longlong_t)job->reclaimed, (u_longlong_t)job->released);
+	mutex_exit(&job->lock);
+	spa_close(spa, FTAG);
 	return (n);
 }
 
-/* zfs_pr19262_status: state and census of the engine pool. */
+/* Selecting a pool changes observation only; jobs stay owned by their SPA. */
 static int
 engine_kernel_status_set(const char *val, zfs_kernel_param_t *kp)
 {
-	(void) val, (void) kp;
-	return (-EPERM);
+	(void) kp;
+	char name[ZFS_MAX_DATASET_NAME_LEN];
+	engine_kernel_word(val, name, sizeof (name));
+	spa_t *spa;
+	int error = spa_open(name, &spa, FTAG);
+	if (error != 0)
+		return (-error);
+	engine_kernel_select(name);
+	spa_close(spa, FTAG);
+	return (0);
 }
 
 static int
 engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 {
 	(void) kp;
-	mutex_enter(&engine_kernel.lock);
-	char pool[ZFS_MAX_DATASET_NAME_LEN];
-	(void) strlcpy(pool, engine_kernel.pool, sizeof (pool));
-	char state[ENGINE_KERNEL_STATE];
-	(void) strlcpy(state, engine_kernel.state, sizeof (state));
-	uint64_t parity = engine_kernel.parity;
-	uint64_t copied = engine_kernel.stats.copied;
-	uint64_t passes = engine_kernel.stats.passes;
-	uint64_t floor = engine_kernel.floor;
-	int error = engine_kernel.error;
-	mutex_exit(&engine_kernel.lock);
-	pr19262_engine_census_t c;
-	memset(&c, 0, sizeof (c));
-	boolean_t active = B_FALSE;
+	char name[ZFS_MAX_DATASET_NAME_LEN];
 	spa_t *spa;
-	if (pool[0] != '\0' && spa_open(pool, &spa, FTAG) == 0) {
-		active = pr19262_engine_active(spa);
-		if (active)
-			pr19262_engine_census(spa, parity != 0 ? parity : 2,
-			    &c);
+	if (engine_kernel_selected(name, &spa) == 0) {
+		int n = engine_kernel_snapshot(spa, buf);
 		spa_close(spa, FTAG);
+		return (n);
 	}
+	mutex_enter(&engine_selector.lock);
+	int n = scnprintf(buf, PAGE_SIZE, "%s", engine_selector.cached_status);
+	mutex_exit(&engine_selector.lock);
+	return (n);
+}
+
+static int
+engine_kernel_snapshot(spa_t *spa, char *buf)
+{
+	engine_t *engine = spa->spa_reloc;
+	engine_kernel_t *job = engine->kernel;
+	char pool[ZFS_MAX_DATASET_NAME_LEN];
+	(void) strlcpy(pool, spa_name(spa), sizeof (pool));
+	char state[ENGINE_KERNEL_STATE];
+	mutex_enter(&job->lock);
+	(void) strlcpy(state, job->state, sizeof (state));
+	uint64_t parity = job->parity, copied = job->stats.copied;
+	uint64_t passes = job->stats.passes, floor = job->floor;
+	int error = job->error;
+	mutex_exit(&job->lock);
+	pr19262_engine_census_t c = { 0 };
+	boolean_t active = pr19262_engine_active(spa);
+	mutex_enter(&engine->store_lock);
+	if (active)
+		pr19262_engine_census(spa, parity != 0 ? parity : 2, &c);
+	mutex_enter(&engine->lock);
 	int n = scnprintf(buf, PAGE_SIZE, "state=%s pool=%s active=%u "
 	    "parity=%llu owners=%llu legacy=%llu weak=%llu retired=%llu "
 	    "certified=%llu floor=%llu journal_segments=%llu pages=%llu "
@@ -313,59 +363,61 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	    (u_longlong_t)c.journal_segments, (u_longlong_t)c.pages_used,
 	    (u_longlong_t)copied, (u_longlong_t)passes, error,
 	    (u_longlong_t)(c.current_versions + c.retired_versions),
-	    (u_longlong_t)engine_store_checked,
-	    (u_longlong_t)engine_store_check_failures,
-	    (u_longlong_t)engine_pages_evicted,
-	    (u_longlong_t)engine_store_cost.stores,
-	    (u_longlong_t)engine_store_cost.pages,
-	    (u_longlong_t)engine_store_cost.runs,
-	    (u_longlong_t)(engine_store_cost.tree / MSEC2NSEC(1)),
-	    (u_longlong_t)(engine_store_cost.reserve / MSEC2NSEC(1)),
-	    (u_longlong_t)(engine_store_cost.write / MSEC2NSEC(1)),
-	    (u_longlong_t)(engine_store_cost.flush / MSEC2NSEC(1)),
-	    (u_longlong_t)engine_slot_cost.reads,
-	    (u_longlong_t)engine_slot_cost.writes,
-	    (u_longlong_t)engine_slot_cost.skipped,
-	    (u_longlong_t)engine_slot_cost.cached,
-	    (u_longlong_t)atomic_load_64(&engine_copy_cost.groups),
-	    (u_longlong_t)atomic_load_64(&engine_copy_cost.blocks),
-	    (u_longlong_t)atomic_load_64(&engine_copy_cost.bytes),
+	    (u_longlong_t)engine->store_checked,
+	    (u_longlong_t)engine->store_check_failures,
+	    (u_longlong_t)engine->pages_evicted,
+	    (u_longlong_t)engine->store_cost.stores,
+	    (u_longlong_t)engine->store_cost.pages,
+	    (u_longlong_t)engine->store_cost.runs,
+	    (u_longlong_t)(engine->store_cost.tree / MSEC2NSEC(1)),
+	    (u_longlong_t)(engine->store_cost.reserve / MSEC2NSEC(1)),
+	    (u_longlong_t)(engine->store_cost.write / MSEC2NSEC(1)),
+	    (u_longlong_t)(engine->store_cost.flush / MSEC2NSEC(1)),
+	    (u_longlong_t)engine->slot_cost.reads,
+	    (u_longlong_t)engine->slot_cost.writes,
+	    (u_longlong_t)engine->slot_cost.skipped,
+	    (u_longlong_t)engine->slot_cost.cached,
+	    (u_longlong_t)atomic_load_64(&engine->copy_cost.groups),
+	    (u_longlong_t)atomic_load_64(&engine->copy_cost.blocks),
+	    (u_longlong_t)atomic_load_64(&engine->copy_cost.bytes),
 #define	ENGINE_COST_MS(field) \
 	    (u_longlong_t)(atomic_load_64(&(field)) / MSEC2NSEC(1))
-	    ENGINE_COST_MS(engine_copy_cost.setup),
-	    ENGINE_COST_MS(engine_copy_cost.io[0]),
-	    ENGINE_COST_MS(engine_copy_cost.io[1]),
-	    ENGINE_COST_MS(engine_copy_cost.io[2]),
-	    ENGINE_COST_MS(engine_copy_cost.check),
-	    ENGINE_COST_MS(engine_copy_cost.flush),
-	    ENGINE_COST_MS(engine_copy_cost.settle),
-	    ENGINE_COST_MS(engine_copy_cost.journal),
-	    ENGINE_COST_MS(engine_copy_cost.publish),
-	    ENGINE_COST_MS(engine_copy_cost.total),
-	    (u_longlong_t)atomic_load_64(&engine_journal_cost.calls[0]),
-	    (u_longlong_t)atomic_load_64(&engine_journal_cost.pages[0]),
-	    ENGINE_COST_MS(engine_journal_cost.write[0]),
-	    ENGINE_COST_MS(engine_journal_cost.flush[0]),
-	    (u_longlong_t)atomic_load_64(&engine_journal_cost.calls[1]),
-	    ENGINE_COST_MS(engine_journal_cost.write[1]),
-	    ENGINE_COST_MS(engine_journal_cost.flush[1]),
-	    (u_longlong_t)atomic_load_64(&engine_journal_cost.calls[2]),
-	    ENGINE_COST_MS(engine_journal_cost.write[2]),
-	    ENGINE_COST_MS(engine_journal_cost.flush[2]),
-	    (u_longlong_t)atomic_load_64(&engine_journal_cost.rolls),
-	    ENGINE_COST_MS(engine_journal_cost.roll),
-	    ENGINE_COST_MS(engine_journal_cost.lock),
-	    ENGINE_COST_MS(engine_journal_cost.seal),
-	    (u_longlong_t)atomic_load_64(&engine_admit_cost.rebuilds),
-	    (u_longlong_t)atomic_load_64(&engine_admit_cost.rebuilt),
-	    (u_longlong_t)atomic_load_64(&engine_admit_cost.walked),
-	    (u_longlong_t)atomic_load_64(&engine_admit_cost.updates),
-	    (u_longlong_t)atomic_load_64(&engine_admit_cost.checked),
-	    (u_longlong_t)atomic_load_64(&engine_admit_cost.pages_checked),
+	    ENGINE_COST_MS(engine->copy_cost.setup),
+	    ENGINE_COST_MS(engine->copy_cost.io[0]),
+	    ENGINE_COST_MS(engine->copy_cost.io[1]),
+	    ENGINE_COST_MS(engine->copy_cost.io[2]),
+	    ENGINE_COST_MS(engine->copy_cost.check),
+	    ENGINE_COST_MS(engine->copy_cost.flush),
+	    ENGINE_COST_MS(engine->copy_cost.settle),
+	    ENGINE_COST_MS(engine->copy_cost.journal),
+	    ENGINE_COST_MS(engine->copy_cost.publish),
+	    ENGINE_COST_MS(engine->copy_cost.total),
+	    (u_longlong_t)atomic_load_64(&engine->journal_cost.calls[0]),
+	    (u_longlong_t)atomic_load_64(&engine->journal_cost.pages[0]),
+	    ENGINE_COST_MS(engine->journal_cost.write[0]),
+	    ENGINE_COST_MS(engine->journal_cost.flush[0]),
+	    (u_longlong_t)atomic_load_64(&engine->journal_cost.calls[1]),
+	    ENGINE_COST_MS(engine->journal_cost.write[1]),
+	    ENGINE_COST_MS(engine->journal_cost.flush[1]),
+	    (u_longlong_t)atomic_load_64(&engine->journal_cost.calls[2]),
+	    ENGINE_COST_MS(engine->journal_cost.write[2]),
+	    ENGINE_COST_MS(engine->journal_cost.flush[2]),
+	    (u_longlong_t)atomic_load_64(&engine->journal_cost.rolls),
+	    ENGINE_COST_MS(engine->journal_cost.roll),
+	    ENGINE_COST_MS(engine->journal_cost.lock),
+	    ENGINE_COST_MS(engine->journal_cost.seal),
+	    (u_longlong_t)atomic_load_64(&engine->admit_cost.rebuilds),
+	    (u_longlong_t)atomic_load_64(&engine->admit_cost.rebuilt),
+	    (u_longlong_t)atomic_load_64(&engine->admit_cost.walked),
+	    (u_longlong_t)atomic_load_64(&engine->admit_cost.updates),
+	    (u_longlong_t)atomic_load_64(&engine->admit_cost.checked),
+	    (u_longlong_t)atomic_load_64(&engine->admit_cost.pages_checked),
 	    (u_longlong_t)sizeof (engine_owner_t),
 	    (u_longlong_t)sizeof (engine_version_t),
-	    (u_longlong_t)engine_pages.available);
+	    (u_longlong_t)engine->pages->available);
 #undef ENGINE_COST_MS
+	mutex_exit(&engine->lock);
+	mutex_exit(&engine->store_lock);
 	return (n);
 }
 
@@ -379,8 +431,8 @@ ZFS_MODULE_VIRTUAL_PARAM_CALL(zfs, zfs_pr19262_, fence,
 	engine_kernel_fence_set, engine_kernel_fence_get, ZMOD_RW,
 	"Private pr19262 engine: pool name to fence");
 ZFS_MODULE_VIRTUAL_PARAM_CALL(zfs, zfs_pr19262_, status,
-	engine_kernel_status_set, engine_kernel_status_get, ZMOD_RD,
-	"Private pr19262 engine: state and census");
+	engine_kernel_status_set, engine_kernel_status_get, ZMOD_RW,
+	"Private pr19262 engine: select pool, read state and census");
 ZFS_MODULE_PARAM(zfs, zfs_pr19262_, convert_group, UINT, ZMOD_RW,
 	"Private pr19262 engine: copies per data flush and journal round");
 ZFS_MODULE_PARAM(zfs, zfs_pr19262_, convert_group_bytes, U64, ZMOD_RW,

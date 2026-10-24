@@ -65,7 +65,7 @@ boolean_t pr19262_engine_store_ub(const uberblock_t *);
 int pr19262_vdev_uberblocks(spa_t *, void *,
     int (*)(void *, const uberblock_t *));
 int pr19262_engine_store_inventory(spa_t *, uint64_t *, uint64_t *);
-void pr19262_engine_store_test_hook(void (*)(spa_t *, int));
+void pr19262_engine_store_test_hook(spa_t *, void (*)(spa_t *, int));
 typedef struct pr19262_mgrowth_probe {
 	uint64_t p;
 	uint64_t pages;
@@ -90,10 +90,11 @@ int pr19262_engine_mgrowth_probe(spa_t *, boolean_t,
     pr19262_mgrowth_probe_t *);
 int pr19262_engine_metadata_flush(vdev_t *);
 void pr19262_engine_metadata_flush_nowait(zio_t *, vdev_t *);
-void pr19262_engine_store_crash(uint64_t);
+void pr19262_engine_store_crash(spa_t *, uint64_t);
 int pr19262_engine_journal_bind(spa_t *, const blkptr_t *);
 void pr19262_engine_journal_gate(zio_t *, spa_t *, const blkptr_t *);
-void pr19262_engine_journal_test_hook(void (*)(spa_t *, const blkptr_t *,
+void pr19262_engine_journal_test_hook(spa_t *, void (*)(spa_t *,
+    const blkptr_t *,
     int));
 int pr19262_zio_walk_gang(spa_t *, const blkptr_t *, void *,
     int (*)(spa_t *, const blkptr_t *, void *), void *);
@@ -101,11 +102,13 @@ int pr19262_engine_journal_claim(spa_t *, uint64_t);
 boolean_t pr19262_engine_journal_claimed(spa_t *, vdev_t *, uint64_t,
     uint64_t, uint64_t, uint64_t);
 void pr19262_engine_journal_ub_committed(spa_t *, const uberblock_t *);
-void pr19262_engine_journal_fault(uint_t);
+void pr19262_engine_journal_fault(spa_t *, uint_t);
 int pr19262_engine_journal_roll(spa_t *);
-void pr19262_engine_journal_roll_fault(uint_t);
-void pr19262_engine_journal_group_fault(uint_t);
-int pr19262_engine_journal_wait_error(void);
+void pr19262_engine_journal_roll_fault(spa_t *, uint_t);
+void pr19262_engine_journal_group_fault(spa_t *, uint_t);
+int pr19262_engine_journal_wait_error(spa_t *);
+void pr19262_engine_spa_init(spa_t *);
+void pr19262_engine_spa_fini(spa_t *);
 void pr19262_engine_init(void);
 void pr19262_engine_fini(void);
 void pr19262_engine_start(spa_t *);
@@ -113,10 +116,10 @@ boolean_t pr19262_engine_active(spa_t *);
 vdev_t *pr19262_engine_vdev(spa_t *);
 boolean_t pr19262_engine_bp_foreign(spa_t *, const blkptr_t *);
 uint64_t pr19262_engine_limit(spa_t *, boolean_t);
-void pr19262_engine_block_new(boolean_t);
-void pr19262_engine_fail_writes(boolean_t);
-void pr19262_engine_retired_limit(uint64_t);
-void pr19262_engine_alloc_fail_after(uint64_t);
+void pr19262_engine_block_new(spa_t *, boolean_t);
+void pr19262_engine_fail_writes(spa_t *, boolean_t);
+void pr19262_engine_retired_limit(spa_t *, uint64_t);
+void pr19262_engine_alloc_fail_after(spa_t *, uint64_t);
 int pr19262_engine_pair(spa_t *, vdev_t *, uint64_t, uint64_t, uint64_t);
 typedef enum pr19262_engine_alloc_result {
 	PR19262_ALLOC_INACTIVE,
@@ -146,9 +149,9 @@ void pr19262_engine_copy_group(void **, uint_t, const boolean_t *, int *);
 int pr19262_engine_rebind_unwritten(spa_t *, const blkptr_t *, int, uint64_t);
 zio_t *pr19262_engine_physical_io(spa_t *, blkptr_t *, vdev_t *,
     uint64_t, abd_t *, uint64_t, zio_type_t, uint64_t, void *, zio_flag_t);
-void pr19262_engine_park_next(void);
-uint64_t pr19262_engine_waiting(boolean_t);
-void pr19262_engine_unpark(void);
+void pr19262_engine_park_next(spa_t *);
+uint64_t pr19262_engine_waiting(spa_t *, boolean_t);
+void pr19262_engine_unpark(spa_t *);
 typedef struct pr19262_engine_info {
 	uint64_t p;
 	uint64_t vsize;
@@ -269,7 +272,7 @@ typedef struct pr19262_export_fence_test {
 void pr19262_engine_export_fence_arm(spa_t *,
     pr19262_export_fence_test_t *);
 #endif
-void pr19262_engine_hold_report(void *);
+void pr19262_engine_hold_report(spa_t *, void *);
 int pr19262_engine_epoch(spa_t *, uint64_t, uint64_t *);
 uint64_t pr19262_engine_floor(spa_t *);
 /* Incarnation of an owner overlapping [V, V + size), or 0 when none. */

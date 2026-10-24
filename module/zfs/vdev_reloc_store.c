@@ -13,31 +13,31 @@
 	return (EINVAL); \
 } while (0)
 
-static uint64_t engine_store_crash_txg;
-static void (*engine_store_test_hook)(spa_t *, int);
-
 void
-pr19262_engine_store_test_hook(void (*hook)(spa_t *, int))
+pr19262_engine_store_test_hook(spa_t *spa, void (*hook)(spa_t *, int))
 {
-	mutex_enter(&engine.lock);
-	engine_store_test_hook = hook;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	engine->store_test_hook = hook;
+	mutex_exit(&engine->lock);
 }
 
 static void
 engine_store_test_phase(spa_t *spa, int phase)
 {
-	mutex_enter(&engine.lock);
-	void (*hook)(spa_t *, int) = engine_store_test_hook;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	void (*hook)(spa_t *, int) = engine->store_test_hook;
+	mutex_exit(&engine->lock);
 	if (hook != NULL)
 		hook(spa, phase);
 }
 
 void
-pr19262_engine_store_crash(uint64_t txg)
+pr19262_engine_store_crash(spa_t *spa, uint64_t txg)
 {
-	engine_store_crash_txg = txg;
+	engine_t *engine = spa->spa_reloc;
+	engine->store_crash_txg = txg;
 }
 
 boolean_t
@@ -49,30 +49,34 @@ pr19262_engine_store_ub(const uberblock_t *ub)
 boolean_t
 pr19262_engine_persistent(spa_t *spa)
 {
-	mutex_enter(&engine.lock);
-	boolean_t active = engine.spa == spa && spa != NULL &&
-	    engine.persistent;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	boolean_t active = engine->spa == spa && spa != NULL &&
+	    engine->persistent;
+	mutex_exit(&engine->lock);
 	return (active);
 }
 
 boolean_t
 pr19262_engine_store_dirty(spa_t *spa)
 {
-	mutex_enter(&engine.lock);
-	boolean_t dirty = engine.spa == spa && engine.persistent &&
-	    engine.revision != engine.stored_revision;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	boolean_t dirty = engine->spa == spa && engine->persistent &&
+	    engine->revision != engine->stored_revision;
+	mutex_exit(&engine->lock);
 	return (dirty);
 }
 
 static void
 engine_store_pick(void *arg, uint64_t start, uint64_t size)
 {
+	engine_t *engine = ((engine_walk_arg_t *)arg)->engine;
+	arg = ((engine_walk_arg_t *)arg)->arg;
 	uint64_t *found = arg;
-	uint64_t stripe = engine.vd->vdev_children * ENGINE_STORE_PAGE;
-	uint64_t bytes = engine.vd->vdev_children *
-	    (engine.arena_bytes == 0 ? ENGINE_STORE_BYTES :
+	uint64_t stripe = engine->vd->vdev_children * ENGINE_STORE_PAGE;
+	uint64_t bytes = engine->vd->vdev_children *
+	    (engine->arena_bytes == 0 ? ENGINE_STORE_BYTES :
 	    ENGINE_JOURNAL_BYTES);
 	uint64_t p = roundup(start, stripe);
 	if (p >= start && p - start <= size && bytes <= size - (p - start))
@@ -82,67 +86,69 @@ engine_store_pick(void *arg, uint64_t start, uint64_t size)
 void
 pr19262_engine_store_enable(spa_t *spa)
 {
+	engine_t *engine = spa->spa_reloc;
 	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_WRITER);
-	mutex_enter(&engine.lock);
-	VERIFY3P(spa, ==, engine.spa);
-	VERIFY(!engine.persistent);
+	mutex_enter(&engine->lock);
+	VERIFY3P(spa, ==, engine->spa);
+	VERIFY(!engine->persistent);
 	/* Raw pages are whole sectors: ashift up to the page size. */
-	VERIFY0(ENGINE_STORE_PAGE % (1ULL << engine.vd->vdev_ashift));
+	VERIFY0(ENGINE_STORE_PAGE % (1ULL << engine->vd->vdev_ashift));
 	uint64_t p = UINT64_MAX;
-	zfs_range_tree_walk(engine.free, engine_store_pick, &p);
+	engine_walk_arg_t walk = { engine, &p };
+	zfs_range_tree_walk(engine->free, engine_store_pick, &walk);
 	VERIFY3U(p, !=, UINT64_MAX);
-	engine.arena = p;
-	engine.arena_bytes = ENGINE_STORE_BYTES;
-	engine.bitmap = kmem_zalloc(ENGINE_STORE_PAGES, KM_SLEEP);
-	engine.store_codec = 7;
-	engine.bitmap[0] = engine.bitmap[1] = 1;
-	engine.persistent = B_TRUE;
-	engine.store_all = B_TRUE;
-	engine.revision++;
-	zfs_range_tree_remove(engine.free, p,
-	    ENGINE_STORE_BYTES * engine.vd->vdev_children);
-	engine.store_extents = zfs_range_tree_create(NULL,
+	engine->arena = p;
+	engine->arena_bytes = ENGINE_STORE_BYTES;
+	engine->bitmap = kmem_zalloc(ENGINE_STORE_PAGES, KM_SLEEP);
+	engine->store_codec = 7;
+	engine->bitmap[0] = engine->bitmap[1] = 1;
+	engine->persistent = B_TRUE;
+	engine->store_all = B_TRUE;
+	engine->revision++;
+	zfs_range_tree_remove(engine->free, p,
+	    ENGINE_STORE_BYTES * engine->vd->vdev_children);
+	engine->store_extents = zfs_range_tree_create(NULL,
 	    ZFS_RANGE_SEG64, NULL, 0, 0);
-	zfs_range_tree_add(engine.store_extents, p,
-	    ENGINE_STORE_BYTES * engine.vd->vdev_children);
+	zfs_range_tree_add(engine->store_extents, p,
+	    ENGINE_STORE_BYTES * engine->vd->vdev_children);
 	p = UINT64_MAX;
-	zfs_range_tree_walk(engine.free, engine_store_pick, &p);
+	zfs_range_tree_walk(engine->free, engine_store_pick, &walk);
 	VERIFY3U(p, !=, UINT64_MAX);
-	engine.journal_arena = p;
-	engine.journal_bytes = ENGINE_JOURNAL_BYTES;
-	zfs_range_tree_remove(engine.free, p,
-	    ENGINE_JOURNAL_BYTES * engine.vd->vdev_children);
-	VERIFY0(random_get_pseudo_bytes((void *)engine.journal_epoch,
-	    sizeof (engine.journal_epoch)));
-	engine.journal_root = p;
-	memcpy(engine.journal_root_epoch, engine.journal_epoch,
-	    sizeof (engine.journal_epoch));
-	engine.journal_extents = zfs_range_tree_create(NULL,
+	engine->journal_arena = p;
+	engine->journal_bytes = ENGINE_JOURNAL_BYTES;
+	zfs_range_tree_remove(engine->free, p,
+	    ENGINE_JOURNAL_BYTES * engine->vd->vdev_children);
+	VERIFY0(random_get_pseudo_bytes((void *)engine->journal_epoch,
+	    sizeof (engine->journal_epoch)));
+	engine->journal_root = p;
+	memcpy(engine->journal_root_epoch, engine->journal_epoch,
+	    sizeof (engine->journal_epoch));
+	engine->journal_extents = zfs_range_tree_create(NULL,
 	    ZFS_RANGE_SEG64, NULL, 0, 0);
-	zfs_range_tree_add(engine.journal_extents, p,
-	    ENGINE_JOURNAL_BYTES * engine.vd->vdev_children);
-	engine.journal_segments = engine.journal_tail =
+	zfs_range_tree_add(engine->journal_extents, p,
+	    ENGINE_JOURNAL_BYTES * engine->vd->vdev_children);
+	engine->journal_segments = engine->journal_tail =
 	    kmem_zalloc(sizeof (engine_j_segment_t), KM_SLEEP);
-	engine.journal_tail->arena = p;
-	engine.journal_tail->index = engine.journal_segment_count = 1;
-	engine.journal_tail->free_after = UINT64_MAX;
-	engine.journal_current = engine.journal_tail;
-	memcpy(engine.journal_tail->epoch, engine.journal_epoch,
-	    sizeof (engine.journal_epoch));
-	mutex_exit(&engine.lock);
+	engine->journal_tail->arena = p;
+	engine->journal_tail->index = engine->journal_segment_count = 1;
+	engine->journal_tail->free_after = UINT64_MAX;
+	engine->journal_current = engine->journal_tail;
+	memcpy(engine->journal_tail->epoch, engine->journal_epoch,
+	    sizeof (engine->journal_epoch));
+	mutex_exit(&engine->lock);
 	fnvlist_add_uint64(spa->spa_label_features,
 	    PR19262_ENGINE_LABEL_FEATURE, 0);
-	vdev_config_dirty(engine.vd);
+	vdev_config_dirty(engine->vd);
 	spa_config_exit(spa, SCL_CONFIG, FTAG);
 	VERIFY0(engine_journal_format(spa));
-	mutex_enter(&engine.lock);
-	engine.journal_formatted = B_TRUE;
-	cv_broadcast(&engine.changed);
-	mutex_exit(&engine.lock);
+	mutex_enter(&engine->lock);
+	engine->journal_formatted = B_TRUE;
+	cv_broadcast(&engine->changed);
+	mutex_exit(&engine->lock);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
-	mutex_enter(&engine.lock);
-	VERIFY(engine.journal_ready);
-	mutex_exit(&engine.lock);
+	mutex_enter(&engine->lock);
+	VERIFY(engine->journal_ready);
+	mutex_exit(&engine->lock);
 }
 
 /* Create one raw member I/O as a child of pio (NULL: caller waits). */
@@ -150,8 +156,9 @@ static int
 engine_store_zio(zio_t *pio, vdev_t *vd, uint64_t arena, uint64_t page,
     uint64_t pages, abd_t *abd, boolean_t write, zio_t **zp)
 {
+	engine_t *engine = vd->vdev_spa->spa_reloc;
 	uint64_t offset = VDEV_LABEL_START_SIZE +
-	    arena / engine.vd->vdev_children + page * ENGINE_STORE_PAGE;
+	    arena / engine->vd->vdev_children + page * ENGINE_STORE_PAGE;
 	uint64_t bytes = pages * ENGINE_STORE_PAGE;
 	if (!vdev_readable(vd) || (write && !vdev_writeable(vd)))
 		return (ENXIO);
@@ -168,7 +175,7 @@ engine_store_zio(zio_t *pio, vdev_t *vd, uint64_t arena, uint64_t page,
 	    flags, B_FALSE) : zio_read_phys(pio, vd, offset, bytes,
 	    abd, ZIO_CHECKSUM_OFF, NULL, NULL, ZIO_PRIORITY_SYNC_READ,
 	    flags, B_FALSE);
-	zio->io_pr19262_metadata_authority = &engine;
+	zio->io_pr19262_metadata_authority = engine;
 	*zp = zio;
 	return (0);
 }
@@ -177,22 +184,23 @@ static int
 engine_store_io_at(vdev_t *vd, uint64_t arena, uint64_t page,
     uint64_t pages, abd_t *abd, boolean_t write)
 {
+	engine_t *engine = vd->vdev_spa->spa_reloc;
 	zio_t *zio;
 	int error = engine_store_zio(NULL, vd, arena, page, pages, abd,
 	    write, &zio);
 	if (error == 0)
 		error = zio_wait(zio);
 	if (error != 0)
-		atomic_inc_64(&engine_io_errors);
+		atomic_inc_64(&engine->io_errors);
 	return (error);
 }
 
 /* A member's result: the first error, which an absence does not mask. */
 static void
-engine_member_error(int *member, int error)
+engine_member_error(engine_t *engine, int *member, int error)
 {
 	if (error != 0)
-		atomic_inc_64(&engine_io_errors);
+		atomic_inc_64(&engine->io_errors);
 	if (error != 0 && (*member == 0 || error != ENXIO))
 		*member = error;
 }
@@ -224,15 +232,15 @@ engine_member_order(const void *a, const void *b)
  * never crosses from one kind of extent into another.
  */
 static boolean_t
-engine_member_run_ok(uint64_t offset, uint64_t bytes)
+engine_member_run_ok(engine_t *engine, uint64_t offset, uint64_t bytes)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
-	uint64_t children = engine.vd->vdev_children;
-	return ((engine.store_extents != NULL &&
-	    zfs_range_tree_contains(engine.store_extents, offset * children,
+	ASSERT(MUTEX_HELD(&engine->lock));
+	uint64_t children = engine->vd->vdev_children;
+	return ((engine->store_extents != NULL &&
+	    zfs_range_tree_contains(engine->store_extents, offset * children,
 	    bytes * children)) ||
-	    (engine.journal_extents != NULL &&
-	    zfs_range_tree_contains(engine.journal_extents, offset * children,
+	    (engine->journal_extents != NULL &&
+	    zfs_range_tree_contains(engine->journal_extents, offset * children,
 	    bytes * children)));
 }
 
@@ -245,10 +253,10 @@ engine_member_run_ok(uint64_t offset, uint64_t bytes)
  * as with single writes.
  */
 static uint_t
-engine_member_runs(const engine_member_page_t *pv, uint_t n,
+engine_member_runs(engine_t *engine, const engine_member_page_t *pv, uint_t n,
     engine_member_run_t *runs)
 {
-	uint64_t children = engine.vd->vdev_children;
+	uint64_t children = engine->vd->vdev_children;
 	uint64_t *order = pr19262_zalloc(MAX(1, n) * 2 * sizeof (uint64_t),
 	    KM_SLEEP);
 	for (uint_t i = 0; i < n; i++) {
@@ -258,13 +266,13 @@ engine_member_runs(const engine_member_page_t *pv, uint_t n,
 	}
 	qsort(order, n, 2 * sizeof (uint64_t), engine_member_order);
 	uint_t r = 0;
-	mutex_enter(&engine.lock);
+	mutex_enter(&engine->lock);
 	for (uint_t i = 0; i < n; ) {
 		uint_t j = i + 1;
 		while (j < n && j - i < ENGINE_MEMBER_RUN &&
 		    order[2 * j] == order[2 * i] + (j - i) *
 		    ENGINE_STORE_PAGE &&
-		    engine_member_run_ok(order[2 * i],
+		    engine_member_run_ok(engine, order[2 * i],
 		    (j - i + 1) * ENGINE_STORE_PAGE))
 			j++;
 		const engine_member_page_t *first = &pv[order[2 * i + 1]];
@@ -284,7 +292,7 @@ engine_member_runs(const engine_member_page_t *pv, uint_t n,
 		}
 		i = j;
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	kmem_free(order, MAX(1, n) * 2 * sizeof (uint64_t));
 	return (r);
 }
@@ -293,17 +301,6 @@ engine_member_runs(const engine_member_page_t *pv, uint_t n,
  * Where the catalog stores spend their time, summed over every stored
  * root (the kernel status line reports it).
  */
-typedef struct engine_store_cost {
-	uint64_t stores;
-	uint64_t pages;
-	uint64_t runs;
-	hrtime_t tree;
-	hrtime_t reserve;
-	hrtime_t write;
-	hrtime_t flush;
-} engine_store_cost_t;
-
-static engine_store_cost_t engine_store_cost;
 
 /*
  * One raw step on every member of the engine's vdev at once: every
@@ -322,12 +319,13 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
     uint_t n, boolean_t flush, boolean_t flush_failed, int *errors,
     engine_store_cost_t *cost)
 {
+	engine_t *engine = spa->spa_reloc;
 	hrtime_t start = gethrtime();
-	uint_t children = engine.vd->vdev_children;
+	uint_t children = engine->vd->vdev_children;
 	zio_t **root = kmem_zalloc(children * sizeof (zio_t *), KM_SLEEP);
 	engine_member_run_t *runs = pr19262_zalloc(MAX(1, n) * sizeof (*runs),
 	    KM_SLEEP);
-	uint_t nr = n == 0 ? 0 : engine_member_runs(pv, n, runs);
+	uint_t nr = n == 0 ? 0 : engine_member_runs(engine, pv, n, runs);
 	for (uint_t c = 0; c < children; c++) {
 		errors[c] = 0;
 		if (nr == 0)
@@ -336,18 +334,19 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
 		for (uint_t i = 0; i < nr; i++) {
 			zio_t *zio;
 			int e = engine_store_zio(root[c],
-			    engine.vd->vdev_child[c], runs[i].arena,
+			    engine->vd->vdev_child[c], runs[i].arena,
 			    runs[i].page, runs[i].pages, runs[i].abd, B_TRUE,
 			    &zio);
 			if (e != 0)
-				engine_member_error(&errors[c], e);
+				engine_member_error(engine, &errors[c], e);
 			else
 				zio_nowait(zio);
 		}
 	}
 	for (uint_t c = 0; c < children; c++) {
 		if (root[c] != NULL)
-			engine_member_error(&errors[c], zio_wait(root[c]));
+			engine_member_error(engine, &errors[c],
+			    zio_wait(root[c]));
 		root[c] = NULL;
 	}
 	for (uint_t i = 0; i < nr; i++)
@@ -361,11 +360,11 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
 				continue;
 			root[c] = zio_root(spa, NULL, NULL, ZIO_FLAG_CANFAIL);
 			pr19262_engine_metadata_flush_nowait(root[c],
-			    engine.vd->vdev_child[c]);
+			    engine->vd->vdev_child[c]);
 		}
 		for (uint_t c = 0; c < children; c++) {
 			if (root[c] != NULL)
-				engine_member_error(&errors[c],
+				engine_member_error(engine, &errors[c],
 				    zio_wait(root[c]));
 		}
 	}
@@ -381,11 +380,12 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
 static void
 engine_members_flush(spa_t *spa, engine_quorum_t *q)
 {
-	uint_t children = engine.vd->vdev_children;
+	engine_t *engine = spa->spa_reloc;
+	uint_t children = engine->vd->vdev_children;
 	int *errors = kmem_alloc(children * sizeof (int), KM_SLEEP);
 	engine_members_write(spa, NULL, 0, B_TRUE, B_TRUE, errors, NULL);
 	for (uint_t c = 0; c < children; c++)
-		engine_quorum_add(q, errors[c]);
+		engine_quorum_add(engine, q, errors[c]);
 	kmem_free(errors, children * sizeof (int));
 }
 
@@ -393,7 +393,8 @@ static int
 engine_store_io(vdev_t *vd, uint64_t page, uint64_t pages, abd_t *abd,
     boolean_t write)
 {
-	return (engine_store_io_at(vd, engine.arena, page, pages, abd, write));
+	engine_t *engine = vd->vdev_spa->spa_reloc;
+	return (engine_store_io_at(vd, engine->arena, page, pages, abd, write));
 }
 
 /*
@@ -427,21 +428,22 @@ engine_store_listed(const engine_owner_t *e, const uberblock_t *ub)
 }
 
 static void
-engine_dirty_snapshot(const uberblock_t *ub, engine_dirty_snap_t *s)
+engine_dirty_snapshot(engine_t *engine, const uberblock_t *ub,
+    engine_dirty_snap_t *s)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	ASSERT(MUTEX_HELD(&engine->lock));
 	uint_t n = 0;
-	for (engine_owner_t *e = list_head(&engine.dirty); e != NULL;
-	    e = list_next(&engine.dirty, e))
+	for (engine_owner_t *e = list_head(&engine->dirty); e != NULL;
+	    e = list_next(&engine->dirty, e))
 		n++;
-	s->all = engine.store_all;
-	s->gone = engine.gone_count;
+	s->all = engine->store_all;
+	s->gone = engine->gone_count;
 	s->count = n + s->gone;
 	s->keys = pr19262_zalloc(MAX(1, s->count) * 4 * sizeof (uint64_t),
 	    KM_SLEEP);
 	uint64_t *k = s->keys;
-	for (engine_owner_t *e = list_head(&engine.dirty); e != NULL;
-	    e = list_next(&engine.dirty, e), k += 4) {
+	for (engine_owner_t *e = list_head(&engine->dirty); e != NULL;
+	    e = list_next(&engine->dirty, e), k += 4) {
 		k[0] = e->v;
 		k[1] = e->incarnation;
 		k[2] = e->dirty_seq;
@@ -449,8 +451,8 @@ engine_dirty_snapshot(const uberblock_t *ub, engine_dirty_snap_t *s)
 		k[3] = engine_store_listed(e, ub);
 	}
 	for (uint_t i = 0; i < s->gone; i++, k += 4) {
-		k[0] = engine.gone[2 * i];
-		k[1] = engine.gone[2 * i + 1];
+		k[0] = engine->gone[2 * i];
+		k[1] = engine->gone[2 * i + 1];
 		k[2] = 0;
 		k[3] = 1;
 	}
@@ -470,13 +472,13 @@ engine_dirty_free(engine_dirty_snap_t *s)
 
 /* The listed owner of a snapshot entry; NULL if gone or not listed. */
 static engine_owner_t *
-engine_dirty_owner(const engine_dirty_snap_t *s, uint_t i)
+engine_dirty_owner(engine_t *engine, const engine_dirty_snap_t *s, uint_t i)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	ASSERT(MUTEX_HELD(&engine->lock));
 	const uint64_t *k = &s->keys[4 * i];
 	if (k[2] == 0 || k[3] == 0)
 		return (NULL);
-	engine_owner_t *e = engine_find(k[0]);
+	engine_owner_t *e = engine_find(engine, k[0]);
 	VERIFY(e != NULL && e->incarnation == k[1]);
 	return (e);
 }
@@ -507,35 +509,35 @@ engine_dirty_covers(const engine_dirty_snap_t *s, const uint64_t key[4])
  * list unless marked again since, and its gone entries are done.
  */
 static void
-engine_dirty_settle(const engine_dirty_snap_t *s)
+engine_dirty_settle(engine_t *engine, const engine_dirty_snap_t *s)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	ASSERT(MUTEX_HELD(&engine->lock));
 	for (uint_t i = 0; i < s->count; i++) {
 		const uint64_t *k = &s->keys[4 * i];
 		if (k[2] == 0 || k[3] == 0)
 			continue;
-		engine_owner_t *e = engine_find(k[0]);
+		engine_owner_t *e = engine_find(engine, k[0]);
 		if (e != NULL && e->incarnation == k[1] &&
 		    e->dirty_seq == k[2] && list_link_active(&e->dirty_node)) {
 			/* Settle its reserve before removing it. */
-			engine_admit_owner_update(e);
-			engine_owner_unlist(e);
+			engine_admit_owner_update(engine, e);
+			engine_owner_unlist(engine, e);
 		}
 	}
-	VERIFY3U(engine.gone_count, >=, s->gone);
-	memmove(engine.gone, engine.gone + 2 * s->gone,
-	    (engine.gone_count - s->gone) * 2 * sizeof (uint64_t));
-	engine.gone_count -= s->gone;
+	VERIFY3U(engine->gone_count, >=, s->gone);
+	memmove(engine->gone, engine->gone + 2 * s->gone,
+	    (engine->gone_count - s->gone) * 2 * sizeof (uint64_t));
+	engine->gone_count -= s->gone;
 	if (s->all)
-		engine.store_all = B_FALSE;
+		engine->store_all = B_FALSE;
 }
 
 #include "vdev_reloc_pages.c"
 
 static uint_t
-engine_store_tolerated(void)
+engine_store_tolerated(engine_t *engine)
 {
-	return (MIN(engine_pages.certified, VDEV_RAIDZ_MAXPARITY));
+	return (MIN(engine->pages->certified, VDEV_RAIDZ_MAXPARITY));
 }
 
 static boolean_t
@@ -583,7 +585,8 @@ engine_store_owner_count(const engine_owner_t *e)
  * must be nothing left to stamp.
  */
 static uint_t
-engine_store_owner_rows(engine_owner_t *e, const uberblock_t *ub,
+engine_store_owner_rows(engine_t *engine, engine_owner_t *e,
+    const uberblock_t *ub,
     boolean_t stamp, engine_mrow_t *rows)
 {
 	if (e->retired && e->retired_txg == 0) {
@@ -625,19 +628,20 @@ engine_store_owner_rows(engine_owner_t *e, const uberblock_t *ub,
  * listed owner's (all) or the listed owners' a snapshot names.
  */
 static int
-engine_store_rows(const uberblock_t *ub, const engine_dirty_snap_t *s,
+engine_store_rows(engine_t *engine, const uberblock_t *ub,
+    const engine_dirty_snap_t *s,
     boolean_t stamp, engine_mrow_t **out, uint_t *count)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	ASSERT(MUTEX_HELD(&engine->lock));
 	uint64_t total = 0;
 	if (s == NULL) {
-		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-		    e = AVL_NEXT(&engine.owners, e))
+		for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+		    e = AVL_NEXT(&engine->owners, e))
 			if (engine_store_listed(e, ub))
 				total += engine_store_owner_count(e);
 	} else {
 		for (uint_t i = 0; i < s->count; i++) {
-			engine_owner_t *e = engine_dirty_owner(s, i);
+			engine_owner_t *e = engine_dirty_owner(engine, s, i);
 			if (e != NULL)
 				total += engine_store_owner_count(e);
 		}
@@ -649,16 +653,18 @@ engine_store_rows(const uberblock_t *ub, const engine_dirty_snap_t *s,
 	    KM_SLEEP);
 	uint_t at = 0;
 	if (s == NULL) {
-		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-		    e = AVL_NEXT(&engine.owners, e))
+		for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+		    e = AVL_NEXT(&engine->owners, e))
 			if (engine_store_listed(e, ub))
-				at += engine_store_owner_rows(e, ub, stamp,
+				at += engine_store_owner_rows(engine, e, ub,
+				    stamp,
 				    rows + at);
 	} else {
 		for (uint_t i = 0; i < s->count; i++) {
-			engine_owner_t *e = engine_dirty_owner(s, i);
+			engine_owner_t *e = engine_dirty_owner(engine, s, i);
 			if (e != NULL)
-				at += engine_store_owner_rows(e, ub, stamp,
+				at += engine_store_owner_rows(engine, e, ub,
+				    stamp,
 				    rows + at);
 		}
 	}
@@ -676,19 +682,20 @@ engine_store_rows(const uberblock_t *ub, const engine_dirty_snap_t *s,
 static nvlist_t *
 engine_store_snapshot(spa_t *spa, const uberblock_t *ub, boolean_t owners)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	engine_t *engine = spa->spa_reloc;
+	ASSERT(MUTEX_HELD(&engine->lock));
 	nvlist_t *nv = fnvlist_alloc();
 	fnvlist_add_uint64(nv, "txg", ub->ub_txg);
 	fnvlist_add_uint64(nv, "pool", spa_guid(spa));
-	fnvlist_add_uint64(nv, "top", engine.vd->vdev_guid);
+	fnvlist_add_uint64(nv, "top", engine->vd->vdev_guid);
 	fnvlist_add_uint64_array(nv, "mos", (uint64_t *)&ub->ub_rootbp,
 	    sizeof (blkptr_t) / sizeof (uint64_t));
-	uint64_t geometry[] = { engine.total, engine.vd->vdev_ms_shift,
-	    engine.vd->vdev_ashift, engine.vd->vdev_children,
-	    engine.arena, engine.arena_bytes };
+	uint64_t geometry[] = { engine->total, engine->vd->vdev_ms_shift,
+	    engine->vd->vdev_ashift, engine->vd->vdev_children,
+	    engine->arena, engine->arena_bytes };
 	fnvlist_add_uint64_array(nv, "geometry", geometry, 6);
-	uint64_t journal[] = { engine.journal_root, engine.journal_bytes,
-	    engine.journal_root_epoch[0], engine.journal_root_epoch[1] };
+	uint64_t journal[] = { engine->journal_root, engine->journal_bytes,
+	    engine->journal_root_epoch[0], engine->journal_root_epoch[1] };
 	fnvlist_add_uint64_array(nv, "journal", journal, 4);
 	/*
 	 * This catalog names the current root: cut segments may go at a
@@ -697,7 +704,7 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub, boolean_t owners)
 	 * reuse an extent an older importable root still reads.
 	 */
 	uint_t retired = 0;
-	for (engine_j_segment_t *s = engine.journal_retired; s != NULL;
+	for (engine_j_segment_t *s = engine->journal_retired; s != NULL;
 	    s = s->next) {
 		if (s->free_after == UINT64_MAX)
 			s->free_after = ub->ub_txg;
@@ -706,10 +713,10 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub, boolean_t owners)
 	uint64_t *cut = kmem_alloc(MAX(1, retired) * 5 * sizeof (uint64_t),
 	    KM_SLEEP);
 	uint_t at = 0;
-	for (engine_j_segment_t *s = engine.journal_retired; s != NULL;
+	for (engine_j_segment_t *s = engine->journal_retired; s != NULL;
 	    s = s->next) {
 		cut[at++] = s->arena;
-		cut[at++] = engine.journal_bytes;
+		cut[at++] = engine->journal_bytes;
 		cut[at++] = s->epoch[0];
 		cut[at++] = s->epoch[1];
 		cut[at++] = s->free_after;
@@ -717,18 +724,18 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub, boolean_t owners)
 	fnvlist_add_uint64_array(nv, "journal-retired", cut, at);
 	kmem_free(cut, MAX(1, retired) * 5 * sizeof (uint64_t));
 	fnvlist_add_uint64_array(nv, "checkpoint",
-	    (uint64_t *)&engine.checkpoint,
-	    sizeof (engine.checkpoint) / sizeof (uint64_t));
-	uint64_t state[] = { engine.sequence, engine.next_incarnation,
-	    engine.retired_limit };
+	    (uint64_t *)&engine->checkpoint,
+	    sizeof (engine->checkpoint) / sizeof (uint64_t));
+	uint64_t state[] = { engine->sequence, engine->next_incarnation,
+	    engine->retired_limit };
 	fnvlist_add_uint64_array(nv, "state", state, 3);
-	uint64_t max = owners ? avl_numnodes(&engine.owners) : 0;
+	uint64_t max = owners ? avl_numnodes(&engine->owners) : 0;
 	nvlist_t **rows = pr19262_alloc(MAX(1, max) * sizeof (*rows),
 	    KM_SLEEP);
 	uint_t n = 0;
 	/* The paged store takes its rows from engine_store_rows instead. */
-	for (engine_owner_t *e = owners ? avl_first(&engine.owners) : NULL;
-	    e != NULL; e = AVL_NEXT(&engine.owners, e)) {
+	for (engine_owner_t *e = owners ? avl_first(&engine->owners) : NULL;
+	    e != NULL; e = AVL_NEXT(&engine->owners, e)) {
 		/* New uncommitted V allocations are outside this MOS root. */
 		if (e->aborted || e->catalog_txg > ub->ub_txg ||
 		    e->journal_pending)
@@ -776,13 +783,14 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub, boolean_t owners)
 	for (uint_t i = 0; i < n; i++)
 		fnvlist_free(rows[i]);
 	kmem_free(rows, MAX(1, max) * sizeof (*rows));
-	uint64_t nr = zfs_range_tree_numsegs(engine.legacy) * 2;
+	uint64_t nr = zfs_range_tree_numsegs(engine->legacy) * 2;
 	engine_ranges_t r = { pr19262_alloc(MAX(1, nr) * sizeof (uint64_t),
 	    KM_SLEEP), 0 };
-	zfs_range_tree_walk(engine.legacy, engine_store_range, &r);
+	zfs_range_tree_walk(engine->legacy, engine_store_range, &r);
 	fnvlist_add_uint64_array(nv, "legacy", r.values, r.count);
 	kmem_free(r.values, MAX(1, nr) * sizeof (uint64_t));
-	fnvlist_add_byte_array(nv, "bitmap", engine.bitmap, ENGINE_STORE_PAGES);
+	fnvlist_add_byte_array(nv, "bitmap", engine->bitmap,
+	    ENGINE_STORE_PAGES);
 	return (nv);
 }
 
@@ -794,9 +802,10 @@ engine_store_snapshot(spa_t *spa, const uberblock_t *ub, boolean_t owners)
 noinline static int
 engine_store_paged(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	engine_t *engine = spa->spa_reloc;
+	ASSERT(MUTEX_HELD(&engine->lock));
 	engine_dirty_snap_t snap;
-	engine_dirty_snapshot(ub, &snap);
+	engine_dirty_snapshot(engine, ub, &snap);
 	/*
 	 * After engage or import every listed owner's rows; otherwise only
 	 * those of the owners the snapshot names.  Debug ztest, or a kernel
@@ -805,17 +814,18 @@ engine_store_paged(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 	 */
 	engine_mrow_t *rows = NULL, *full = NULL;
 	uint_t count = 0, full_count = 0;
-	int error = engine_store_rows(ub, snap.all ? NULL : &snap, B_TRUE,
+	int error = engine_store_rows(engine, ub, snap.all ? NULL : &snap,
+	    B_TRUE,
 	    &rows, &count);
 	if (error == 0 && !snap.all &&
 	    (ENGINE_MIRROR || zfs_pr19262_store_verify != 0)) {
-		error = engine_store_rows(ub, NULL, B_FALSE, &full,
+		error = engine_store_rows(engine, ub, NULL, B_FALSE, &full,
 		    &full_count);
 		if (error != 0)
 			kmem_free(rows, MAX(1, count) * sizeof (*rows));
 	}
-	uint64_t revision = engine.revision;
-	mutex_exit(&engine.lock);
+	uint64_t revision = engine->revision;
+	mutex_exit(&engine->lock);
 	if (error != 0) {
 		engine_dirty_free(&snap);
 		fnvlist_free(nv);
@@ -826,13 +836,13 @@ engine_store_paged(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 	    &snap, desc);
 	fnvlist_free(nv);
 	if (error == 0) {
-		mutex_enter(&engine.lock);
-		engine_dirty_settle(&snap);
-		engine.stored_revision = revision;
-		memcpy(engine.stored_desc, desc, sizeof (desc));
-		mutex_exit(&engine.lock);
+		mutex_enter(&engine->lock);
+		engine_dirty_settle(engine, &snap);
+		engine->stored_revision = revision;
+		memcpy(engine->stored_desc, desc, sizeof (desc));
+		mutex_exit(&engine->lock);
 		memcpy(ub->ub_pr19262, desc, sizeof (desc));
-		if (engine_store_crash_txg == ub->ub_txg) {
+		if (engine->store_crash_txg == ub->ub_txg) {
 			pr19262_flush();
 			pr19262_exit(77);
 		}
@@ -848,14 +858,15 @@ engine_store_paged(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 noinline static int
 engine_store_packed(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	engine_t *engine = spa->spa_reloc;
+	ASSERT(MUTEX_HELD(&engine->lock));
 	size_t size = 0;
 	char *packed = NULL;
 	VERIFY0(nvlist_pack(nv, &packed, &size, NV_ENCODE_XDR, KM_SLEEP));
 	uint64_t pages = howmany(size, ENGINE_STORE_PAGE);
 	uint64_t first = 0, run = 0;
 	for (uint64_t i = 0; i < ENGINE_STORE_PAGES; i++) {
-		run = engine.bitmap[i] ? 0 : run + 1;
+		run = engine->bitmap[i] ? 0 : run + 1;
 		if (run == pages) {
 			first = i + 1 - pages;
 			break;
@@ -864,13 +875,14 @@ engine_store_packed(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 	if (pages == 0 || run != pages) {
 		kmem_free(packed, size);
 		fnvlist_free(nv);
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (ENOSPC);
 	}
 	/* Finite COW pages, including this root's own allocator bitmap. */
-	memset(engine.bitmap + first, 1, pages);
+	memset(engine->bitmap + first, 1, pages);
 	fnvlist_remove(nv, "bitmap");
-	fnvlist_add_byte_array(nv, "bitmap", engine.bitmap, ENGINE_STORE_PAGES);
+	fnvlist_add_byte_array(nv, "bitmap", engine->bitmap,
+	    ENGINE_STORE_PAGES);
 	kmem_free(packed, size);
 	packed = NULL;
 	size = 0;
@@ -881,40 +893,40 @@ engine_store_packed(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 	abd_zero(abd, pages * ENGINE_STORE_PAGE);
 	abd_copy_from_buf(abd, packed, size);
 	kmem_free(packed, size);
-	uint64_t desc[16] = { ENGINE_STORE_MAGIC, engine.vd->vdev_guid,
-	    engine.arena, engine.arena_bytes, first, pages, ub->ub_txg,
-	    size, 0, 0, 0, 0, engine.vd->vdev_ashift,
-	    engine.vd->vdev_children, engine.total, 5 };
+	uint64_t desc[16] = { ENGINE_STORE_MAGIC, engine->vd->vdev_guid,
+	    engine->arena, engine->arena_bytes, first, pages, ub->ub_txg,
+	    size, 0, 0, 0, 0, engine->vd->vdev_ashift,
+	    engine->vd->vdev_children, engine->total, 5 };
 	zio_cksum_t hash;
 	abd_checksum_sha256(abd, pages * ENGINE_STORE_PAGE, NULL, &hash);
 	memcpy(&desc[8], &hash, sizeof (hash));
-	uint64_t revision = engine.revision;
-	mutex_exit(&engine.lock);
+	uint64_t revision = engine->revision;
+	mutex_exit(&engine->lock);
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	int error = 0;
-	for (uint64_t i = 0; i < engine.vd->vdev_children; i++) {
-		int e = engine_store_io(engine.vd->vdev_child[i], first,
+	for (uint64_t i = 0; i < engine->vd->vdev_children; i++) {
+		int e = engine_store_io(engine->vd->vdev_child[i], first,
 		    pages, abd, B_TRUE);
 		if (e != 0)
 			error = e;
-		e = pr19262_engine_metadata_flush(engine.vd->vdev_child[i]);
+		e = pr19262_engine_metadata_flush(engine->vd->vdev_child[i]);
 		if (e != 0)
 			error = e;
 	}
 	spa_config_exit(spa, SCL_ZIO, FTAG);
 	abd_free(abd);
 	if (error == 0) {
-		mutex_enter(&engine.lock);
-		engine.stored_revision = revision;
-		memcpy(engine.stored_desc, desc, sizeof (desc));
-		mutex_exit(&engine.lock);
+		mutex_enter(&engine->lock);
+		engine->stored_revision = revision;
+		memcpy(engine->stored_desc, desc, sizeof (desc));
+		mutex_exit(&engine->lock);
 		memcpy(ub->ub_pr19262, desc, sizeof (desc));
 		pr19262_printf("PR19262_STORE_SYNC txg=%llu page=%llu "
 		    "pages=%llu bytes=%llu arena=%llu\n",
 		    (u_longlong_t)ub->ub_txg,
 		    (u_longlong_t)first, (u_longlong_t)pages,
-		    (u_longlong_t)size, (u_longlong_t)engine.arena);
-		if (engine_store_crash_txg == ub->ub_txg) {
+		    (u_longlong_t)size, (u_longlong_t)engine->arena);
+		if (engine->store_crash_txg == ub->ub_txg) {
 			pr19262_flush();
 			pr19262_exit(77);
 		}
@@ -922,22 +934,22 @@ engine_store_packed(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 	return (error);
 }
 
-
 static int
 engine_store_sync(spa_t *spa, uberblock_t *ub)
 {
-	mutex_enter(&engine.lock);
-	if (engine.spa != spa || !engine.persistent) {
-		mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || !engine->persistent) {
+		mutex_exit(&engine->lock);
 		return (0);
 	}
-	while (!engine.journal_formatted)
-		cv_wait(&engine.changed, &engine.lock);
+	while (!engine->journal_formatted)
+		cv_wait(&engine->changed, &engine->lock);
 	if (pr19262_engine_store_ub(ub) && ub->ub_pr19262[6] == ub->ub_txg) {
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (0);
 	}
-	boolean_t paged = engine.store_codec >= 6;
+	boolean_t paged = engine->store_codec >= 6;
 	nvlist_t *nv = engine_store_snapshot(spa, ub, !paged);
 	if (paged)
 		return (engine_store_paged(spa, ub, nv));
@@ -947,20 +959,21 @@ engine_store_sync(spa_t *spa, uberblock_t *ub)
 int
 pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
 {
+	engine_t *engine = spa->spa_reloc;
 	engine_store_test_phase(spa, 2);
-	mutex_enter(&engine.store_lock);
+	mutex_enter(&engine->store_lock);
 	int error = engine_store_sync(spa, ub);
-	mutex_exit(&engine.store_lock);
+	mutex_exit(&engine->store_lock);
 	return (error);
 }
 
 static void
-engine_store_clear(void)
+engine_store_clear(engine_t *engine)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
-	engine_pages_clear();
+	ASSERT(MUTEX_HELD(&engine->lock));
+	engine_pages_clear(engine);
 	engine_owner_t *e;
-	while ((e = avl_first(&engine.owners)) != NULL) {
+	while ((e = avl_first(&engine->owners)) != NULL) {
 		VERIFY0(e->holds);
 		VERIFY(!e->copying && e->pending == NULL);
 		while (e->versions != NULL) {
@@ -969,143 +982,148 @@ engine_store_clear(void)
 			e->versions = b->next;
 			kmem_free(b, sizeof (*b));
 		}
-		engine_owner_unlist(e);
-		avl_remove(&engine.owners, e);
+		engine_owner_unlist(engine, e);
+		avl_remove(&engine->owners, e);
 		kmem_free(e, sizeof (*e));
 	}
 	/* Whatever comes next starts from a whole store. */
-	engine.gone_count = 0;
-	engine.store_all = B_TRUE;
-	engine_tombstones_clear();
-	if (engine.free != NULL) {
-		zfs_range_tree_vacate(engine.free, NULL, NULL);
-		zfs_range_tree_destroy(engine.free);
+	engine->gone_count = 0;
+	engine->store_all = B_TRUE;
+	engine_tombstones_clear(engine);
+	if (engine->free != NULL) {
+		zfs_range_tree_vacate(engine->free, NULL, NULL);
+		zfs_range_tree_destroy(engine->free);
 	}
-	if (engine.legacy != NULL) {
-		zfs_range_tree_vacate(engine.legacy, NULL, NULL);
-		zfs_range_tree_destroy(engine.legacy);
+	if (engine->legacy != NULL) {
+		zfs_range_tree_vacate(engine->legacy, NULL, NULL);
+		zfs_range_tree_destroy(engine->legacy);
 	}
-	if (engine.unusable != NULL) {
-		zfs_range_tree_vacate(engine.unusable, NULL, NULL);
-		zfs_range_tree_destroy(engine.unusable);
+	if (engine->unusable != NULL) {
+		zfs_range_tree_vacate(engine->unusable, NULL, NULL);
+		zfs_range_tree_destroy(engine->unusable);
 	}
-	if (engine.bitmap != NULL)
-		kmem_free(engine.bitmap, ENGINE_STORE_PAGES);
-	if (engine.store_extents != NULL) {
-		zfs_range_tree_vacate(engine.store_extents, NULL, NULL);
-		zfs_range_tree_destroy(engine.store_extents);
-		engine.store_extents = NULL;
+	if (engine->bitmap != NULL)
+		kmem_free(engine->bitmap, ENGINE_STORE_PAGES);
+	if (engine->store_extents != NULL) {
+		zfs_range_tree_vacate(engine->store_extents, NULL, NULL);
+		zfs_range_tree_destroy(engine->store_extents);
+		engine->store_extents = NULL;
 	}
-	if (engine.journal_extents != NULL) {
-		zfs_range_tree_vacate(engine.journal_extents, NULL, NULL);
-		zfs_range_tree_destroy(engine.journal_extents);
-		engine.journal_extents = NULL;
+	if (engine->journal_extents != NULL) {
+		zfs_range_tree_vacate(engine->journal_extents, NULL, NULL);
+		zfs_range_tree_destroy(engine->journal_extents);
+		engine->journal_extents = NULL;
 	}
-	while (engine.journal_segments != NULL) {
-		engine_j_segment_t *s = engine.journal_segments;
-		engine.journal_segments = s->next;
+	while (engine->journal_segments != NULL) {
+		engine_j_segment_t *s = engine->journal_segments;
+		engine->journal_segments = s->next;
 		kmem_free(s, sizeof (*s));
 	}
-	while (engine.journal_retired != NULL) {
-		engine_j_segment_t *s = engine.journal_retired;
-		engine.journal_retired = s->next;
+	while (engine->journal_retired != NULL) {
+		engine_j_segment_t *s = engine->journal_retired;
+		engine->journal_retired = s->next;
 		kmem_free(s, sizeof (*s));
 	}
-	engine.journal_segment_count = 0;
-	engine.journal_freed_segments = engine.journal_freed_bytes = 0;
-	engine.journal_tail = NULL;
-	engine.journal_current = NULL;
-	if (engine.journal_pending != NULL) {
-		kmem_free(engine.journal_pending, sizeof (engine_j_segment_t));
-		engine.journal_pending = NULL;
+	engine->journal_segment_count = 0;
+	engine->journal_freed_segments = engine->journal_freed_bytes = 0;
+	engine->journal_tail = NULL;
+	engine->journal_current = NULL;
+	if (engine->journal_pending != NULL) {
+		kmem_free(engine->journal_pending, sizeof (engine_j_segment_t));
+		engine->journal_pending = NULL;
 	}
-	engine.spa = NULL;
-	engine.vd = NULL;
-	engine.free = engine.legacy = engine.unusable = NULL;
-	engine.bitmap = NULL;
-	engine.persistent = B_FALSE;
-	engine.arena = engine.arena_bytes = engine.retired = 0;
-	engine.store_codec = 0;
-	engine.journal_arena = engine.journal_bytes = engine.journal_seq = 0;
-	engine.journal_serial = 0;
-	engine.journal_root = 0;
-	memset(engine.journal_root_epoch, 0,
-	    sizeof (engine.journal_root_epoch));
-	memset(&engine.journal_hash, 0, sizeof (engine.journal_hash));
-	engine.journal_error = 0;
-	engine.journal_ready = engine.journal_formatted = B_FALSE;
-	engine.journal_repair = B_FALSE;
-	memset(&engine.checkpoint, 0, sizeof (engine.checkpoint));
-	engine.durable_ub_txg = engine.durable_catalog_txg = 0;
-	memset(engine.stored_desc, 0, sizeof (engine.stored_desc));
-	memset(engine.durable_desc, 0, sizeof (engine.durable_desc));
-	engine.certified = 0;
-	engine.release_thread = NULL;
-	memset(engine.admit, 0, sizeof (engine.admit));
-	engine.admit_parity = engine.admit_reserve = 0;
-	engine.admit_reserve_growth = engine.admit_reserve_legacy = 0;
-	engine.admit_reserve_weak = engine.admit_growth_peak = 0;
-	engine.admit_space_rejections = 0;
-	engine.admit_batch = ENGINE_ADMIT_BATCH;
-	engine.admit_refreshed = UINT64_MAX;
-	engine.admit_cached_parity = UINT64_MAX;
-	engine.admit_first = NULL;
-	VERIFY(!engine.fence_pending);
-	engine.fence_quiesced = engine.fence_stalled = B_FALSE;
+	engine->spa = NULL;
+	engine->vd = NULL;
+	engine->free = engine->legacy = engine->unusable = NULL;
+	engine->bitmap = NULL;
+	engine->persistent = B_FALSE;
+	engine->arena = engine->arena_bytes = engine->retired = 0;
+	engine->store_codec = 0;
+	engine->journal_arena = engine->journal_bytes = engine->journal_seq = 0;
+	engine->journal_serial = 0;
+	engine->journal_root = 0;
+	memset(engine->journal_root_epoch, 0,
+	    sizeof (engine->journal_root_epoch));
+	memset(&engine->journal_hash, 0, sizeof (engine->journal_hash));
+	engine->journal_error = 0;
+	engine->journal_ready = engine->journal_formatted = B_FALSE;
+	engine->journal_repair = B_FALSE;
+	memset(&engine->checkpoint, 0, sizeof (engine->checkpoint));
+	engine->durable_ub_txg = engine->durable_catalog_txg = 0;
+	memset(engine->stored_desc, 0, sizeof (engine->stored_desc));
+	memset(engine->durable_desc, 0, sizeof (engine->durable_desc));
+	engine->certified = 0;
+	engine->release_thread = NULL;
+	memset(engine->admit, 0, sizeof (engine->admit));
+	engine->admit_parity = engine->admit_reserve = 0;
+	engine->admit_reserve_growth = engine->admit_reserve_legacy = 0;
+	engine->admit_reserve_weak = engine->admit_growth_peak = 0;
+	engine->admit_space_rejections = 0;
+	engine->admit_batch = ENGINE_ADMIT_BATCH;
+	engine->admit_refreshed = UINT64_MAX;
+	engine->admit_cached_parity = UINT64_MAX;
+	engine->admit_first = NULL;
+	VERIFY(!engine->fence_pending);
+	engine->fence_quiesced = engine->fence_stalled = B_FALSE;
 #ifndef _KERNEL
-	engine.export_fence_test = NULL;
+	engine->export_fence_test = NULL;
 #endif
-	engine.fence_error = 0;
-	engine.fence_requests = engine.fence_auto = 0;
-	engine.admit_fence_waits = 0;
+	engine->fence_error = 0;
+	engine->fence_requests = engine->fence_auto = 0;
+	engine->admit_fence_waits = 0;
 }
 
 void
 pr19262_engine_store_unload(spa_t *spa)
 {
-	mutex_enter(&engine.store_lock);
-	mutex_enter(&engine.lock);
-	if (engine.spa == spa && engine.persistent)
-		engine_store_clear();
-	mutex_exit(&engine.lock);
-	mutex_exit(&engine.store_lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->store_lock);
+	mutex_enter(&engine->lock);
+	if (engine->spa == spa)
+		engine_store_clear(engine);
+	mutex_exit(&engine->lock);
+	mutex_exit(&engine->store_lock);
+#ifdef _KERNEL
+	engine_kernel_cache(spa);
+#endif
 }
 
 void
 pr19262_engine_store_rebind(spa_t *spa)
 {
-	mutex_enter(&engine.lock);
-	if (engine.spa == spa) {
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->spa == spa) {
 		/* The config was reloaded: find the target by its guid. */
-		engine.vd = engine_target_vdev(spa, engine.vd_guid);
-		VERIFY3P(engine.vd, !=, NULL);
-		engine.foreign_normal = engine_foreign_normal(spa, engine.vd);
+		engine->vd = engine_target_vdev(spa, engine->vd_guid);
+		VERIFY3P(engine->vd, !=, NULL);
+		engine->foreign_normal = engine_foreign_normal(spa, engine->vd);
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 }
 
 static boolean_t
-engine_store_extent(uint64_t p, uint64_t size)
+engine_store_extent(engine_t *engine, uint64_t p, uint64_t size)
 {
 	/* Backing extents are sector-aligned; arenas are checked by callers. */
-	uint64_t sector = 1ULL << engine.vd->vdev_ashift;
+	uint64_t sector = 1ULL << engine->vd->vdev_ashift;
 	return (size != 0 && IS_P2ALIGNED(p, sector) &&
-	    IS_P2ALIGNED(size, sector) && p < engine.total &&
-	    size <= engine.total - p &&
-	    zfs_range_tree_contains(engine.free, p, size));
+	    IS_P2ALIGNED(size, sector) && p < engine->total &&
+	    size <= engine->total - p &&
+	    zfs_range_tree_contains(engine->free, p, size));
 }
 
 static int
-engine_store_validate_virtual(void)
+engine_store_validate_virtual(engine_t *engine)
 {
 	zfs_range_tree_t *seen = zfs_range_tree_create(NULL,
 	    ZFS_RANGE_SEG64, NULL, 0, 0);
-	zfs_range_tree_walk(engine.legacy, zfs_range_tree_add, seen);
+	zfs_range_tree_walk(engine->legacy, zfs_range_tree_add, seen);
 	int error = 0;
-	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-	    e = AVL_NEXT(&engine.owners, e)) {
+	for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+	    e = AVL_NEXT(&engine->owners, e)) {
 		uint64_t start, size;
-		uint64_t sector = 1ULL << engine.vd->vdev_ashift;
+		uint64_t sector = 1ULL << engine->vd->vdev_ashift;
 		if (!IS_P2ALIGNED(e->v, sector) ||
 		    !IS_P2ALIGNED(e->size, sector) ||
 		    zfs_range_tree_find_in(seen, e->v, e->size,
@@ -1123,6 +1141,7 @@ engine_store_validate_virtual(void)
 static int
 engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 {
+	engine_t *engine = spa->spa_reloc;
 	uint64_t txg, pool, top, *mos, *g, *state, *legacy, *journal;
 	uint64_t *checkpoint;
 	uint_t nm, ng, ns, nl, nr, nb, nj, nc;
@@ -1140,79 +1159,82 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		ENGINE_REFUSE(2);
 	if (nvlist_lookup_uint64_array(nv, "journal", &journal, &nj) != 0 ||
 	    nj != 4 || journal[1] != ENGINE_JOURNAL_BYTES ||
-	    journal[0] >= engine.total ||
-	    journal[1] * engine.vd->vdev_children >
-	    engine.total - journal[0] ||
-	    journal[0] % (engine.vd->vdev_children * ENGINE_STORE_PAGE) != 0)
+	    journal[0] >= engine->total ||
+	    journal[1] * engine->vd->vdev_children >
+	    engine->total - journal[0] ||
+	    journal[0] % (engine->vd->vdev_children * ENGINE_STORE_PAGE) != 0)
 		ENGINE_REFUSE(3);
 	if (nvlist_lookup_uint64_array(nv, "checkpoint", &checkpoint,
 	    &nc) != 0 ||
-	    nc != sizeof (engine.checkpoint) / sizeof (uint64_t))
+	    nc != sizeof (engine->checkpoint) / sizeof (uint64_t))
 		ENGINE_REFUSE(4);
-	memcpy(&engine.checkpoint, checkpoint, sizeof (engine.checkpoint));
-	if (engine.checkpoint.ub_txg != 0 &&
-	    (engine.checkpoint.ub_checkpoint_txg != engine.checkpoint.ub_txg ||
-	    engine.checkpoint.ub_txg > ub->ub_txg ||
-	    !pr19262_engine_store_ub(&engine.checkpoint)))
+	memcpy(&engine->checkpoint, checkpoint, sizeof (engine->checkpoint));
+	if (engine->checkpoint.ub_txg != 0 &&
+	    (engine->checkpoint.ub_checkpoint_txg !=
+	    engine->checkpoint.ub_txg ||
+	    engine->checkpoint.ub_txg > ub->ub_txg ||
+	    !pr19262_engine_store_ub(&engine->checkpoint)))
 		ENGINE_REFUSE(5);
 	if (txg != ub->ub_pr19262[6] || pool != spa_guid(spa) ||
-	    top != engine.vd->vdev_guid || nm != 16 || ng != 6 || ns != 3 ||
+	    top != engine->vd->vdev_guid || nm != 16 || ng != 6 || ns != 3 ||
 	    memcmp(mos, &ub->ub_rootbp, sizeof (blkptr_t)) != 0 ||
-	    g[0] != engine.total || g[1] != engine.vd->vdev_ms_shift ||
-	    g[2] != engine.vd->vdev_ashift ||
-	    g[3] != engine.vd->vdev_children ||
-	    g[4] != engine.arena || g[5] != engine.arena_bytes ||
+	    g[0] != engine->total || g[1] != engine->vd->vdev_ms_shift ||
+	    g[2] != engine->vd->vdev_ashift ||
+	    g[3] != engine->vd->vdev_children ||
+	    g[4] != engine->arena || g[5] != engine->arena_bytes ||
 	    nb != ENGINE_STORE_PAGES || nl % 2 != 0 ||
-	    nr > (engine.store_codec >= 6 ? engine_pages_row_limit() : 50000))
+	    nr > (engine->store_codec >= 6 ?
+	    engine_pages_row_limit(engine) : 50000))
 		ENGINE_REFUSE(6);
 	for (uint64_t i = 0; i < ENGINE_STORE_PAGES; i++)
 		if (bitmap[i] > 1 || (ub->ub_pr19262[15] == 5 &&
 		    i >= ub->ub_pr19262[4] &&
 		    i < ub->ub_pr19262[4] + ub->ub_pr19262[5] && !bitmap[i]))
 			ENGINE_REFUSE(7);
-	boolean_t at_floor = engine.store_codec >= 6 &&
-	    engine_pages.floor != 0 && ub->ub_txg == engine_pages.floor;
+	boolean_t at_floor = engine->store_codec >= 6 &&
+	    engine->pages->floor != 0 && ub->ub_txg == engine->pages->floor;
 	uint64_t dropped = 0;
-	engine.bitmap = kmem_alloc(ENGINE_STORE_PAGES, KM_SLEEP);
-	memcpy(engine.bitmap, bitmap, ENGINE_STORE_PAGES);
-	engine.sequence = state[0];
-	engine.next_incarnation = state[1];
-	engine.retired_limit = state[2];
-	engine.free = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0, 0);
-	engine.legacy = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	engine->bitmap = kmem_alloc(ENGINE_STORE_PAGES, KM_SLEEP);
+	memcpy(engine->bitmap, bitmap, ENGINE_STORE_PAGES);
+	engine->sequence = state[0];
+	engine->next_incarnation = state[1];
+	engine->retired_limit = state[2];
+	engine->free = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0, 0);
+	engine->legacy = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
 	    NULL, 0, 0);
-	zfs_range_tree_add(engine.free, 0, engine.total);
-	zfs_range_tree_remove(engine.free, engine.arena,
-	    engine.arena_bytes * engine.vd->vdev_children);
-	engine.store_extents = zfs_range_tree_create(NULL,
+	zfs_range_tree_add(engine->free, 0, engine->total);
+	zfs_range_tree_remove(engine->free, engine->arena,
+	    engine->arena_bytes * engine->vd->vdev_children);
+	engine->store_extents = zfs_range_tree_create(NULL,
 	    ZFS_RANGE_SEG64, NULL, 0, 0);
-	zfs_range_tree_add(engine.store_extents, engine.arena,
-	    engine.arena_bytes * engine.vd->vdev_children);
-	for (engine_marena_t *a = engine_pages.arenas; a != NULL;
+	zfs_range_tree_add(engine->store_extents, engine->arena,
+	    engine->arena_bytes * engine->vd->vdev_children);
+	for (engine_marena_t *a = engine->pages->arenas; a != NULL;
 	    a = a->next) {
-		if (a->p == engine.arena || a->pending)
+		if (a->p == engine->arena || a->pending)
 			continue;
 		uint64_t bytes = a->pages * ENGINE_STORE_PAGE *
-		    engine.vd->vdev_children;
-		if (!engine_store_extent(a->p, bytes))
+		    engine->vd->vdev_children;
+		if (!engine_store_extent(engine, a->p, bytes))
 			ENGINE_REFUSE(8);
-		zfs_range_tree_remove(engine.free, a->p, bytes);
-		zfs_range_tree_add(engine.store_extents, a->p, bytes);
+		zfs_range_tree_remove(engine->free, a->p, bytes);
+		zfs_range_tree_add(engine->store_extents, a->p, bytes);
 	}
-	engine.journal_arena = journal[0];
-	engine.journal_bytes = journal[1];
-	engine.journal_epoch[0] = journal[2];
-	engine.journal_epoch[1] = journal[3];
-	engine.journal_root = journal[0];
-	memcpy(engine.journal_root_epoch, engine.journal_epoch,
-	    sizeof (engine.journal_epoch));
-	uint64_t jsize = engine.journal_bytes * engine.vd->vdev_children;
-	if (!engine_store_extent(engine.journal_arena, jsize))
+	engine->journal_arena = journal[0];
+	engine->journal_bytes = journal[1];
+	engine->journal_epoch[0] = journal[2];
+	engine->journal_epoch[1] = journal[3];
+	engine->journal_root = journal[0];
+	memcpy(engine->journal_root_epoch, engine->journal_epoch,
+	    sizeof (engine->journal_epoch));
+	uint64_t jsize = engine->journal_bytes * engine->vd->vdev_children;
+	if (!engine_store_extent(engine, engine->journal_arena, jsize))
 		ENGINE_REFUSE(9);
-	zfs_range_tree_remove(engine.free, engine.journal_arena, jsize);
-	engine.journal_extents = zfs_range_tree_create(NULL,
+	zfs_range_tree_remove(engine->free, engine->journal_arena, jsize);
+	engine->journal_extents = zfs_range_tree_create(NULL,
 	    ZFS_RANGE_SEG64, NULL, 0, 0);
-	zfs_range_tree_add(engine.journal_extents, engine.journal_arena, jsize);
+	zfs_range_tree_add(engine->journal_extents, engine->journal_arena,
+	    jsize);
 	/* Cut segments stay quarantined until a fence frees them. */
 	uint64_t *cut;
 	uint_t ncut;
@@ -1220,16 +1242,16 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	    &ncut) == 0) {
 		if (ncut % 5 != 0)
 			ENGINE_REFUSE(10);
-		engine_j_segment_t **link = &engine.journal_retired;
+		engine_j_segment_t **link = &engine->journal_retired;
 		for (uint_t i = 0; i < ncut; i += 5) {
-			if (cut[i + 1] != engine.journal_bytes ||
-			    cut[i] % (engine.vd->vdev_children *
+			if (cut[i + 1] != engine->journal_bytes ||
+			    cut[i] % (engine->vd->vdev_children *
 			    ENGINE_STORE_PAGE) != 0 ||
-			    !engine_store_extent(cut[i], jsize) ||
+			    !engine_store_extent(engine, cut[i], jsize) ||
 			    cut[i + 4] == UINT64_MAX || cut[i + 4] > txg)
 				ENGINE_REFUSE(11);
-			zfs_range_tree_remove(engine.free, cut[i], jsize);
-			zfs_range_tree_add(engine.journal_extents, cut[i],
+			zfs_range_tree_remove(engine->free, cut[i], jsize);
+			zfs_range_tree_add(engine->journal_extents, cut[i],
 			    jsize);
 			engine_j_segment_t *s = kmem_zalloc(sizeof (*s),
 			    KM_SLEEP);
@@ -1241,19 +1263,19 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 			link = &s->next;
 		}
 	}
-	engine.journal_segments = engine.journal_tail =
+	engine->journal_segments = engine->journal_tail =
 	    kmem_zalloc(sizeof (engine_j_segment_t), KM_SLEEP);
-	engine.journal_tail->arena = engine.journal_arena;
-	engine.journal_tail->index = engine.journal_segment_count = 1;
-	engine.journal_tail->free_after = UINT64_MAX;
-	engine.journal_current = engine.journal_tail;
-	memcpy(engine.journal_tail->epoch, engine.journal_epoch,
-	    sizeof (engine.journal_epoch));
+	engine->journal_tail->arena = engine->journal_arena;
+	engine->journal_tail->index = engine->journal_segment_count = 1;
+	engine->journal_tail->free_after = UINT64_MAX;
+	engine->journal_current = engine->journal_tail;
+	memcpy(engine->journal_tail->epoch, engine->journal_epoch,
+	    sizeof (engine->journal_epoch));
 	for (uint_t i = 0; i < nl; i += 2) {
-		if (!engine_store_extent(legacy[i], legacy[i + 1]))
+		if (!engine_store_extent(engine, legacy[i], legacy[i + 1]))
 			ENGINE_REFUSE(12);
-		zfs_range_tree_remove(engine.free, legacy[i], legacy[i + 1]);
-		zfs_range_tree_add(engine.legacy, legacy[i], legacy[i + 1]);
+		zfs_range_tree_remove(engine->free, legacy[i], legacy[i + 1]);
+		zfs_range_tree_add(engine->legacy, legacy[i], legacy[i + 1]);
 	}
 	/* Released owner identities: their journal bindings are folded. */
 	uint64_t *tombs;
@@ -1268,27 +1290,27 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 			/* Bound to the tail once the chain is recovered. */
 			t->segment = UINT64_MAX;
 			avl_index_t where;
-			if (avl_find(&engine.tombstones, t, &where) != NULL) {
+			if (avl_find(&engine->tombstones, t, &where) != NULL) {
 				kmem_free(t, sizeof (*t));
 				ENGINE_REFUSE(14);
 			}
-			avl_insert(&engine.tombstones, t, where);
+			avl_insert(&engine->tombstones, t, where);
 		}
 	}
 	/* Older images list the rows past the last metaslab as legacy. */
-	engine.unusable = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	engine->unusable = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
 	    NULL, 0, 0);
-	if (engine.vd->vdev_ms_shift == 0)
+	if (engine->vd->vdev_ms_shift == 0)
 		ENGINE_REFUSE(15);
-	uint64_t covered = P2ALIGN_TYPED(engine.total,
-	    1ULL << engine.vd->vdev_ms_shift, uint64_t);
-	if (covered < engine.total) {
-		zfs_range_tree_clear(engine.free, covered,
-		    engine.total - covered);
-		zfs_range_tree_clear(engine.legacy, covered,
-		    engine.total - covered);
-		zfs_range_tree_add(engine.unusable, covered,
-		    engine.total - covered);
+	uint64_t covered = P2ALIGN_TYPED(engine->total,
+	    1ULL << engine->vd->vdev_ms_shift, uint64_t);
+	if (covered < engine->total) {
+		zfs_range_tree_clear(engine->free, covered,
+		    engine->total - covered);
+		zfs_range_tree_clear(engine->legacy, covered,
+		    engine->total - covered);
+		zfs_range_tree_add(engine->unusable, covered,
+		    engine->total - covered);
 	}
 	for (uint_t i = 0; i < nr; i++) {
 		uint64_t *v, *p;
@@ -1296,9 +1318,10 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		if (nvlist_lookup_uint64_array(rows[i], "V", &v, &nv) != 0 ||
 		    nvlist_lookup_uint64_array(rows[i], "P", &p, &np) != 0 ||
 		    nv != 8 || np == 0 || np % 8 != 0 || v[6] > 2 ||
-		    v[0] >= engine.total || v[1] == 0 ||
-		    v[1] > engine.total - v[0] || engine_find(v[0]) != NULL ||
-		    v[7] > txg || v[3] > engine.next_incarnation)
+		    v[0] >= engine->total || v[1] == 0 ||
+		    v[1] > engine->total - v[0] || engine_find(engine, v[0]) !=
+		    NULL ||
+		    v[7] > txg || v[3] > engine->next_incarnation)
 			ENGINE_REFUSE(16);
 		engine_owner_t *e = engine_owner_alloc(KM_SLEEP);
 		e->v = v[0]; e->size = v[1]; e->allocation_txg = v[2];
@@ -1308,11 +1331,11 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		e->checkpoint_only = v[6] == 2;
 		if (e->retired)
 			e->retired_txg = txg;
-		avl_add(&engine.owners, e);
+		avl_add(&engine->owners, e);
 		for (uint_t j = 0; j < np; j += 8) {
 			if (p[j + 3] <= p[j + 4] ||
 			    p[j + 3] > UINT16_MAX ||
-			    p[j + 3] > engine.vd->vdev_children ||
+			    p[j + 3] > engine->vd->vdev_children ||
 			    p[j + 4] == 0 || p[j + 4] > 3 ||
 			    p[j + 5] > 1 || p[j + 6] > 1 ||
 			    (j != 0 && p[j + 6] != 1))
@@ -1326,9 +1349,10 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 				dropped++;
 				continue;
 			}
-			if (!engine_store_extent(p[j], p[j + 1]))
+			if (!engine_store_extent(engine, p[j], p[j + 1]))
 				ENGINE_REFUSE(18);
-			engine_version_t *b = engine_version_new(e, p[j],
+			engine_version_t *b = engine_version_new(engine, e,
+			    p[j],
 			    p[j + 1], p[j + 2], B_TRUE);
 			engine_version_geometry(b, p[j + 3], p[j + 4]);
 			b->retired = p[j + 6];
@@ -1337,17 +1361,17 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 				b->retired_txg = txg;
 			if (j == 0)
 				e->cur = b;
-			zfs_range_tree_remove(engine.free, b->p, b->size);
+			zfs_range_tree_remove(engine->free, b->p, b->size);
 			if (b->retired || (e->retired && j == 0))
-				engine.retired += b->size;
+				engine->retired += b->size;
 		}
 	}
 	if (dropped != 0)
 		pr19262_printf("PR19262_FLOOR_DROP root=%llu catalog=%llu "
 		    "floor=%llu versions=%llu\n", (u_longlong_t)ub->ub_txg,
-		    (u_longlong_t)txg, (u_longlong_t)engine_pages.floor,
+		    (u_longlong_t)txg, (u_longlong_t)engine->pages->floor,
 		    (u_longlong_t)dropped);
-	return (engine_store_validate_virtual());
+	return (engine_store_validate_virtual(engine));
 }
 
 typedef struct engine_root_graph {
@@ -1361,15 +1385,16 @@ typedef struct engine_root_graph {
 static int
 engine_root_add(void *arg, const uberblock_t *ub)
 {
+	engine_t *engine = ((engine_root_graph_t *)arg)->spa->spa_reloc;
 	engine_root_graph_t *g = arg;
 	const uint64_t *d = ub->ub_pr19262;
 	/* Roots below the durable floor are not importable: skip them. */
-	if (pr19262_engine_store_ub(ub) && ub->ub_txg < engine_pages.floor)
+	if (pr19262_engine_store_ub(ub) && ub->ub_txg < engine->pages->floor)
 		return (0);
 	if (!pr19262_engine_store_ub(ub) || !engine_store_layout(d) ||
-	    d[1] != engine.vd->vdev_guid || d[2] != engine.arena ||
-	    d[3] != engine.arena_bytes || d[12] != engine.vd->vdev_ashift ||
-	    d[13] != engine.vd->vdev_children || d[14] != engine.total ||
+	    d[1] != engine->vd->vdev_guid || d[2] != engine->arena ||
+	    d[3] != engine->arena_bytes || d[12] != engine->vd->vdev_ashift ||
+	    d[13] != engine->vd->vdev_children || d[14] != engine->total ||
 	    d[6] == 0 ||
 	    d[6] > ub->ub_txg ||
 	    (d[6] != ub->ub_txg && (ub->ub_checkpoint_txg == 0 ||
@@ -1385,8 +1410,8 @@ engine_root_add(void *arg, const uberblock_t *ub)
 	if (g->count == g->capacity) {
 		uint64_t wanted = g->capacity == 0 ? 64 :
 		    (uint64_t)g->capacity * 2;
-		uint64_t limit = MIN(UINT_MAX, engine.total /
-		    (ENGINE_STORE_PAGE * engine.vd->vdev_children));
+		uint64_t limit = MIN(UINT_MAX, engine->total /
+		    (ENGINE_STORE_PAGE * engine->vd->vdev_children));
 		limit = MIN(limit, SIZE_MAX / sizeof (uberblock_t));
 		uint_t capacity = MIN(wanted, limit);
 		if (capacity == g->capacity)
@@ -1407,6 +1432,7 @@ engine_root_add(void *arg, const uberblock_t *ub)
 static int
 engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 {
+	engine_t *engine = g->spa->spa_reloc;
 	const uint64_t *d = ub->ub_pr19262;
 	int error = ECKSUM;
 	nvlist_t *nv = NULL;
@@ -1415,8 +1441,8 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 		    g->occupied, B_FALSE);
 	abd_t *abd = d[15] == 5 ?
 	    abd_alloc_linear(d[5] * ENGINE_STORE_PAGE, B_TRUE) : NULL;
-	for (uint_t c = 0; d[15] == 5 && c < engine.vd->vdev_children; c++) {
-		if (engine_store_io(engine.vd->vdev_child[c], d[4], d[5],
+	for (uint_t c = 0; d[15] == 5 && c < engine->vd->vdev_children; c++) {
+		if (engine_store_io(engine->vd->vdev_child[c], d[4], d[5],
 		    abd, B_FALSE) != 0)
 			continue;
 		zio_cksum_t hash;
@@ -1457,10 +1483,10 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 		if (error == 0) {
 			if (d[15] == 5)
 				engine_mmark(g->occupied,
-				    engine.arena + d[4] * ENGINE_STORE_PAGE *
-				    engine.vd->vdev_children,
+				    engine->arena + d[4] * ENGINE_STORE_PAGE *
+				    engine->vd->vdev_children,
 				    d[5] * ENGINE_STORE_PAGE *
-				    engine.vd->vdev_children);
+				    engine->vd->vdev_children);
 			pr19262_printf("PR19262_M_PIN catalog=%llu first=%llu "
 			    "pages=%llu cp=%llu cp_catalog=%llu\n",
 			    (u_longlong_t)d[6],
@@ -1477,6 +1503,7 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 int
 pr19262_engine_store_inventory(spa_t *spa, uint64_t *roots, uint64_t *pages)
 {
+	engine_t *engine = spa->spa_reloc;
 	*roots = *pages = 0;
 	/*
 	 * The caller holds no config locks.  Sync already holds STATE when
@@ -1484,10 +1511,10 @@ pr19262_engine_store_inventory(spa_t *spa, uint64_t *roots, uint64_t *pages)
 	 * through this reader.  Take ZIO only after acquiring store_lock.
 	 */
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
-	mutex_enter(&engine.store_lock);
+	mutex_enter(&engine->store_lock);
 	engine_store_test_phase(spa, 1);
 	if (!pr19262_engine_persistent(spa)) {
-		mutex_exit(&engine.store_lock);
+		mutex_exit(&engine->store_lock);
 		spa_config_exit(spa, SCL_STATE, FTAG);
 		return (ENOTSUP);
 	}
@@ -1503,14 +1530,14 @@ pr19262_engine_store_inventory(spa_t *spa, uint64_t *roots, uint64_t *pages)
 	if (error == 0) {
 		*roots = g->count;
 		*pages = zfs_range_tree_space(g->occupied) /
-		    (ENGINE_STORE_PAGE * engine.vd->vdev_children);
+		    (ENGINE_STORE_PAGE * engine->vd->vdev_children);
 	}
 	zfs_range_tree_vacate(g->occupied, NULL, NULL);
 	zfs_range_tree_destroy(g->occupied);
 	if (g->roots != NULL)
 		kmem_free(g->roots, g->capacity * sizeof (uberblock_t));
 	kmem_free(g, sizeof (*g));
-	mutex_exit(&engine.store_lock);
+	mutex_exit(&engine->store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	return (error);
 }
@@ -1519,12 +1546,13 @@ int
 pr19262_engine_mgrowth_probe(spa_t *spa, boolean_t advance,
     pr19262_mgrowth_probe_t *out)
 {
+	engine_t *engine = spa->spa_reloc;
 	memset(out, 0, sizeof (*out));
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
-	mutex_enter(&engine.store_lock);
+	mutex_enter(&engine->store_lock);
 	int error = pr19262_engine_persistent(spa) ?
 	    engine_pages_growth_probe(spa, advance, out) : ENOTSUP;
-	mutex_exit(&engine.store_lock);
+	mutex_exit(&engine->store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	return (error);
 }
@@ -1532,10 +1560,11 @@ pr19262_engine_mgrowth_probe(spa_t *spa, boolean_t advance,
 int
 pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 {
+	engine_t *engine = spa->spa_reloc;
 	if (!pr19262_engine_store_ub(ub))
 		return (0);
 	const uint64_t *d = ub->ub_pr19262;
-	if (engine.spa != NULL)
+	if (engine->spa != NULL)
 		return (ENOTSUP);
 	/* The trailer names the translated vdev; others stay native. */
 	vdev_t *vd = engine_target_vdev(spa, d[1]);
@@ -1561,12 +1590,12 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	    d[3] * d[13] > vd->vdev_asize - d[2] ||
 	    d[2] % (vd->vdev_children * ENGINE_STORE_PAGE) != 0)
 		ENGINE_REFUSE(20);
-	engine.vd = vd;
-	engine.vd_guid = vd->vdev_guid;
-	engine.foreign_normal = engine_foreign_normal(spa, vd);
-	engine.total = vd->vdev_asize;
-	engine.arena = d[2]; engine.arena_bytes = d[3];
-	engine.store_codec = d[15];
+	engine->vd = vd;
+	engine->vd_guid = vd->vdev_guid;
+	engine->foreign_normal = engine_foreign_normal(spa, vd);
+	engine->total = vd->vdev_asize;
+	engine->arena = d[2]; engine->arena_bytes = d[3];
+	engine->store_codec = d[15];
 	abd_t *abd = d[15] == 5 ?
 	    abd_alloc_for_io(d[5] * ENGINE_STORE_PAGE, B_TRUE) : NULL;
 	int error = ECKSUM;
@@ -1591,48 +1620,48 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 	spa_config_exit(spa, SCL_ZIO, FTAG);
 	if (abd != NULL)
 		abd_free(abd);
-	mutex_enter(&engine.lock);
+	mutex_enter(&engine->lock);
 	/* Roots below the durable floor may reference reused backing. */
-	if (error == 0 && d[15] >= 6 && ub->ub_txg < engine_pages.floor) {
+	if (error == 0 && d[15] >= 6 && ub->ub_txg < engine->pages->floor) {
 		pr19262_printf("PR19262_FLOOR_REFUSED ub=%llu floor=%llu\n",
 		    (u_longlong_t)ub->ub_txg,
-		    (u_longlong_t)engine_pages.floor);
+		    (u_longlong_t)engine->pages->floor);
 		error = SET_ERROR(ESTALE);
 	}
 	/* The label certificate is published after the control record. */
 	if (error == 0 && d[15] >= 6 &&
-	    pr19262_vdev_certified_parity(vd) > engine_pages.certified)
+	    pr19262_vdev_certified_parity(vd) > engine->pages->certified)
 		error = ENGINE_EINVAL(101);
 	if (error == 0)
 		error = engine_store_decode(spa, ub, nv);
 	if (error == 0 && d[15] >= 6)
-		error = engine_pages_install(nv);
+		error = engine_pages_install(engine, nv);
 	nvlist_free(nv);
 	if (error == 0) {
-		engine.persistent = B_TRUE;
-		engine.store_all = B_TRUE;
-		engine.spa = spa;
-		engine.stored_revision = engine.revision;
-		engine.durable_ub_txg = ub->ub_txg;
-		engine.durable_catalog_txg = d[6];
-		memcpy(engine.stored_desc, d, sizeof (engine.stored_desc));
-		memcpy(engine.durable_desc, d, sizeof (engine.durable_desc));
-		engine.certified = engine_pages.certified;
-		engine.admit_batch = ENGINE_ADMIT_BATCH;
-		engine.admit_refreshed = UINT64_MAX;
-		engine.admit_cached_parity = UINT64_MAX;
+		engine->persistent = B_TRUE;
+		engine->store_all = B_TRUE;
+		engine->spa = spa;
+		engine->stored_revision = engine->revision;
+		engine->durable_ub_txg = ub->ub_txg;
+		engine->durable_catalog_txg = d[6];
+		memcpy(engine->stored_desc, d, sizeof (engine->stored_desc));
+		memcpy(engine->durable_desc, d, sizeof (engine->durable_desc));
+		engine->certified = engine->pages->certified;
+		engine->admit_batch = ENGINE_ADMIT_BATCH;
+		engine->admit_refreshed = UINT64_MAX;
+		engine->admit_cached_parity = UINT64_MAX;
 		vdev_raidz_layout_for_birth(vd, ub->ub_txg + 1, NULL,
-		    &engine.admit_parity);
+		    &engine->admit_parity);
 		/* Open native space maps even for a read-only SPA. */
 		spa->spa_read_spacemaps = B_TRUE;
 		pr19262_printf("PR19262_STORE_LOAD pre-MOS txg=%llu "
 		    "owners=%llu catalog=%llu\n", (u_longlong_t)ub->ub_txg,
-		    (u_longlong_t)avl_numnodes(&engine.owners),
+		    (u_longlong_t)avl_numnodes(&engine->owners),
 		    (u_longlong_t)d[6]);
 	} else {
-		engine_store_clear();
+		engine_store_clear(engine);
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	if (error == 0)
 		error = engine_journal_recover(spa);
 	/*
@@ -1662,15 +1691,16 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 int
 pr19262_engine_store_recover(spa_t *spa)
 {
+	engine_t *engine = spa->spa_reloc;
 	if (!pr19262_engine_persistent(spa) || !spa_writeable(spa))
 		return (0);
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
-	mutex_enter(&engine.store_lock);
+	mutex_enter(&engine->store_lock);
 	int error = engine_pages_reconcile(spa, B_TRUE);
 	/* Members that returned after missing writes get the live pages. */
 	if (error == 0)
 		error = engine_pages_resilver_members(spa);
-	mutex_exit(&engine.store_lock);
+	mutex_exit(&engine->store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	return (error);
 }
@@ -1680,17 +1710,18 @@ int
 pr19262_engine_raw_audit(spa_t *spa, const char *label, uint64_t *ok,
     uint64_t *missing)
 {
+	engine_t *engine = spa->spa_reloc;
 	if (!pr19262_engine_persistent(spa))
 		return (ENOTSUP);
 	if (spa_writeable(spa))
 		txg_wait_synced(spa->spa_dsl_pool, 0);
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
-	mutex_enter(&engine.store_lock);
+	mutex_enter(&engine->store_lock);
 	uint64_t written;
 	int error = engine_pages_members(spa, -1, ok, missing, &written);
 	if (error == 0)
 		engine_pages_audit_print(spa, label, ok, missing);
-	mutex_exit(&engine.store_lock);
+	mutex_exit(&engine->store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	return (error);
 }

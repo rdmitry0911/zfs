@@ -5374,7 +5374,7 @@ zio_vdev_io_start(zio_t *zio)
 				    (longlong_t)zio->io_bookmark.zb_level,
 				    (u_longlong_t)zio->io_bookmark.zb_blkid);
 				pr19262_flush();
-				pr19262_engine_hold_report(
+				pr19262_engine_hold_report(zio->io_spa,
 				    zio->io_pr19262_owner_hold);
 				pr19262_backtrace();
 			}

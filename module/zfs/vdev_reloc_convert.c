@@ -13,10 +13,10 @@
 #include <sys/zil_impl.h>
 
 static void
-engine_version_unlink(engine_owner_t *e, engine_version_t *b)
+engine_version_unlink(engine_t *engine, engine_owner_t *e, engine_version_t *b)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
-	engine_owner_dirty(e);
+	ASSERT(MUTEX_HELD(&engine->lock));
+	engine_owner_dirty(engine, e);
 	engine_version_t **link = &e->versions;
 	while (*link != b) {
 		VERIFY3P(*link, !=, NULL);
@@ -29,12 +29,13 @@ void
 pr19262_engine_census(spa_t *spa, uint64_t parity,
     pr19262_engine_census_t *c)
 {
+	engine_t *engine = spa->spa_reloc;
 	memset(c, 0, sizeof (*c));
 	c->min_parity = UINT64_MAX;
-	mutex_enter(&engine.lock);
-	VERIFY3P(spa, ==, engine.spa);
-	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-	    e = AVL_NEXT(&engine.owners, e)) {
+	mutex_enter(&engine->lock);
+	VERIFY3P(spa, ==, engine->spa);
+	for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+	    e = AVL_NEXT(&engine->owners, e)) {
 		c->owners++;
 		c->retired_owners += e->retired;
 		for (engine_version_t *b = e->versions; b != NULL;
@@ -56,49 +57,53 @@ pr19262_engine_census(spa_t *spa, uint64_t parity,
 	}
 	if (c->min_parity == UINT64_MAX)
 		c->min_parity = 0;
-	c->legacy_bytes = zfs_range_tree_space(engine.legacy);
-	c->legacy_segments = zfs_range_tree_numsegs(engine.legacy);
-	c->unusable_bytes = zfs_range_tree_space(engine.unusable);
-	c->free_bytes = zfs_range_tree_space(engine.free);
-	if (engine.store_extents != NULL)
-		c->store_bytes = zfs_range_tree_space(engine.store_extents);
-	if (engine.journal_extents != NULL)
-		c->journal_bytes = zfs_range_tree_space(engine.journal_extents);
-	for (engine_j_segment_t *s = engine.journal_segments; s != NULL;
+	c->legacy_bytes = zfs_range_tree_space(engine->legacy);
+	c->legacy_segments = zfs_range_tree_numsegs(engine->legacy);
+	c->unusable_bytes = zfs_range_tree_space(engine->unusable);
+	c->free_bytes = zfs_range_tree_space(engine->free);
+	if (engine->store_extents != NULL)
+		c->store_bytes = zfs_range_tree_space(engine->store_extents);
+	if (engine->journal_extents != NULL)
+		c->journal_bytes =
+		    zfs_range_tree_space(engine->journal_extents);
+	for (engine_j_segment_t *s = engine->journal_segments; s != NULL;
 	    s = s->next)
 		c->journal_segments++;
-	for (engine_j_segment_t *s = engine.journal_retired; s != NULL;
+	for (engine_j_segment_t *s = engine->journal_retired; s != NULL;
 	    s = s->next)
 		c->journal_retired++;
-	c->journal_freed_bytes = engine.journal_freed_bytes;
-	c->tombstones = avl_numnodes(&engine.tombstones);
-	c->floor = engine_pages.floor;
-	c->certified = engine.certified;
-	c->durable_txg = engine.durable_ub_txg;
-	c->journal_seq = engine.journal_seq;
-	c->pages_capacity = engine_pages.capacity;
-	for (uint64_t i = 0; i < engine_pages.capacity; i++)
-		c->pages_used += engine_pages.bits[i] != 0;
-	mutex_exit(&engine.lock);
+	c->journal_freed_bytes = engine->journal_freed_bytes;
+	c->tombstones = avl_numnodes(&engine->tombstones);
+	c->floor = engine->pages->floor;
+	c->certified = engine->certified;
+	c->durable_txg = engine->durable_ub_txg;
+	c->journal_seq = engine->journal_seq;
+	c->pages_capacity = engine->pages->capacity;
+	for (uint64_t i = 0; i < engine->pages->capacity; i++)
+		c->pages_used += engine->pages->bits[i] != 0;
+	mutex_exit(&engine->lock);
 }
 
 uint64_t
 pr19262_engine_owner_incarnation(spa_t *spa, uint64_t v, uint64_t size)
 {
-	mutex_enter(&engine.lock);
-	engine_owner_t *e = engine.spa == spa ? engine_overlap(v, size) : NULL;
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	engine_owner_t *e = engine->spa == spa ? engine_overlap(engine, v,
+	    size) : NULL;
 	uint64_t incarnation = e == NULL ? 0 : e->incarnation;
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (incarnation);
 }
 
 uint64_t
 pr19262_engine_floor(spa_t *spa)
 {
-	mutex_enter(&engine.lock);
-	uint64_t floor = engine.spa == spa && engine.persistent ?
-	    engine_pages.floor : 0;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	uint64_t floor = engine->spa == spa && engine->persistent ?
+	    engine->pages->floor : 0;
+	mutex_exit(&engine->lock);
 	return (floor);
 }
 
@@ -108,9 +113,9 @@ pr19262_engine_floor(spa_t *spa)
  * and nothing references it any more.
  */
 static boolean_t
-engine_owner_releasable(engine_owner_t *e, uint64_t catalog)
+engine_owner_releasable(engine_t *engine, engine_owner_t *e, uint64_t catalog)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	ASSERT(MUTEX_HELD(&engine->lock));
 	if (!e->retired || e->aborted || e->checkpoint_only || e->copying ||
 	    e->releasing || e->pending != NULL || e->holds != 0 ||
 	    e->queued_writers != 0 || e->journal_pending ||
@@ -131,55 +136,57 @@ typedef struct engine_release {
 static void
 engine_release_sync(void *arg, dmu_tx_t *tx)
 {
+	engine_t *engine = dmu_tx_pool(tx)->dp_spa->spa_reloc;
 	engine_release_t *r = arg;
 	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
 	for (;;) {
-		mutex_enter(&engine.lock);
+		mutex_enter(&engine->lock);
 		engine_owner_t *e = NULL;
-		if (engine.spa == spa && engine.persistent) {
-			for (e = avl_first(&engine.owners); e != NULL;
-			    e = AVL_NEXT(&engine.owners, e))
-				if (engine_owner_releasable(e, r->catalog))
+		if (engine->spa == spa && engine->persistent) {
+			for (e = avl_first(&engine->owners); e != NULL;
+			    e = AVL_NEXT(&engine->owners, e))
+				if (engine_owner_releasable(engine, e,
+				    r->catalog))
 					break;
 		}
 		if (e == NULL) {
-			mutex_exit(&engine.lock);
+			mutex_exit(&engine->lock);
 			return;
 		}
 		e->releasing = B_TRUE;
 		uint64_t v = e->v, size = e->size;
-		engine.release_thread = curthread;
-		mutex_exit(&engine.lock);
+		engine->release_thread = curthread;
+		mutex_exit(&engine->lock);
 		/* The native V returns to this syncing txg's space map. */
-		metaslab_free_concrete(engine.vd, v, size, B_FALSE);
-		mutex_enter(&engine.lock);
-		engine.release_thread = NULL;
-		VERIFY3P(engine_find(v), ==, e);
+		metaslab_free_concrete(engine->vd, v, size, B_FALSE);
+		mutex_enter(&engine->lock);
+		engine->release_thread = NULL;
+		VERIFY3P(engine_find(engine, v), ==, e);
 		while (e->versions != NULL) {
 			engine_version_t *b = e->versions;
 			e->versions = b->next;
 			VERIFY0(b->leases);
-			zfs_range_tree_verify_not_present(engine.free, b->p,
+			zfs_range_tree_verify_not_present(engine->free, b->p,
 			    b->size);
-			zfs_range_tree_add(engine.free, b->p, b->size);
+			zfs_range_tree_add(engine->free, b->p, b->size);
 			if (b->retired || b == e->cur) {
-				VERIFY3U(engine.retired, >=, b->size);
-				engine.retired -= b->size;
+				VERIFY3U(engine->retired, >=, b->size);
+				engine->retired -= b->size;
 			}
 			r->bytes += b->size;
 			kmem_free(b, sizeof (*b));
 		}
-		engine_owner_gone(e);
-		avl_remove(&engine.owners, e);
+		engine_owner_gone(engine, e);
+		avl_remove(&engine->owners, e);
 		/* Journal records of this identity may still be replayed. */
 		if (e->journal_touched)
-			engine_tombstone_add(v, e->incarnation,
-			    engine.journal_tail != NULL ?
-			    engine.journal_tail->index : 0);
+			engine_tombstone_add(engine, v, e->incarnation,
+			    engine->journal_tail != NULL ?
+			    engine->journal_tail->index : 0);
 		kmem_free(e, sizeof (*e));
 		r->owners++;
-		engine.revision++;
-		mutex_exit(&engine.lock);
+		engine->revision++;
+		mutex_exit(&engine->lock);
 	}
 }
 
@@ -195,35 +202,36 @@ int
 pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
     uint64_t *released, uint64_t *sample)
 {
+	engine_t *engine = spa->spa_reloc;
 	*floor = *reclaimed = *released = 0;
 	if (!pr19262_engine_persistent(spa) || !spa_writeable(spa))
 		return (ENOTSUP);
 	/* The catalog listing the retirements must be on disk first. */
 	txg_wait_synced(spa->spa_dsl_pool, 0);
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
-	mutex_enter(&engine.store_lock);
-	mutex_enter(&engine.lock);
-	uint64_t ub = engine.durable_ub_txg;
-	uint64_t catalog = engine.durable_catalog_txg;
-	boolean_t checkpoint = engine.checkpoint.ub_txg != 0;
-	mutex_exit(&engine.lock);
+	mutex_enter(&engine->store_lock);
+	mutex_enter(&engine->lock);
+	uint64_t ub = engine->durable_ub_txg;
+	uint64_t catalog = engine->durable_catalog_txg;
+	boolean_t checkpoint = engine->checkpoint.ub_txg != 0;
+	mutex_exit(&engine->lock);
 	int error = 0;
 	uint64_t pages_freed = 0, journal_segments = 0, journal_bytes = 0;
 	if (checkpoint)
 		error = EBUSY;
-	else if (ub == 0 || ub < engine_pages.floor || catalog > ub)
+	else if (ub == 0 || ub < engine->pages->floor || catalog > ub)
 		error = ENGINE_EINVAL(101);
-	else if (ub != engine_pages.floor || engine_pages.gc_relaxed) {
+	else if (ub != engine->pages->floor || engine->pages->gc_relaxed) {
 		/* Dead catalog pages go with the floor into both slots. */
 		error = engine_pages_gc(spa, &pages_freed);
 		if (error == 0)
 			error = engine_pages_publish_control(spa, ub,
-			    engine_pages.certified);
+			    engine->pages->certified);
 	}
 	if (error == 0) {
-		mutex_enter(&engine.lock);
-		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-		    e = AVL_NEXT(&engine.owners, e)) {
+		mutex_enter(&engine->lock);
+		for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+		    e = AVL_NEXT(&engine->owners, e)) {
 			engine_version_t *b = e->versions;
 			while (b != NULL) {
 				engine_version_t *next = b->next;
@@ -233,26 +241,26 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 				    b->retired_txg != 0 &&
 				    b->retired_txg <= catalog &&
 				    b->leases == 0 && b->writers == 0) {
-					engine_version_unlink(e, b);
+					engine_version_unlink(engine, e, b);
 					zfs_range_tree_verify_not_present(
-					    engine.free, b->p, b->size);
-					zfs_range_tree_add(engine.free, b->p,
+					    engine->free, b->p, b->size);
+					zfs_range_tree_add(engine->free, b->p,
 					    b->size);
-					VERIFY3U(engine.retired, >=, b->size);
-					engine.retired -= b->size;
+					VERIFY3U(engine->retired, >=, b->size);
+					engine->retired -= b->size;
 					if (sample != NULL && sample[1] == 0) {
 						sample[0] = b->p;
 						sample[1] = b->size;
 					}
 					*reclaimed += b->size;
-					engine.revision++;
+					engine->revision++;
 					kmem_free(b, sizeof (*b));
 				}
 				b = next;
 			}
 		}
-		*floor = engine_pages.floor;
-		mutex_exit(&engine.lock);
+		*floor = engine->pages->floor;
+		mutex_exit(&engine->lock);
 		/* Journal segments folded into this floor root's catalog. */
 		engine_journal_gc(spa, catalog, &journal_segments,
 		    &journal_bytes);
@@ -267,7 +275,7 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 		pr19262_flush();
 		pr19262_exit(0);
 	}
-	mutex_exit(&engine.store_lock);
+	mutex_exit(&engine->store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	if (error != 0)
 		return (error);
@@ -300,12 +308,13 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 static void
 engine_fence_task(void *arg)
 {
+	engine_t *engine = ((spa_t *)arg)->spa_reloc;
 	spa_t *spa = arg;
 	uint64_t floor, reclaimed, released;
 #ifndef _KERNEL
-	mutex_enter(&engine.lock);
-	pr19262_export_fence_test_t *test = engine.export_fence_test;
-	mutex_exit(&engine.lock);
+	mutex_enter(&engine->lock);
+	pr19262_export_fence_test_t *test = engine->export_fence_test;
+	mutex_exit(&engine->lock);
 	if (test != NULL) {
 		mutex_enter(&test->lock);
 		test->paused = B_TRUE;
@@ -317,7 +326,7 @@ engine_fence_task(void *arg)
 #endif
 	int error = pr19262_engine_fence(spa, &floor, &reclaimed, &released,
 	    NULL);
-	mutex_enter(&engine.lock);
+	mutex_enter(&engine->lock);
 #ifndef _KERNEL
 	if (test != NULL) {
 		mutex_enter(&test->lock);
@@ -327,12 +336,12 @@ engine_fence_task(void *arg)
 		mutex_exit(&test->lock);
 	}
 #endif
-	engine.fence_error = error;
-	engine.fence_auto += error == 0;
-	engine.fence_stalled = error == 0 && reclaimed == 0 && released == 0;
-	engine.fence_pending = B_FALSE;
-	cv_broadcast(&engine.fence_cv);
-	mutex_exit(&engine.lock);
+	engine->fence_error = error;
+	engine->fence_auto += error == 0;
+	engine->fence_stalled = error == 0 && reclaimed == 0 && released == 0;
+	engine->fence_pending = B_FALSE;
+	cv_broadcast(&engine->fence_cv);
+	mutex_exit(&engine->lock);
 	pr19262_printf("PR19262_FENCE_AUTO error=%d floor=%llu reclaimed=%llu "
 	    "released=%llu\n", error, (u_longlong_t)floor,
 	    (u_longlong_t)reclaimed, (u_longlong_t)released);
@@ -350,11 +359,12 @@ void
 pr19262_engine_export_fence_arm(spa_t *spa,
     pr19262_export_fence_test_t *test)
 {
-	mutex_enter(&engine.lock);
-	VERIFY3P(engine.spa, ==, spa);
-	VERIFY(!engine.fence_pending);
-	engine.export_fence_test = test;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	VERIFY3P(engine->spa, ==, spa);
+	VERIFY(!engine->fence_pending);
+	engine->export_fence_test = test;
+	mutex_exit(&engine->lock);
 }
 #endif
 
@@ -362,22 +372,23 @@ pr19262_engine_export_fence_arm(spa_t *spa,
 void
 pr19262_engine_quiesce(spa_t *spa)
 {
-	mutex_enter(&engine.lock);
-	if (engine.spa == spa) {
-		engine.fence_quiesced = B_TRUE;
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->spa == spa) {
+		engine->fence_quiesced = B_TRUE;
 #ifndef _KERNEL
-		pr19262_export_fence_test_t *test = engine.export_fence_test;
-		if (engine.fence_pending && test != NULL) {
+		pr19262_export_fence_test_t *test = engine->export_fence_test;
+		if (engine->fence_pending && test != NULL) {
 			mutex_enter(&test->lock);
 			test->quiescing = B_TRUE;
 			cv_broadcast(&test->changed);
 			mutex_exit(&test->lock);
 		}
 #endif
-		while (engine.fence_pending)
-			cv_wait(&engine.fence_cv, &engine.lock);
+		while (engine->fence_pending)
+			cv_wait(&engine->fence_cv, &engine->lock);
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 }
 
 /*
@@ -389,12 +400,12 @@ pr19262_engine_quiesce(spa_t *spa)
  */
 /* Name the owners whose current version is weaker than the target. */
 static void
-engine_weak_report(uint64_t parity)
+engine_weak_report(engine_t *engine, uint64_t parity)
 {
 	uint64_t n = 0;
-	mutex_enter(&engine.lock);
-	for (engine_owner_t *e = avl_first(&engine.owners);
-	    e != NULL && n < 8; e = AVL_NEXT(&engine.owners, e)) {
+	mutex_enter(&engine->lock);
+	for (engine_owner_t *e = avl_first(&engine->owners);
+	    e != NULL && n < 8; e = AVL_NEXT(&engine->owners, e)) {
 		engine_version_t *b = e->cur;
 		if (b == NULL || e->retired || e->aborted ||
 		    b->parity >= parity)
@@ -417,23 +428,24 @@ engine_weak_report(uint64_t parity)
 		    (u_longlong_t)b->leases, (u_longlong_t)b->writers, b->ready,
 		    (u_longlong_t)b->journal_seq, (u_longlong_t)e->created);
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 }
 
 int
 pr19262_engine_certify(spa_t *spa, uint64_t parity)
 {
+	engine_t *engine = spa->spa_reloc;
 	if (!pr19262_engine_persistent(spa) || !spa_writeable(spa))
 		return (ENOTSUP);
 	pr19262_engine_census_t c;
 	pr19262_engine_census(spa, parity, &c);
-	mutex_enter(&engine.lock);
-	boolean_t checkpoint = engine.checkpoint.ub_txg != 0;
-	mutex_exit(&engine.lock);
+	mutex_enter(&engine->lock);
+	boolean_t checkpoint = engine->checkpoint.ub_txg != 0;
+	mutex_exit(&engine->lock);
 	if (c.legacy_bytes != 0 || c.weak_current != 0 ||
 	    c.weak_retired != 0 || c.floor == 0 || checkpoint ||
 	    parity == 0 || parity > VDEV_RAIDZ_MAXPARITY ||
-	    engine.vd->vdev_children < parity + 1) {
+	    engine->vd->vdev_children < parity + 1) {
 		pr19262_printf("PR19262_CERTIFY_REFUSED parity=%llu "
 		    "legacy=%llu weak_current=%llu weak_retired=%llu "
 		    "floor=%llu checkpoint=%u\n", (u_longlong_t)parity,
@@ -441,25 +453,25 @@ pr19262_engine_certify(spa_t *spa, uint64_t parity)
 		    (u_longlong_t)c.weak_retired, (u_longlong_t)c.floor,
 		    checkpoint);
 		if (c.weak_current != 0)
-			engine_weak_report(parity);
+			engine_weak_report(engine, parity);
 		return (EBUSY);
 	}
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
-	mutex_enter(&engine.store_lock);
-	int error = engine_pages_publish_control(spa, engine_pages.floor,
+	mutex_enter(&engine->store_lock);
+	int error = engine_pages_publish_control(spa, engine->pages->floor,
 	    parity);
 	if (error == 0) {
-		mutex_enter(&engine.lock);
-		engine.certified = parity;
-		mutex_exit(&engine.lock);
+		mutex_enter(&engine->lock);
+		engine->certified = parity;
+		mutex_exit(&engine->lock);
 	}
-	mutex_exit(&engine.store_lock);
+	mutex_exit(&engine->store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	if (error != 0)
 		return (error);
 	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_WRITER);
-	pr19262_vdev_certify(engine.vd, parity);
-	vdev_config_dirty(engine.vd);
+	pr19262_vdev_certify(engine->vd, parity);
+	vdev_config_dirty(engine->vd);
 	spa_config_exit(spa, SCL_CONFIG, FTAG);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
 	pr19262_printf("PR19262_CERTIFIED parity=%llu floor=%llu "
@@ -565,12 +577,14 @@ engine_convert_collect(spa_t *spa, const blkptr_t *bp, void *arg)
 static boolean_t
 engine_convert_weak(engine_convert_t *c, const blkptr_t *bp, int d)
 {
+	engine_t *engine = c->spa->spa_reloc;
 	boolean_t weak = B_FALSE;
-	mutex_enter(&engine.lock);
-	engine_owner_t *e = engine_find(DVA_GET_OFFSET(&bp->blk_dva[d]));
+	mutex_enter(&engine->lock);
+	engine_owner_t *e = engine_find(engine,
+	    DVA_GET_OFFSET(&bp->blk_dva[d]));
 	if (e != NULL && !e->retired && !e->aborted && e->cur != NULL)
 		weak = e->cur->parity < c->parity;
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (weak);
 }
 
@@ -593,6 +607,7 @@ engine_convert_grouped(engine_convert_t *c, uint64_t v)
 static int
 engine_convert_drain(engine_convert_t *c)
 {
+	engine_t *engine = c->spa->spa_reloc;
 	uint_t n = c->group_count;
 	if (n == 0)
 		return (0);
@@ -654,10 +669,10 @@ engine_convert_drain(engine_convert_t *c)
 		st->old_bytes += g->before.psize;
 		st->new_bytes += after.psize;
 		c->pending += after.psize;
-		mutex_enter(&engine.lock);
+		mutex_enter(&engine->lock);
 		st->peak_retired_bytes = MAX(st->peak_retired_bytes,
-		    engine.retired);
-		mutex_exit(&engine.lock);
+		    engine->retired);
+		mutex_exit(&engine->lock);
 	}
 	for (uint_t i = 0; i < c->group_hold_count; i++)
 		pr19262_engine_rele(c->group_holds[i]);
@@ -685,11 +700,12 @@ static int
 engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
     boolean_t member)
 {
+	engine_t *engine = c->spa->spa_reloc;
 	spa_t *spa = c->spa;
 	pr19262_engine_convert_stats_t *st = c->stats;
 	boolean_t mine = B_FALSE;
 	for (int d = 0; d < BP_GET_NDVAS(bp); d++)
-		mine |= DVA_GET_VDEV(&bp->blk_dva[d]) == engine.vd->vdev_id;
+		mine |= DVA_GET_VDEV(&bp->blk_dva[d]) == engine->vd->vdev_id;
 	if (!mine)
 		return (0);
 	st->visited++;
@@ -709,7 +725,7 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 	if (error != 0)
 		goto out;
 	for (int d = 0; d < BP_GET_NDVAS(bp) && error == 0; d++) {
-		if (DVA_GET_VDEV(&bp->blk_dva[d]) != engine.vd->vdev_id ||
+		if (DVA_GET_VDEV(&bp->blk_dva[d]) != engine->vd->vdev_id ||
 		    !engine_convert_weak(c, bp, d))
 			continue;
 		/* A block the walk meets twice (a clone) is copied once. */
@@ -718,8 +734,8 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 		st->candidates++;
 		/* Admit this copy's bytes, catalog row and journal frame. */
 		uint64_t psize = DVA_GET_GANG(&bp->blk_dva[d]) ?
-		    vdev_gang_header_psize(engine.vd) : BP_GET_PSIZE(bp);
-		uint64_t asize = vdev_psize_to_asize_txg(engine.vd, psize,
+		    vdev_gang_header_psize(engine->vd) : BP_GET_PSIZE(bp);
+		uint64_t asize = vdev_psize_to_asize_txg(engine->vd, psize,
 		    c->birth);
 		uint64_t pages = pr19262_engine_admit_row_pages(spa);
 		if (pr19262_engine_admit(spa, PR19262_ADMIT_CONVERTER,
@@ -1028,6 +1044,7 @@ int
 pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
     uint64_t max_passes, pr19262_engine_convert_stats_t *stats)
 {
+	engine_t *engine = spa->spa_reloc;
 	memset(stats, 0, sizeof (*stats));
 	if (!pr19262_engine_active(spa) || !spa_writeable(spa))
 		return (ENOTSUP);
@@ -1038,7 +1055,7 @@ pr19262_engine_convert(spa_t *spa, uint64_t birth, uint64_t batch,
 	/* A block's DVAs join one group: room for all past the cap. */
 	c.group_max = MAX(1, MIN(zfs_pr19262_convert_group, 1024));
 	uint_t group_capacity = c.group_max + SPA_DVAS_PER_BP;
-	vdev_raidz_layout_for_birth(engine.vd, birth, NULL, &c.parity);
+	vdev_raidz_layout_for_birth(engine->vd, birth, NULL, &c.parity);
 	dsl_pool_t *dp = spa->spa_dsl_pool;
 	/*
 	 * The standing reserve already holds the growth of every weaker

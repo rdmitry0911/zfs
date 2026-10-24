@@ -10,6 +10,7 @@
 #include <sys/vdev_raidz.h>
 #include <sys/zio_checksum.h>
 
+typedef struct pr19262_engine engine_t;
 typedef struct engine_owner engine_owner_t;
 
 typedef struct engine_version {
@@ -72,6 +73,7 @@ typedef struct engine_owner {
 } engine_owner_t;
 
 typedef struct engine_hold {
+	spa_t *spa;
 	uint64_t refs;
 	uint_t count;
 	engine_owner_t *owner[SPA_DVAS_PER_BP];
@@ -98,6 +100,7 @@ typedef struct engine_tomb {
 } engine_tomb_t;
 
 typedef struct engine_copy {
+	spa_t *spa;
 	engine_owner_t *owner;
 	engine_version_t *source;
 	engine_version_t *stage;
@@ -106,28 +109,6 @@ typedef struct engine_copy {
 } engine_copy_t;
 
 /* Group wall time, partitioned at the real I/O and publication steps. */
-static struct {
-	uint64_t groups;
-	uint64_t blocks;
-	uint64_t bytes;
-	uint64_t setup;
-	uint64_t io[3];
-	uint64_t check;
-	uint64_t flush;
-	uint64_t settle;
-	uint64_t journal;
-	uint64_t publish;
-	uint64_t total;
-} engine_copy_cost;
-
-static struct {
-	uint64_t rebuilds;
-	uint64_t rebuilt;
-	uint64_t walked;
-	uint64_t updates;
-	uint64_t checked;
-	uint64_t pages_checked;
-} engine_admit_cost;
 
 typedef struct engine_j_segment {
 	struct engine_j_segment *next;
@@ -150,9 +131,9 @@ static void engine_journal_bind_copies(engine_copy_t **, uint_t,
     const boolean_t *, int *);
 static void engine_journal_test_event(spa_t *, const blkptr_t *, int);
 static void engine_journal_fold(spa_t *, uint64_t);
-static void engine_admit_owner_update(engine_owner_t *);
-static void engine_admit_owner_forget(engine_owner_t *);
-static uint_t engine_store_tolerated(void);
+static void engine_admit_owner_update(engine_t *, engine_owner_t *);
+static void engine_admit_owner_forget(engine_t *, engine_owner_t *);
+static uint_t engine_store_tolerated(engine_t *);
 /* Default converter batch the standing reserve keeps free. */
 #define	ENGINE_ADMIT_BATCH (8ULL << 20)
 
@@ -169,7 +150,6 @@ typedef struct engine_quorum {
 } engine_quorum_t;
 
 /* Any raw I/O error invalidates the control-slot cache. */
-static uint64_t engine_io_errors;
 
 /* One page of a raw step that every member of the vdev writes. */
 typedef struct engine_member_page {
@@ -180,25 +160,59 @@ typedef struct engine_member_page {
 
 static void engine_members_flush(spa_t *, engine_quorum_t *);
 
-static void
-engine_quorum_add(engine_quorum_t *q, int error)
-{
-	if (error == 0)
-		return;
-	atomic_inc_64(&engine_io_errors);
-	q->failures++;
-	q->absent += error == ENXIO;
-	if (q->error == 0 || error != ENXIO)
-		q->error = error;
-}
+typedef struct engine_copy_cost {
+	uint64_t groups;
+	uint64_t blocks;
+	uint64_t bytes;
+	uint64_t setup;
+	uint64_t io[3];
+	uint64_t check;
+	uint64_t flush;
+	uint64_t settle;
+	uint64_t journal;
+	uint64_t publish;
+	uint64_t total;
+} engine_copy_cost_t;
 
-static int
-engine_quorum_result(const engine_quorum_t *q)
-{
-	return (q->failures > engine_store_tolerated() ? q->error : 0);
-}
+typedef struct engine_admit_cost {
+	uint64_t rebuilds;
+	uint64_t rebuilt;
+	uint64_t walked;
+	uint64_t updates;
+	uint64_t checked;
+	uint64_t pages_checked;
+} engine_admit_cost_t;
 
-static struct {
+typedef struct engine_journal_cost {
+	uint64_t calls[3];
+	uint64_t pages[3];
+	uint64_t write[3];
+	uint64_t flush[3];
+	uint64_t seal;
+	uint64_t rolls;
+	uint64_t roll;
+	uint64_t lock;
+} engine_journal_cost_t;
+
+typedef struct engine_slot_cost {
+	uint64_t reads;
+	uint64_t writes;
+	uint64_t skipped;
+	uint64_t cached;
+	uint64_t checked;
+} engine_slot_cost_t;
+
+typedef struct engine_store_cost {
+	uint64_t stores;
+	uint64_t pages;
+	uint64_t runs;
+	hrtime_t tree;
+	hrtime_t reserve;
+	hrtime_t write;
+	hrtime_t flush;
+} engine_store_cost_t;
+
+struct pr19262_engine {
 	kmutex_t lock;
 	kmutex_t journal_lock;
 	kmutex_t store_lock;
@@ -321,16 +335,63 @@ static struct {
 	uint64_t inherit_prints;
 	uint64_t hold_report_prints;
 	uint64_t gate_prints;
-} engine;
+	engine_copy_cost_t copy_cost;
+	engine_admit_cost_t admit_cost;
+	engine_journal_cost_t journal_cost;
+	engine_slot_cost_t slot_cost;
+	engine_store_cost_t store_cost;
+	uint64_t io_errors;
+	uint_t dispatch_unsafe_prints;
+	uint64_t store_crash_txg;
+	uint_t journal_fault_stage;
+	uint64_t journal_fault_seq;
+	uint_t journal_roll_fault;
+	uint_t journal_group_fault;
+	uint_t journal_roll_phase;
+	boolean_t m_read_injected;
+	boolean_t m_active_error_injected;
+	uint64_t pages_evicted;
+	uint64_t store_checked;
+	uint64_t store_check_failures;
+	void (*store_test_hook)(spa_t *, int);
+	void (*journal_observer)(spa_t *, const blkptr_t *, int);
+	struct engine_pages *pages;
+#ifdef _KERNEL
+	struct engine_kernel *kernel;
+#endif
+};
+
+typedef struct engine_walk_arg {
+	engine_t *engine;
+	void *arg;
+} engine_walk_arg_t;
 
 static void
-engine_owner_unlist(engine_owner_t *e)
+engine_quorum_add(engine_t *engine, engine_quorum_t *q, int error)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	if (error == 0)
+		return;
+	atomic_inc_64(&engine->io_errors);
+	q->failures++;
+	q->absent += error == ENXIO;
+	if (q->error == 0 || error != ENXIO)
+		q->error = error;
+}
+
+static int
+engine_quorum_result(engine_t *engine, const engine_quorum_t *q)
+{
+	return (q->failures > engine_store_tolerated(engine) ? q->error : 0);
+}
+
+static void
+engine_owner_unlist(engine_t *engine, engine_owner_t *e)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
 	if (list_link_active(&e->dirty_node)) {
-		if (engine.admit_first == e)
-			engine.admit_first = list_next(&engine.dirty, e);
-		list_remove(&engine.dirty, e);
+		if (engine->admit_first == e)
+			engine->admit_first = list_next(&engine->dirty, e);
+		list_remove(&engine->dirty, e);
 	}
 	e->admit_dirty = B_FALSE;
 }
@@ -342,16 +403,16 @@ engine_owner_unlist(engine_owner_t *e)
  * row of an unmarked owner changes.
  */
 static void
-engine_owner_dirty(engine_owner_t *e)
+engine_owner_dirty(engine_t *engine, engine_owner_t *e)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
-	e->dirty_seq = ++engine.dirty_next;
+	ASSERT(MUTEX_HELD(&engine->lock));
+	e->dirty_seq = ++engine->dirty_next;
 	/* Keep reserve changes behind the already processed prefix. */
-	engine_owner_unlist(e);
-	list_insert_tail(&engine.dirty, e);
+	engine_owner_unlist(engine, e);
+	list_insert_tail(&engine->dirty, e);
 	e->admit_dirty = B_TRUE;
-	if (engine.admit_first == NULL)
-		engine.admit_first = e;
+	if (engine->admit_first == NULL)
+		engine->admit_first = e;
 }
 
 /*
@@ -369,27 +430,27 @@ engine_owner_alloc(int kmflag)
 
 /* The owner leaves the engine: the next store drops its rows. */
 static void
-engine_owner_gone(engine_owner_t *e)
+engine_owner_gone(engine_t *engine, engine_owner_t *e)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
-	engine_admit_owner_forget(e);
-	engine_owner_unlist(e);
-	if (engine.gone_count == engine.gone_capacity) {
-		uint_t cap = MAX(64, engine.gone_capacity * 2);
+	ASSERT(MUTEX_HELD(&engine->lock));
+	engine_admit_owner_forget(engine, e);
+	engine_owner_unlist(engine, e);
+	if (engine->gone_count == engine->gone_capacity) {
+		uint_t cap = MAX(64, engine->gone_capacity * 2);
 		uint64_t *gone = pr19262_zalloc(cap * 2 * sizeof (uint64_t),
 		    KM_SLEEP);
-		if (engine.gone != NULL) {
-			memcpy(gone, engine.gone,
-			    engine.gone_count * 2 * sizeof (uint64_t));
-			kmem_free(engine.gone,
-			    engine.gone_capacity * 2 * sizeof (uint64_t));
+		if (engine->gone != NULL) {
+			memcpy(gone, engine->gone,
+			    engine->gone_count * 2 * sizeof (uint64_t));
+			kmem_free(engine->gone,
+			    engine->gone_capacity * 2 * sizeof (uint64_t));
 		}
-		engine.gone = gone;
-		engine.gone_capacity = cap;
+		engine->gone = gone;
+		engine->gone_capacity = cap;
 	}
-	engine.gone[2 * engine.gone_count] = e->v;
-	engine.gone[2 * engine.gone_count + 1] = e->incarnation;
-	engine.gone_count++;
+	engine->gone[2 * engine->gone_count] = e->v;
+	engine->gone[2 * engine->gone_count + 1] = e->incarnation;
+	engine->gone_count++;
 }
 
 static void
@@ -411,7 +472,8 @@ engine_version_layout(engine_version_t *b, vdev_t *vd, uint64_t birth)
 }
 
 static engine_version_t *
-engine_version_new(engine_owner_t *e, uint64_t p, uint64_t size,
+engine_version_new(engine_t *engine, engine_owner_t *e, uint64_t p,
+    uint64_t size,
     uint64_t birth, boolean_t ready)
 {
 	engine_version_t *b = kmem_zalloc(sizeof (*b), KM_SLEEP);
@@ -419,12 +481,12 @@ engine_version_new(engine_owner_t *e, uint64_t p, uint64_t size,
 	b->p = p;
 	b->size = size;
 	b->birth = birth;
-	b->generation = ++engine.sequence;
-	engine_version_layout(b, engine.vd, birth);
+	b->generation = ++engine->sequence;
+	engine_version_layout(b, engine->vd, birth);
 	b->ready = ready;
 	b->next = e->versions;
 	e->versions = b;
-	engine.revision++;
+	engine->revision++;
 	return (b);
 }
 
@@ -443,7 +505,8 @@ engine_resume(engine_pending_t *p)
 static void
 engine_defer(zio_t *zio, engine_pending_t **list)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	engine_t *engine = zio->io_spa->spa_reloc;
+	ASSERT(MUTEX_HELD(&engine->lock));
 	engine_pending_t *p = kmem_alloc(sizeof (*p), KM_SLEEP);
 	p->zio = zio;
 	p->next = *list;
@@ -453,89 +516,97 @@ engine_defer(zio_t *zio, engine_pending_t **list)
 }
 
 void
-pr19262_engine_park_next(void)
+pr19262_engine_park_next(spa_t *spa)
 {
-	mutex_enter(&engine.lock);
-	VERIFY(!engine.park_next && engine.parked == NULL);
-	engine.park_next = B_TRUE;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	VERIFY(!engine->park_next && engine->parked == NULL);
+	engine->park_next = B_TRUE;
+	mutex_exit(&engine->lock);
 }
 
 uint64_t
-pr19262_engine_waiting(boolean_t writers)
+pr19262_engine_waiting(spa_t *spa, boolean_t writers)
 {
+	engine_t *engine = spa->spa_reloc;
 	uint64_t count = 0;
-	mutex_enter(&engine.lock);
+	mutex_enter(&engine->lock);
 	if (!writers) {
-		for (engine_pending_t *p = engine.parked; p != NULL;
+		for (engine_pending_t *p = engine->parked; p != NULL;
 		    p = p->next)
 			count++;
 	} else {
-		for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-		    e = AVL_NEXT(&engine.owners, e))
+		for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+		    e = AVL_NEXT(&engine->owners, e))
 			for (engine_pending_t *p = e->pending; p != NULL;
 			    p = p->next)
 				count++;
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (count);
 }
 
 void
-pr19262_engine_unpark(void)
+pr19262_engine_unpark(spa_t *spa)
 {
-	mutex_enter(&engine.lock);
-	engine_pending_t *p = engine.parked;
-	engine.parked = NULL;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	engine_pending_t *p = engine->parked;
+	engine->parked = NULL;
+	mutex_exit(&engine->lock);
 	engine_resume(p);
 }
 
 void
-pr19262_engine_fail_writes(boolean_t fail)
+pr19262_engine_fail_writes(spa_t *spa, boolean_t fail)
 {
-	mutex_enter(&engine.lock);
-	engine.fail_writes = fail;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	engine->fail_writes = fail;
+	mutex_exit(&engine->lock);
 }
 
 void
-pr19262_engine_retired_limit(uint64_t limit)
+pr19262_engine_retired_limit(spa_t *spa, uint64_t limit)
 {
-	mutex_enter(&engine.lock);
-	engine.retired_limit = limit;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	engine->retired_limit = limit;
+	mutex_exit(&engine->lock);
 }
 
 void
-pr19262_engine_block_new(boolean_t block)
+pr19262_engine_block_new(spa_t *spa, boolean_t block)
 {
-	mutex_enter(&engine.lock);
-	engine.block_new = block;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	engine->block_new = block;
+	mutex_exit(&engine->lock);
 }
 
 void
-pr19262_engine_alloc_fail_after(uint64_t attempts)
+pr19262_engine_alloc_fail_after(spa_t *spa, uint64_t attempts)
 {
-	mutex_enter(&engine.lock);
-	engine.alloc_fail_after = attempts;
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	engine->alloc_fail_after = attempts;
+	mutex_exit(&engine->lock);
 }
 
 uint64_t
 pr19262_engine_limit(spa_t *spa, boolean_t netfree)
 {
+	engine_t *engine = spa->spa_reloc;
 	uint64_t limit = UINT64_MAX;
-	mutex_enter(&engine.lock);
-	if (engine.spa == spa && spa != NULL) {
+	mutex_enter(&engine->lock);
+	if (engine->spa == spa && spa != NULL) {
 		uint64_t protected = (netfree ? 8ULL : 16ULL) << 20;
-		uint64_t free = zfs_range_tree_space(engine.free);
+		uint64_t free = zfs_range_tree_space(engine->free);
 		limit = free > protected ? free - protected : 0;
-		if (!netfree && engine.retired >= engine.retired_limit)
+		if (!netfree && engine->retired >= engine->retired_limit)
 			limit = 0;
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (limit);
 }
 
@@ -547,10 +618,10 @@ engine_compare(const void *arg1, const void *arg2)
 }
 
 static engine_owner_t *
-engine_find(uint64_t v)
+engine_find(engine_t *engine, uint64_t v)
 {
 	engine_owner_t key = { .v = v };
-	return (avl_find(&engine.owners, &key, NULL));
+	return (avl_find(&engine->owners, &key, NULL));
 }
 
 static int
@@ -564,60 +635,62 @@ engine_tomb_compare(const void *arg1, const void *arg2)
 }
 
 static boolean_t
-engine_tombstoned(uint64_t v, uint64_t incarnation)
+engine_tombstoned(engine_t *engine, uint64_t v, uint64_t incarnation)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	ASSERT(MUTEX_HELD(&engine->lock));
 	engine_tomb_t key = { .v = v, .incarnation = incarnation };
-	return (avl_find(&engine.tombstones, &key, NULL) != NULL);
+	return (avl_find(&engine->tombstones, &key, NULL) != NULL);
 }
 
 static void
-engine_tombstones_clear(void)
+engine_tombstones_clear(engine_t *engine)
 {
 	void *cookie = NULL;
 	engine_tomb_t *t;
-	while ((t = avl_destroy_nodes(&engine.tombstones, &cookie)) != NULL)
+	while ((t = avl_destroy_nodes(&engine->tombstones, &cookie)) != NULL)
 		kmem_free(t, sizeof (*t));
 }
 
 /* Record a released journaled identity; later segments cannot bind it. */
 static void
-engine_tombstone_add(uint64_t v, uint64_t incarnation, uint64_t segment)
+engine_tombstone_add(engine_t *engine, uint64_t v, uint64_t incarnation,
+    uint64_t segment)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	ASSERT(MUTEX_HELD(&engine->lock));
 	engine_tomb_t *t = kmem_zalloc(sizeof (*t), KM_SLEEP);
 	t->v = v;
 	t->incarnation = incarnation;
 	t->segment = segment;
 	avl_index_t where;
-	engine_tomb_t *found = avl_find(&engine.tombstones, t, &where);
+	engine_tomb_t *found = avl_find(&engine->tombstones, t, &where);
 	if (found != NULL) {
 		found->segment = MAX(found->segment, segment);
 		found->expired = B_FALSE;
 		kmem_free(t, sizeof (*t));
 		return;
 	}
-	avl_insert(&engine.tombstones, t, where);
+	avl_insert(&engine->tombstones, t, where);
 }
 
 static engine_owner_t *
-engine_overlap(uint64_t v, uint64_t size)
+engine_overlap(engine_t *engine, uint64_t v, uint64_t size)
 {
 	engine_owner_t key = { .v = v };
 	avl_index_t where;
-	engine_owner_t *e = avl_find(&engine.owners, &key, &where);
+	engine_owner_t *e = avl_find(&engine->owners, &key, &where);
 	if (e != NULL)
 		return (e);
-	e = avl_nearest(&engine.owners, where, AVL_BEFORE);
+	e = avl_nearest(&engine->owners, where, AVL_BEFORE);
 	if (e != NULL && v - e->v < e->size)
 		return (e);
-	e = avl_nearest(&engine.owners, where, AVL_AFTER);
+	e = avl_nearest(&engine->owners, where, AVL_AFTER);
 	return (e != NULL && e->v - v < size ? e : NULL);
 }
 
 #ifdef _KERNEL
 static void engine_kernel_init(void);
 static void engine_kernel_fini(void);
+static void engine_kernel_cache(spa_t *);
 #endif
 
 void
@@ -626,17 +699,6 @@ pr19262_engine_init(void)
 #ifdef _KERNEL
 	engine_kernel_init();
 #endif
-	mutex_init(&engine.lock, NULL, MUTEX_DEFAULT, NULL);
-	mutex_init(&engine.journal_lock, NULL, MUTEX_DEFAULT, NULL);
-	mutex_init(&engine.store_lock, NULL, MUTEX_DEFAULT, NULL);
-	cv_init(&engine.changed, NULL, CV_DEFAULT, NULL);
-	cv_init(&engine.fence_cv, NULL, CV_DEFAULT, NULL);
-	avl_create(&engine.owners, engine_compare, sizeof (engine_owner_t),
-	    offsetof(engine_owner_t, avl));
-	list_create(&engine.dirty, sizeof (engine_owner_t),
-	    offsetof(engine_owner_t, dirty_node));
-	avl_create(&engine.tombstones, engine_tomb_compare,
-	    sizeof (engine_tomb_t), offsetof(engine_tomb_t, avl));
 }
 
 void
@@ -645,35 +707,21 @@ pr19262_engine_fini(void)
 #ifdef _KERNEL
 	engine_kernel_fini();
 #endif
-	/* A translated test image must never be handed to an old importer. */
-	VERIFY3P(engine.spa, ==, NULL);
-	VERIFY(avl_is_empty(&engine.owners));
-	avl_destroy(&engine.owners);
-	list_destroy(&engine.dirty);
-	if (engine.gone != NULL)
-		kmem_free(engine.gone,
-		    engine.gone_capacity * 2 * sizeof (uint64_t));
-	engine.gone = NULL;
-	engine.gone_count = engine.gone_capacity = 0;
-	engine_tombstones_clear();
-	avl_destroy(&engine.tombstones);
-	cv_destroy(&engine.changed);
-	cv_destroy(&engine.fence_cv);
-	mutex_destroy(&engine.journal_lock);
-	mutex_destroy(&engine.store_lock);
-	mutex_destroy(&engine.lock);
 }
 
 boolean_t
 pr19262_engine_active(spa_t *spa)
 {
-	mutex_enter(&engine.lock);
-	boolean_t active = engine.spa == spa && spa != NULL;
-	mutex_exit(&engine.lock);
+	if (spa == NULL)
+		return (B_FALSE);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	boolean_t active = engine->spa == spa;
+	mutex_exit(&engine->lock);
 	return (active);
 }
 
-static uint64_t engine_admit_protected(uint_t);
+static uint64_t engine_admit_protected(engine_t *, uint_t);
 
 /* The translated vdev: the first RAIDZ top-level vdev, or the one named. */
 static vdev_t *
@@ -707,9 +755,12 @@ engine_foreign_normal(spa_t *spa, vdev_t *target)
 vdev_t *
 pr19262_engine_vdev(spa_t *spa)
 {
-	mutex_enter(&engine.lock);
-	vdev_t *vd = engine.spa == spa && spa != NULL ? engine.vd : NULL;
-	mutex_exit(&engine.lock);
+	if (spa == NULL)
+		return (NULL);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	vdev_t *vd = engine->spa == spa && spa != NULL ? engine->vd : NULL;
+	mutex_exit(&engine->lock);
 	return (vd);
 }
 
@@ -717,23 +768,25 @@ pr19262_engine_vdev(spa_t *spa)
 boolean_t
 pr19262_engine_bp_foreign(spa_t *spa, const blkptr_t *bp)
 {
-	if (bp == NULL || BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp))
+	if (spa == NULL || bp == NULL || BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp))
 		return (B_FALSE);
-	mutex_enter(&engine.lock);
-	boolean_t foreign = engine.spa == spa && spa != NULL;
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	boolean_t foreign = engine->spa == spa && spa != NULL;
 	for (int d = 0; foreign && d < BP_GET_NDVAS(bp); d++)
-		foreign = DVA_GET_VDEV(&bp->blk_dva[d]) != engine.vd->vdev_id;
-	mutex_exit(&engine.lock);
+		foreign = DVA_GET_VDEV(&bp->blk_dva[d]) != engine->vd->vdev_id;
+	mutex_exit(&engine->lock);
 	return (foreign);
 }
 
 void
 pr19262_engine_start(spa_t *spa)
 {
+	engine_t *engine = spa->spa_reloc;
 	VERIFY(spa_writeable(spa));
 	VERIFY(spa->spa_trust_config);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
-	VERIFY3P(engine.spa, ==, NULL);
+	VERIFY3P(engine->spa, ==, NULL);
 	/*
 	 * Fresh fixture without background client writers.  The first RAIDZ
 	 * top-level vdev is translated; log, special and further normal
@@ -768,23 +821,23 @@ pr19262_engine_start(spa_t *spa)
 		zfs_range_tree_clear(legacy, covered, vd->vdev_asize - covered);
 		zfs_range_tree_add(unusable, covered, vd->vdev_asize - covered);
 	}
-	mutex_enter(&engine.lock);
-	engine.free = free;
-	engine.legacy = legacy;
-	engine.unusable = unusable;
-	engine.vd = vd;
-	engine.vd_guid = vd->vdev_guid;
-	engine.foreign_normal = engine_foreign_normal(spa, vd);
-	engine.total = vd->vdev_asize;
-	engine.retired_limit = 64ULL << 20;
-	engine.spa = spa;
-	engine.admit_batch = ENGINE_ADMIT_BATCH;
-	engine.admit_refreshed = UINT64_MAX;
-	engine.admit_cached_parity = UINT64_MAX;
+	mutex_enter(&engine->lock);
+	engine->free = free;
+	engine->legacy = legacy;
+	engine->unusable = unusable;
+	engine->vd = vd;
+	engine->vd_guid = vd->vdev_guid;
+	engine->foreign_normal = engine_foreign_normal(spa, vd);
+	engine->total = vd->vdev_asize;
+	engine->retired_limit = 64ULL << 20;
+	engine->spa = spa;
+	engine->admit_batch = ENGINE_ADMIT_BATCH;
+	engine->admit_refreshed = UINT64_MAX;
+	engine->admit_cached_parity = UINT64_MAX;
 	/* The strongest layout present is the default conversion target. */
 	vdev_raidz_layout_for_birth(vd, spa_last_synced_txg(spa) + 1, NULL,
-	    &engine.admit_parity);
-	mutex_exit(&engine.lock);
+	    &engine->admit_parity);
+	mutex_exit(&engine->lock);
 	spa_config_exit(spa, SCL_ALLOC | SCL_FREE, FTAG);
 }
 
@@ -853,6 +906,8 @@ engine_alloc_gap(engine_alloc_pick_t *pick, uint64_t low, uint64_t high)
 static void
 engine_alloc_v(void *arg, uint64_t start, uint64_t size)
 {
+	engine_t *engine = ((engine_walk_arg_t *)arg)->engine;
+	arg = ((engine_walk_arg_t *)arg)->arg;
 	engine_alloc_pick_t *pick = arg;
 	if (pick->found != UINT64_MAX)
 		return;
@@ -862,11 +917,11 @@ engine_alloc_v(void *arg, uint64_t start, uint64_t size)
 	    engine_alloc_size(pick, low, high));
 	engine_owner_t key = { .v = low };
 	avl_index_t where;
-	engine_owner_t *e = avl_find(&engine.owners, &key, &where);
+	engine_owner_t *e = avl_find(&engine->owners, &key, &where);
 	if (e == NULL) {
-		e = avl_nearest(&engine.owners, where, AVL_BEFORE);
+		e = avl_nearest(&engine->owners, where, AVL_BEFORE);
 		if (e == NULL || low - e->v >= e->size)
-			e = avl_nearest(&engine.owners, where, AVL_AFTER);
+			e = avl_nearest(&engine->owners, where, AVL_AFTER);
 	}
 	while (e != NULL && e->v < high) {
 		if (e->v > low && engine_alloc_gap(pick, low, e->v))
@@ -874,7 +929,7 @@ engine_alloc_v(void *arg, uint64_t start, uint64_t size)
 		low = MAX(low, e->v + e->size);
 		if (low >= high)
 			return;
-		e = AVL_NEXT(&engine.owners, e);
+		e = AVL_NEXT(&engine->owners, e);
 	}
 	(void) engine_alloc_gap(pick, low, high);
 }
@@ -889,25 +944,28 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
     uint64_t ms_start, uint64_t size, uint64_t max_size, uint64_t txg,
     uint64_t *offset, uint64_t *actual_size)
 {
+	if (spa == NULL)
+		return (PR19262_ALLOC_INACTIVE);
+	engine_t *engine = spa->spa_reloc;
 	pr19262_engine_alloc_result_t result = PR19262_ALLOC_INACTIVE;
 	engine_owner_t *e = NULL;
 	engine_version_t *b = NULL;
 	/* Budget lookup takes the transaction lock: before the engine lock. */
 	boolean_t client = pr19262_tx_client_txg(spa, txg);
-	mutex_enter(&engine.lock);
-	if (engine.spa != spa || spa == NULL || vd != engine.vd)
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || spa == NULL || vd != engine->vd)
 		goto out;
 	/*
 	 * With another normal-class vdev to fall back to, client data never
 	 * eats into the protected reserve of the translated vdev: the
 	 * allocator moves on to the native vdev (class fallback).
 	 */
-	if (engine.foreign_normal && client) {
-		uint64_t free = zfs_range_tree_space(engine.free);
+	if (engine->foreign_normal && client) {
+		uint64_t free = zfs_range_tree_space(engine->free);
 		uint64_t protected =
-		    engine_admit_protected(PR19262_ADMIT_CLIENT);
+		    engine_admit_protected(engine, PR19262_ADMIT_CLIENT);
 		if (free < protected || free - protected < size) {
-			engine.alloc_guarded++;
+			engine->alloc_guarded++;
 			result = PR19262_ALLOC_P_BLOCKED;
 			goto out;
 		}
@@ -928,20 +986,21 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
 	 * merely selects that valid P range; native V selection, accounting and
 	 * the owner commit below remain the regular allocator path.
 	 */
-	if (engine.test_prefer_active) {
-		if (engine.test_prefer_p < p.low ||
-		    engine.test_prefer_p + size > p.high ||
-		    engine.test_prefer_p + size > engine.test_prefer_end ||
-		    !zfs_range_tree_contains(engine.free, engine.test_prefer_p,
+	if (engine->test_prefer_active) {
+		if (engine->test_prefer_p < p.low ||
+		    engine->test_prefer_p + size > p.high ||
+		    engine->test_prefer_p + size > engine->test_prefer_end ||
+		    !zfs_range_tree_contains(engine->free,
+		    engine->test_prefer_p,
 		    size)) {
 			result = PR19262_ALLOC_P_BLOCKED;
 			goto out;
 		}
-		p.found = engine.test_prefer_p;
+		p.found = engine->test_prefer_p;
 		p.size = size;
 	} else
 #endif
-	zfs_range_tree_walk(engine.free, engine_alloc_p, &p);
+	zfs_range_tree_walk(engine->free, engine_alloc_p, &p);
 	if (p.found == UINT64_MAX) {
 		result = PR19262_ALLOC_P_BLOCKED;
 		goto out;
@@ -950,13 +1009,14 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
 	v.max = p.size;
 	v.size = 0;
 	v.found = UINT64_MAX;
-	zfs_range_tree_walk(native, engine_alloc_v, &v);
+	engine_walk_arg_t walk = { engine, &v };
+	zfs_range_tree_walk(native, engine_alloc_v, &walk);
 	if (v.found == UINT64_MAX) {
 		result = v.native_max < size ? PR19262_ALLOC_NATIVE_FULL :
 		    PR19262_ALLOC_V_BLOCKED;
 		goto out;
 	}
-	if (engine.alloc_fail_after != 0 && --engine.alloc_fail_after == 0) {
+	if (engine->alloc_fail_after != 0 && --engine->alloc_fail_after == 0) {
 		pr19262_printf("PR19262_ALLOC_NOMEM v=%llu size=%llu p=%llu "
 		    "eligible=1\n", (u_longlong_t)v.found,
 		    (u_longlong_t)v.size,
@@ -971,27 +1031,27 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
 		result = PR19262_ALLOC_NOMEM;
 		goto out;
 	}
-	VERIFY3P(engine_overlap(v.found, v.size), ==, NULL);
-	VERIFY(!zfs_range_tree_contains(engine.legacy, v.found, v.size));
+	VERIFY3P(engine_overlap(engine, v.found, v.size), ==, NULL);
+	VERIFY(!zfs_range_tree_contains(engine->legacy, v.found, v.size));
 	e->v = v.found;
 	e->size = v.size;
 	e->allocation_txg = e->catalog_txg = txg;
-	e->incarnation = ++engine.next_incarnation;
-	e->created = ++engine.sequence;
+	e->incarnation = ++engine->next_incarnation;
+	e->created = ++engine->sequence;
 	b->owner = e;
 	b->p = p.found + p.size - v.size;
 	b->size = v.size;
 	b->birth = txg;
-	b->generation = ++engine.sequence;
+	b->generation = ++engine->sequence;
 	engine_version_layout(b, vd, txg);
 	e->cur = e->versions = b;
-	zfs_range_tree_remove(engine.free, b->p, b->size);
-	avl_add(&engine.owners, e);
-	engine_owner_dirty(e);
-	engine.pairs++;
-	engine.revision++;
+	zfs_range_tree_remove(engine->free, b->p, b->size);
+	avl_add(&engine->owners, e);
+	engine_owner_dirty(engine, e);
+	engine->pairs++;
+	engine->revision++;
 #ifndef _KERNEL
-	engine.test_prefer_active = B_FALSE;
+	engine->test_prefer_active = B_FALSE;
 #endif
 	*offset = v.found;
 	*actual_size = v.size;
@@ -999,7 +1059,7 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
 	b = NULL;
 	result = PR19262_ALLOC_OK;
 out:
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	if (e != NULL)
 		kmem_free(e, sizeof (*e));
 	if (b != NULL)
@@ -1011,13 +1071,16 @@ int
 pr19262_engine_pair(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
     uint64_t txg)
 {
+	if (spa == NULL)
+		return (0);
+	engine_t *engine = spa->spa_reloc;
 	int error = 0;
-	mutex_enter(&engine.lock);
-	if (engine.spa != spa || spa == NULL)
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || spa == NULL)
 		goto out;
-	VERIFY3P(vd, ==, engine.vd);
-	VERIFY(!zfs_range_tree_contains(engine.legacy, v, size));
-	engine_owner_t *collision = engine_overlap(v, size);
+	VERIFY3P(vd, ==, engine->vd);
+	VERIFY(!zfs_range_tree_contains(engine->legacy, v, size));
+	engine_owner_t *collision = engine_overlap(engine, v, size);
 	if (collision != NULL) {
 		pr19262_printf("PR19262_V_PAIR_COLLISION v=%llu size=%llu "
 		    "txg=%llu owner=%llu owner_size=%llu pending=%u "
@@ -1034,7 +1097,7 @@ pr19262_engine_pair(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
 	    uint64_t);
 	engine_pick_t pick = { ms_start, ms_start +
 		(1ULL << vd->vdev_ms_shift), size, UINT64_MAX };
-	zfs_range_tree_walk(engine.free, engine_pick_p, &pick);
+	zfs_range_tree_walk(engine->free, engine_pick_p, &pick);
 	if (pick.found == UINT64_MAX) {
 		error = ENOSPC;
 		goto out;
@@ -1044,22 +1107,22 @@ pr19262_engine_pair(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
 	e->size = size;
 	e->allocation_txg = txg;
 	e->catalog_txg = txg;
-	e->cur = engine_version_new(e, pick.found, size, txg, B_FALSE);
-	e->incarnation = ++engine.next_incarnation;
-	e->created = ++engine.sequence;
-	zfs_range_tree_remove(engine.free, e->cur->p, size);
-	avl_add(&engine.owners, e);
-	engine_owner_dirty(e);
-	engine.pairs++;
+	e->cur = engine_version_new(engine, e, pick.found, size, txg, B_FALSE);
+	e->incarnation = ++engine->next_incarnation;
+	e->created = ++engine->sequence;
+	zfs_range_tree_remove(engine->free, e->cur->p, size);
+	avl_add(&engine->owners, e);
+	engine_owner_dirty(engine, e);
+	engine->pairs++;
 out:
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (error);
 }
 
 static void
-engine_abort_done(engine_owner_t *e)
+engine_abort_done(engine_t *engine, engine_owner_t *e)
 {
-	ASSERT(MUTEX_HELD(&engine.lock));
+	ASSERT(MUTEX_HELD(&engine->lock));
 	VERIFY(e->aborted);
 	if (e->holds != 0)
 		return;
@@ -1070,12 +1133,12 @@ engine_abort_done(engine_owner_t *e)
 	while (e->versions != NULL) {
 		engine_version_t *b = e->versions;
 		e->versions = b->next;
-		zfs_range_tree_verify_not_present(engine.free, b->p, b->size);
-		zfs_range_tree_add(engine.free, b->p, b->size);
+		zfs_range_tree_verify_not_present(engine->free, b->p, b->size);
+		zfs_range_tree_add(engine->free, b->p, b->size);
 		kmem_free(b, sizeof (*b));
 	}
-	engine_owner_gone(e);
-	avl_remove(&engine.owners, e);
+	engine_owner_gone(engine, e);
+	avl_remove(&engine->owners, e);
 	kmem_free(e, sizeof (*e));
 }
 
@@ -1098,41 +1161,42 @@ boolean_t
 pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
     uint64_t txg)
 {
+	engine_t *engine = spa->spa_reloc;
 	boolean_t retained = B_FALSE;
 	boolean_t classified = B_FALSE;
-	mutex_enter(&engine.lock);
-	if (engine.spa == spa && spa != NULL && vd == engine.vd) {
-		engine_owner_t *e = engine_find(v);
+	mutex_enter(&engine->lock);
+	if (engine->spa == spa && spa != NULL && vd == engine->vd) {
+		engine_owner_t *e = engine_find(engine, v);
 		if (e != NULL) {
 			VERIFY3U(e->size, ==, size);
 			VERIFY3U(e->allocation_txg, ==, txg);
 			VERIFY(!e->aborted);
 			classified = B_TRUE;
 			/* Admission and abort choose exactly one outcome. */
-			if (engine.persistent && e->journal_touched) {
+			if (engine->persistent && e->journal_touched) {
 				if (!e->retired) {
 					e->retired = B_TRUE;
-					e->retired_at = ++engine.sequence;
-					engine.retired += e->cur->size;
-					engine.revision++;
-					engine_owner_dirty(e);
+					e->retired_at = ++engine->sequence;
+					engine->retired += e->cur->size;
+					engine->revision++;
+					engine_owner_dirty(engine, e);
 				}
 				retained = B_TRUE;
-				if (engine.abort_prints++ < 4)
+				if (engine->abort_prints++ < 4)
 					engine_abort_report(spa, e, v, size,
 					    txg);
 				goto out;
 			}
 			VERIFY(!e->retired);
 			e->aborted = B_TRUE;
-			engine_owner_dirty(e);
-			engine.revision++;
-			engine.aborts++;
-			engine_abort_done(e);
+			engine_owner_dirty(engine, e);
+			engine->revision++;
+			engine->aborts++;
+			engine_abort_done(engine, e);
 		}
 	}
 out:
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	if (classified) {
 		/* The observer records only; caller still holds ms_lock. */
 		blkptr_t bp = { 0 };
@@ -1149,40 +1213,41 @@ boolean_t
 pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
     boolean_t checkpoint)
 {
+	engine_t *engine = vd->vdev_spa->spa_reloc;
 	boolean_t handled = B_FALSE;
-	mutex_enter(&engine.lock);
-	if (engine.spa != vd->vdev_spa || engine.spa == NULL ||
-	    vd != engine.vd)
+	mutex_enter(&engine->lock);
+	if (engine->spa != vd->vdev_spa || engine->spa == NULL ||
+	    vd != engine->vd)
 		goto out;
 	/* A fenced owner release performs the native free itself. */
-	if (engine.release_thread == curthread)
+	if (engine->release_thread == curthread)
 		goto out;
-	engine_owner_t *e = engine_find(v);
+	engine_owner_t *e = engine_find(engine, v);
 	if (e == NULL) {
-		VERIFY(zfs_range_tree_contains(engine.legacy, v, size));
-		zfs_range_tree_remove(engine.legacy, v, size);
+		VERIFY(zfs_range_tree_contains(engine->legacy, v, size));
+		zfs_range_tree_remove(engine->legacy, v, size);
 		e = engine_owner_alloc(KM_SLEEP);
 		e->v = v;
 		e->size = size;
-		e->cur = engine_version_new(e, v, size, 0, B_TRUE);
-		e->incarnation = ++engine.next_incarnation;
-		avl_add(&engine.owners, e);
-		engine_owner_dirty(e);
+		e->cur = engine_version_new(engine, e, v, size, 0, B_TRUE);
+		e->incarnation = ++engine->next_incarnation;
+		avl_add(&engine->owners, e);
+		engine_owner_dirty(engine, e);
 	}
 	VERIFY3U(e->size, ==, size);
 	VERIFY(!e->retired && !e->aborted);
-	engine_owner_dirty(e);
+	engine_owner_dirty(engine, e);
 	if (checkpoint) {
 		e->checkpoint_only = B_TRUE;
-		engine.revision++;
+		engine->revision++;
 		/* Keep native checkpoint space-map accounting. */
 		goto out;
 	}
 	e->retired = B_TRUE;
-	engine.revision++;
-	e->retired_at = ++engine.sequence;
-	engine.retired += e->cur->size;
-	if (engine.retire_prints++ < 24) {
+	engine->revision++;
+	e->retired_at = ++engine->sequence;
+	engine->retired += e->cur->size;
+	if (engine->retire_prints++ < 24) {
 		spa_t *spa = vd->vdev_spa;
 		pr19262_printf("PR19262_RETIRE v=%llu size=%llu birth=%llu "
 		    "allocation_txg=%llu sync_context=%u syncing_txg=%llu "
@@ -1197,33 +1262,34 @@ pr19262_engine_retire(vdev_t *vd, uint64_t v, uint64_t size,
 	/* No fake floor: neither authoritative V nor P becomes free. */
 	handled = B_TRUE;
 out:
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (handled);
 }
 
 void
 pr19262_engine_checkpoint(spa_t *spa, const uberblock_t *checkpoint)
 {
-	mutex_enter(&engine.lock);
-	if (engine.spa == spa && engine.persistent) {
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->spa == spa && engine->persistent) {
 		if (checkpoint != NULL)
-			engine.checkpoint = *checkpoint;
+			engine->checkpoint = *checkpoint;
 		else
-			memset(&engine.checkpoint, 0,
-			    sizeof (engine.checkpoint));
-		engine.revision++;
+			memset(&engine->checkpoint, 0,
+			    sizeof (engine->checkpoint));
+		engine->revision++;
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 }
 
 static engine_owner_t *
-engine_checkpoint_owner(uint64_t v)
+engine_checkpoint_owner(engine_t *engine, uint64_t v)
 {
 	engine_owner_t key = { .v = v };
 	avl_index_t where;
-	engine_owner_t *e = avl_find(&engine.owners, &key, &where);
+	engine_owner_t *e = avl_find(&engine->owners, &key, &where);
 	if (e == NULL)
-		e = avl_nearest(&engine.owners, where, AVL_BEFORE);
+		e = avl_nearest(&engine->owners, where, AVL_BEFORE);
 	if (e == NULL || v < e->v || v - e->v >= e->size)
 		return (NULL);
 	return (e);
@@ -1232,15 +1298,16 @@ engine_checkpoint_owner(uint64_t v)
 int
 pr19262_engine_checkpoint_validate(spa_t *spa, const uberblock_t *checkpoint)
 {
+	engine_t *engine = spa->spa_reloc;
 	uberblock_t absent = { 0 };
 	const uberblock_t *expected = checkpoint != NULL ? checkpoint : &absent;
-	mutex_enter(&engine.lock);
+	mutex_enter(&engine->lock);
 	int error = 0;
-	if (engine.spa == spa && engine.persistent &&
-	    memcmp(&engine.checkpoint, expected,
-	    sizeof (engine.checkpoint)) != 0)
+	if (engine->spa == spa && engine->persistent &&
+	    memcmp(&engine->checkpoint, expected,
+	    sizeof (engine->checkpoint)) != 0)
 		error = ENGINE_EINVAL(4);
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (error);
 }
 
@@ -1248,40 +1315,41 @@ int
 pr19262_engine_checkpoint_discard(vdev_t *vd, uint64_t v, uint64_t size,
     boolean_t *handled)
 {
+	engine_t *engine = vd->vdev_spa->spa_reloc;
 	*handled = B_FALSE;
-	mutex_enter(&engine.lock);
-	if (engine.spa == NULL || engine.spa != vd->vdev_spa)
+	mutex_enter(&engine->lock);
+	if (engine->spa == NULL || engine->spa != vd->vdev_spa)
 		goto out;
-	if (vd != engine.vd)
+	if (vd != engine->vd)
 		goto out;
-	if (v >= engine.total || size == 0 || size > engine.total - v) {
-		mutex_exit(&engine.lock);
+	if (v >= engine->total || size == 0 || size > engine->total - v) {
+		mutex_exit(&engine->lock);
 		return (ENGINE_EINVAL(1));
 	}
 	/* SM runs can merge allocations or split one allocation into runs. */
 	for (uint64_t cursor = v; cursor < v + size; ) {
-		engine_owner_t *e = engine_checkpoint_owner(cursor);
+		engine_owner_t *e = engine_checkpoint_owner(engine, cursor);
 		if (e == NULL || (!e->checkpoint_only && !e->retired)) {
-			mutex_exit(&engine.lock);
+			mutex_exit(&engine->lock);
 			return (ENGINE_EINVAL(2));
 		}
 		cursor = MIN(v + size, e->v + e->size);
 	}
 	for (uint64_t cursor = v; cursor < v + size; ) {
-		engine_owner_t *e = engine_checkpoint_owner(cursor);
+		engine_owner_t *e = engine_checkpoint_owner(engine, cursor);
 		if (!e->retired) {
 			e->checkpoint_only = B_FALSE;
 			e->retired = B_TRUE;
-			e->retired_at = ++engine.sequence;
-			engine.retired += e->cur->size;
-			engine.revision++;
-			engine_owner_dirty(e);
+			e->retired_at = ++engine->sequence;
+			engine->retired += e->cur->size;
+			engine->revision++;
+			engine_owner_dirty(engine, e);
 		}
 		cursor = MIN(v + size, e->v + e->size);
 	}
 	*handled = B_TRUE;
 out:
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (0);
 }
 
@@ -1289,23 +1357,29 @@ void *
 pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
     boolean_t read, boolean_t gang_child)
 {
+	if (spa == NULL)
+		return (NULL);
+	engine_t *engine = spa->spa_reloc;
 	if (bp != NULL && (BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp)))
 		return (NULL);
-	mutex_enter(&engine.lock);
-	if (engine.spa != spa || spa == NULL) {
-		mutex_exit(&engine.lock);
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || spa == NULL) {
+		mutex_exit(&engine->lock);
 		return (NULL);
 	}
 	engine_hold_t *prior = inherit;
-	if (engine.block_new && prior == NULL) {
-		mutex_exit(&engine.lock);
+	if (prior != NULL)
+		VERIFY3P(prior->spa, ==, spa);
+	if (engine->block_new && prior == NULL) {
+		mutex_exit(&engine->lock);
 		return (NULL);
 	}
 	if (bp == NULL && prior == NULL) {
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (NULL);
 	}
 	engine_hold_t *h = kmem_zalloc(sizeof (*h), KM_SLEEP);
+	h->spa = spa;
 	h->refs = 1;
 	h->write = !read;
 	if (prior != NULL) {
@@ -1313,7 +1387,7 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 		h->error_site = prior->error != 0 ? 1 : 0;
 	}
 	if (prior != NULL && prior->error == ESTALE &&
-	    engine.inherit_prints++ < 4) {
+	    engine->inherit_prints++ < 4) {
 		pr19262_printf("PR19262_HOLD_INHERIT_STALE bp=%d write=%u "
 		    "prior_count=%u prior_write=%u prior_gang=%u "
 		    "prior_started=%llu\n", bp != NULL, !read, prior->count,
@@ -1321,7 +1395,7 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 		pr19262_flush();
 		pr19262_backtrace();
 	}
-	h->started = prior != NULL ? prior->started : ++engine.sequence;
+	h->started = prior != NULL ? prior->started : ++engine->sequence;
 	h->gang = (prior != NULL && prior->gang) ||
 	    (bp != NULL && BP_IS_GANG(bp));
 	if (bp == NULL) {
@@ -1330,26 +1404,26 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 			h->owner[i]->holds++;
 			h->owner[i]->queued_writers += h->write;
 		}
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (h);
 	}
 	for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
 		const dva_t *dva = &bp->blk_dva[d];
-		if (DVA_GET_VDEV(dva) != engine.vd->vdev_id) {
+		if (DVA_GET_VDEV(dva) != engine->vd->vdev_id) {
 			/* Another top-level vdev: native, never translated. */
 			h->foreign++;
 			continue;
 		}
-		engine_owner_t *e = engine_find(DVA_GET_OFFSET(dva));
+		engine_owner_t *e = engine_find(engine, DVA_GET_OFFSET(dva));
 		boolean_t inherited = B_FALSE;
 		if (prior != NULL && prior->error == 0)
 			for (uint_t i = 0; i < prior->count; i++)
 				inherited |= prior->owner[i] == e && e != NULL;
 		if (e == NULL) {
 			uint64_t size = DVA_GET_GANG(dva) ?
-			    vdev_gang_header_asize(engine.vd,
+			    vdev_gang_header_asize(engine->vd,
 			    BP_GET_PHYSICAL_BIRTH(bp)) : DVA_GET_ASIZE(dva);
-			if (!zfs_range_tree_contains(engine.legacy,
+			if (!zfs_range_tree_contains(engine->legacy,
 			    DVA_GET_OFFSET(dva), size)) {
 				h->error = ENOENT;
 				h->error_site = 2;
@@ -1358,12 +1432,12 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 			e = engine_owner_alloc(KM_SLEEP);
 			e->v = DVA_GET_OFFSET(dva);
 			e->size = size;
-			e->cur = engine_version_new(e, e->v, size,
+			e->cur = engine_version_new(engine, e, e->v, size,
 			    BP_GET_PHYSICAL_BIRTH(bp), B_TRUE);
-			e->incarnation = ++engine.next_incarnation;
-			zfs_range_tree_remove(engine.legacy, e->v, size);
-			avl_add(&engine.owners, e);
-			engine_owner_dirty(e);
+			e->incarnation = ++engine->next_incarnation;
+			zfs_range_tree_remove(engine->legacy, e->v, size);
+			avl_add(&engine->owners, e);
+			engine_owner_dirty(engine, e);
 		}
 		boolean_t descendant = prior != NULL && prior->error == 0 &&
 		    prior->gang && gang_child && read;
@@ -1378,7 +1452,7 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 		if (reused || gone) {
 			h->error = ESTALE;
 			h->error_site = 3;
-			if (engine.stale_verdicts++ < 16)
+			if (engine->stale_verdicts++ < 16)
 				pr19262_printf("PR19262_HOLD_STALE v=%llu "
 				    "reused=%u gone=%u retired=%u aborted=%u "
 				    "birth=%llu allocation_txg=%llu write=%u "
@@ -1392,7 +1466,7 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 				    (uint_t)BP_GET_TYPE(bp),
 				    (u_longlong_t)e->retired_txg,
 				    (u_longlong_t)spa_last_synced_txg(spa));
-			if (engine.stale_verdicts <= 3) {
+			if (engine->stale_verdicts <= 3) {
 				pr19262_flush();
 				pr19262_backtrace();
 			}
@@ -1403,21 +1477,22 @@ pr19262_engine_hold(spa_t *spa, const blkptr_t *bp, void *inherit,
 	}
 	if (h->count == 0 && h->foreign != 0 && h->error == 0) {
 		/* Every DVA lives on a native vdev: no engine identity. */
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		kmem_free(h, sizeof (*h));
 		return (NULL);
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (h);
 }
 
 void
 pr19262_engine_rele(void *arg)
 {
-	engine_hold_t *h = arg;
-	if (h == NULL)
+	if (arg == NULL)
 		return;
-	mutex_enter(&engine.lock);
+	engine_t *engine = ((engine_hold_t *)arg)->spa->spa_reloc;
+	engine_hold_t *h = arg;
+	mutex_enter(&engine->lock);
 	for (uint_t i = 0; i < h->count; i++) {
 		engine_owner_t *e = h->owner[i];
 		VERIFY3U(e->holds, >, 0);
@@ -1425,9 +1500,9 @@ pr19262_engine_rele(void *arg)
 		VERIFY3U(e->queued_writers, >=, h->write);
 		e->queued_writers -= h->write;
 		if (e->aborted)
-			engine_abort_done(e);
+			engine_abort_done(engine, e);
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	kmem_free(h, sizeof (*h));
 }
 
@@ -1437,7 +1512,8 @@ pr19262_engine_io_rele(zio_t *zio)
 	engine_version_t *b = zio->io_pr19262_owner_version;
 	if (b == NULL)
 		return;
-	mutex_enter(&engine.lock);
+	engine_t *engine = zio->io_spa->spa_reloc;
+	mutex_enter(&engine->lock);
 	VERIFY3U(b->leases, >, 0);
 	b->leases--;
 	if (zio->io_type == ZIO_TYPE_WRITE) {
@@ -1446,13 +1522,13 @@ pr19262_engine_io_rele(zio_t *zio)
 	}
 	if (zio->io_error == 0 && !b->ready) {
 		b->ready = B_TRUE;
-		engine_owner_dirty(b->owner);
+		engine_owner_dirty(engine, b->owner);
 	}
 	engine_owner_t *e = b->owner;
 	if (e->aborted)
-		engine_abort_done(e);
+		engine_abort_done(engine, e);
 	zio->io_pr19262_owner_version = NULL;
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 }
 
 /* Diagnostic: the hold behind a stale dispatch verdict. */
@@ -1479,83 +1555,86 @@ engine_hold_report(const engine_hold_t *h)
 
 /* Diagnostic: report a zio's hold from the pipeline, ungated. */
 void
-pr19262_engine_hold_report(void *hold)
+pr19262_engine_hold_report(spa_t *spa, void *hold)
 {
-	mutex_enter(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
 	if (hold == NULL)
 		pr19262_printf("PR19262_HOLD_REPORT null hold\n");
 	else
 		engine_hold_report(hold);
 	pr19262_printf("PR19262_HOLD_REPORT_COUNTER value=%llu\n",
-	    (u_longlong_t)engine.hold_report_prints);
-	mutex_exit(&engine.lock);
+	    (u_longlong_t)engine->hold_report_prints);
+	mutex_exit(&engine->lock);
 }
 
 /* A refused physical write names itself: nothing else reports it. */
-static uint_t engine_dispatch_unsafe_prints;
 
 int
 pr19262_engine_dispatch(zio_t *zio)
 {
-	mutex_enter(&engine.lock);
-	if (engine.spa != zio->io_spa || engine.spa == NULL) {
-		mutex_exit(&engine.lock);
+	if (zio->io_spa == NULL)
+		return (0);
+	engine_t *engine = zio->io_spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->spa != zio->io_spa || engine->spa == NULL) {
+		mutex_exit(&engine->lock);
 		return (0);
 	}
 	if (zio->io_type == ZIO_TYPE_TRIM) {
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (ENOTSUP);
 	}
 	if (zio->io_type != ZIO_TYPE_READ &&
 	    zio->io_type != ZIO_TYPE_WRITE) {
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (0);
 	}
 	if (zio->io_logical != NULL &&
 	    zio->io_logical->io_pr19262_physical) {
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		/* Isolated-fixture P constructors lack engine authority. */
 		return (ENOTSUP);
 	}
 	if (zio->io_flags & ZIO_FLAG_PHYSICAL) {
 		uint64_t low = VDEV_LABEL_START_SIZE;
-		boolean_t metadata = engine.persistent &&
-		    zio->io_pr19262_metadata_authority == &engine &&
-		    zio->io_vd->vdev_parent == engine.vd &&
+		boolean_t metadata = engine->persistent &&
+		    zio->io_pr19262_metadata_authority == engine &&
+		    zio->io_vd->vdev_parent == engine->vd &&
 		    zio->io_offset >= low &&
 		    zio->io_offset - low <=
-		    engine.total / engine.vd->vdev_children &&
-		    zio->io_size <= engine.total / engine.vd->vdev_children -
+		    engine->total / engine->vd->vdev_children &&
+		    zio->io_size <= engine->total / engine->vd->vdev_children -
 		    (zio->io_offset - low) &&
-		    ((engine.store_extents != NULL &&
-		    zfs_range_tree_contains(engine.store_extents,
-		    (zio->io_offset - low) * engine.vd->vdev_children,
-		    zio->io_size * engine.vd->vdev_children)) ||
-		    (engine.journal_extents != NULL &&
-		    zfs_range_tree_contains(engine.journal_extents,
-		    (zio->io_offset - low) * engine.vd->vdev_children,
-		    zio->io_size * engine.vd->vdev_children)));
+		    ((engine->store_extents != NULL &&
+		    zfs_range_tree_contains(engine->store_extents,
+		    (zio->io_offset - low) * engine->vd->vdev_children,
+		    zio->io_size * engine->vd->vdev_children)) ||
+		    (engine->journal_extents != NULL &&
+		    zfs_range_tree_contains(engine->journal_extents,
+		    (zio->io_offset - low) * engine->vd->vdev_children,
+		    zio->io_size * engine->vd->vdev_children)));
 		/* Labels/probes are outside the data area. */
 		boolean_t unsafe = zio->io_type == ZIO_TYPE_WRITE &&
 		    zio->io_vd->vdev_ops->vdev_op_leaf &&
-		    zio->io_vd->vdev_top == engine.vd &&
+		    zio->io_vd->vdev_top == engine->vd &&
 		    zio->io_offset >= VDEV_LABEL_START_SIZE &&
 		    zio->io_offset < zio->io_vd->vdev_psize -
 		    VDEV_LABEL_END_SIZE &&
 		    zio->io_pr19262_owner_hold == NULL && !metadata;
-		if (unsafe && engine_dispatch_unsafe_prints++ < 8)
+		if (unsafe && engine->dispatch_unsafe_prints++ < 8)
 			pr19262_printf("PR19262_DISPATCH_UNSAFE child=%llu "
 			    "offset=%llu size=%llu flags=%llx\n",
 			    (u_longlong_t)zio->io_vd->vdev_id,
 			    (u_longlong_t)zio->io_offset,
 			    (u_longlong_t)zio->io_size,
 			    (u_longlong_t)zio->io_flags);
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (unsafe ? ENOTSUP : 0);
 	}
-	if (zio->io_vd != zio->io_vd->vdev_top || zio->io_vd != engine.vd) {
+	if (zio->io_vd != zio->io_vd->vdev_top || zio->io_vd != engine->vd) {
 		/* Leaf I/O below the target, or a native top-level vdev. */
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (0);
 	}
 	engine_hold_t *h = zio->io_pr19262_owner_hold;
@@ -1563,9 +1642,9 @@ pr19262_engine_dispatch(zio_t *zio)
 	    (h == NULL || h->error != 0)) || zio->io_bp == NULL) {
 		int error = h != NULL && h->error != 0 ? h->error : ENOENT;
 		if (error == ESTALE && h != NULL &&
-		    engine.hold_report_prints++ < 4)
+		    engine->hold_report_prints++ < 4)
 			engine_hold_report(h);
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (error);
 	}
 	uint64_t v = zio->io_pr19262_owner_mapped ?
@@ -1583,21 +1662,21 @@ pr19262_engine_dispatch(zio_t *zio)
 				e = h->owner[i];
 	}
 	if (e == NULL) {
-		if (engine_find(v) != NULL ||
-		    !zfs_range_tree_contains(engine.legacy, v,
-		    vdev_psize_to_asize_txg(engine.vd, zio->io_size,
+		if (engine_find(engine, v) != NULL ||
+		    !zfs_range_tree_contains(engine->legacy, v,
+		    vdev_psize_to_asize_txg(engine->vd, zio->io_size,
 		    BP_GET_PHYSICAL_BIRTH(zio->io_bp)))) {
-			mutex_exit(&engine.lock);
+			mutex_exit(&engine->lock);
 			return (ENOENT);
 		}
-		engine.legacy_reads++;
-		mutex_exit(&engine.lock);
+		engine->legacy_reads++;
+		mutex_exit(&engine->lock);
 		return (0);
 	}
 	if (b == NULL && e->copying && zio->io_type == ZIO_TYPE_WRITE) {
 		engine_defer(zio, &e->pending);
-		engine.deferred++;
-		mutex_exit(&engine.lock);
+		engine->deferred++;
+		mutex_exit(&engine->lock);
 		return (EINPROGRESS);
 	}
 	boolean_t selected = !zio->io_pr19262_owner_mapped;
@@ -1611,10 +1690,10 @@ pr19262_engine_dispatch(zio_t *zio)
 	}
 	VERIFY3P(b->owner, ==, e);
 	uint64_t sectors = howmany(zio->io_size,
-	    1ULL << engine.vd->vdev_ashift);
+	    1ULL << engine->vd->vdev_ashift);
 	uint64_t required = roundup(sectors + b->parity *
 	    howmany(sectors, b->width - b->parity), b->parity + 1) <<
-	    engine.vd->vdev_ashift;
+	    engine->vd->vdev_ashift;
 	VERIFY3U(required, <=, b->size);
 	/* Keep the original V-BP for checksum/crypto/gang verification. */
 	blkptr_t *physical = &zio->io_pr19262_owner_bp;
@@ -1622,7 +1701,7 @@ pr19262_engine_dispatch(zio_t *zio)
 	boolean_t matched = B_FALSE;
 	for (int d = 0; d < BP_GET_NDVAS(physical); d++) {
 		dva_t *dva = &physical->blk_dva[d];
-		if (DVA_GET_VDEV(dva) == engine.vd->vdev_id &&
+		if (DVA_GET_VDEV(dva) == engine->vd->vdev_id &&
 		    DVA_GET_OFFSET(dva) == v) {
 			DVA_SET_OFFSET(dva, b->p);
 			DVA_SET_ASIZE(dva, b->size);
@@ -1631,10 +1710,10 @@ pr19262_engine_dispatch(zio_t *zio)
 	}
 	VERIFY(matched);
 	BP_SET_PHYSICAL_BIRTH(physical, b->birth);
-	if (engine.fail_writes && zio->io_type == ZIO_TYPE_WRITE &&
+	if (engine->fail_writes && zio->io_type == ZIO_TYPE_WRITE &&
 	    BP_GET_LEVEL(zio->io_bp) == 0 &&
 	    !DMU_OT_IS_METADATA(BP_GET_TYPE(zio->io_bp))) {
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (EIO);
 	}
 	zio->io_pr19262_owner_mapped = B_TRUE;
@@ -1644,19 +1723,19 @@ pr19262_engine_dispatch(zio_t *zio)
 	zio->io_pr19262_backing_width = b->width;
 	zio->io_pr19262_backing_parity = b->parity;
 	/* Operation TXG is never replaced by an encoding/backing birth. */
-	engine.translated++;
-	engine.legacy_reads += e->v == b->p;
+	engine->translated++;
+	engine->legacy_reads += e->v == b->p;
 	if (BP_GET_LEVEL(zio->io_bp) != 0 ||
 	    DMU_OT_IS_METADATA(BP_GET_TYPE(zio->io_bp)))
-		engine.metadata++;
-	if (selected && engine.park_next &&
+		engine->metadata++;
+	if (selected && engine->park_next &&
 	    zio->io_type == ZIO_TYPE_READ && !zio->io_pr19262_owner_copy) {
-		engine.park_next = B_FALSE;
-		engine_defer(zio, &engine.parked);
-		mutex_exit(&engine.lock);
+		engine->park_next = B_FALSE;
+		engine_defer(zio, &engine->parked);
+		mutex_exit(&engine->lock);
 		return (EINPROGRESS);
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (0);
 }
 
@@ -1665,27 +1744,30 @@ engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d, uint64_t birth,
     void **handle, boolean_t unwritten)
 {
 	*handle = NULL;
+	if (spa == NULL)
+		return (ENOTSUP);
+	engine_t *engine = spa->spa_reloc;
 	if (BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp) || d < 0 ||
 	    d >= BP_GET_NDVAS(bp))
 		return (ENGINE_EINVAL(3));
 	const dva_t *dva = &bp->blk_dva[d];
 	uint64_t psize = BP_GET_PSIZE(bp);
-	mutex_enter(&engine.lock);
-	if (engine.spa != spa || spa == NULL ||
-	    DVA_GET_VDEV(dva) != engine.vd->vdev_id) {
-		mutex_exit(&engine.lock);
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || spa == NULL ||
+	    DVA_GET_VDEV(dva) != engine->vd->vdev_id) {
+		mutex_exit(&engine->lock);
 		return (ENOTSUP);
 	}
-	if (engine.persistent && engine.journal_error != 0) {
-		int error = engine.journal_error;
-		mutex_exit(&engine.lock);
+	if (engine->persistent && engine->journal_error != 0) {
+		int error = engine->journal_error;
+		mutex_exit(&engine->lock);
 		return (error);
 	}
 	if (DVA_GET_GANG(dva))
-		psize = vdev_gang_header_psize(engine.vd);
-	engine_owner_t *e = engine_find(DVA_GET_OFFSET(dva));
+		psize = vdev_gang_header_psize(engine->vd);
+	engine_owner_t *e = engine_find(engine, DVA_GET_OFFSET(dva));
 	if (e == NULL || e->retired || e->aborted) {
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (ESTALE);
 	}
 	/*
@@ -1703,15 +1785,15 @@ engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d, uint64_t birth,
 	    !(unwritten && legacy)) ||
 	    e->cur->writers != 0 || e->queued_writers != 0 ||
 	    e->catalog_txg > spa_last_synced_txg(spa)) {
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (EBUSY);
 	}
-	uint64_t size = vdev_psize_to_asize_txg(engine.vd, psize, birth);
-	uint64_t ms = P2ALIGN_TYPED(e->v, 1ULL << engine.vd->vdev_ms_shift,
+	uint64_t size = vdev_psize_to_asize_txg(engine->vd, psize, birth);
+	uint64_t ms = P2ALIGN_TYPED(e->v, 1ULL << engine->vd->vdev_ms_shift,
 	    uint64_t);
 	engine_pick_t pick = { ms,
-	    ms + (1ULL << engine.vd->vdev_ms_shift), size, UINT64_MAX };
-	zfs_range_tree_walk(engine.free, engine_pick_p, &pick);
+	    ms + (1ULL << engine->vd->vdev_ms_shift), size, UINT64_MAX };
+	zfs_range_tree_walk(engine->free, engine_pick_p, &pick);
 	if (pick.found == UINT64_MAX) {
 		/*
 		 * The V's own metaslab is full: a relocation may take backing
@@ -1719,35 +1801,38 @@ engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d, uint64_t birth,
 		 * with weak data does not need its own headroom.
 		 */
 		pick.start = 0;
-		pick.end = engine.total;
-		zfs_range_tree_walk(engine.free, engine_pick_p, &pick);
+		pick.end = engine->total;
+		zfs_range_tree_walk(engine->free, engine_pick_p, &pick);
 	}
 	if (pick.found == UINT64_MAX) {
-		mutex_exit(&engine.lock);
+		mutex_exit(&engine->lock);
 		return (ENOSPC);
 	}
 	engine_copy_t *c = kmem_zalloc(sizeof (*c), KM_SLEEP);
+	c->spa = spa;
 	c->owner = e;
 	c->source = e->cur;
 	c->original = *bp;
 	c->psize = psize;
-	c->stage = engine_version_new(e, pick.found, size, birth, B_FALSE);
-	zfs_range_tree_remove(engine.free, pick.found, size);
+	c->stage = engine_version_new(engine, e, pick.found, size, birth,
+	    B_FALSE);
+	zfs_range_tree_remove(engine->free, pick.found, size);
 	e->copying = B_TRUE;
 	e->holds++;
 	c->source->leases++;
 	*handle = c;
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (0);
 }
 
 boolean_t
 pr19262_engine_free_range(spa_t *spa, uint64_t p, uint64_t size)
 {
-	mutex_enter(&engine.lock);
-	VERIFY3P(spa, ==, engine.spa);
-	boolean_t free = zfs_range_tree_contains(engine.free, p, size);
-	mutex_exit(&engine.lock);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	VERIFY3P(spa, ==, engine->spa);
+	boolean_t free = zfs_range_tree_contains(engine->free, p, size);
+	mutex_exit(&engine->lock);
 	return (free);
 }
 
@@ -1760,24 +1845,26 @@ pr19262_engine_free_range(spa_t *spa, uint64_t p, uint64_t size)
 int
 pr19262_engine_test_prefer_p(spa_t *spa, uint64_t p, uint64_t size)
 {
+	engine_t *engine = spa->spa_reloc;
 	int error = 0;
-	mutex_enter(&engine.lock);
-	if (engine.spa != spa || engine.vd == NULL || size == 0 ||
-	    p + size < p || P2PHASE(p, 1ULL << engine.vd->vdev_ashift) != 0 ||
-	    p + size > engine.total || !zfs_range_tree_contains(engine.free, p,
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || engine->vd == NULL || size == 0 ||
+	    p + size < p || P2PHASE(p, 1ULL << engine->vd->vdev_ashift) != 0 ||
+	    p + size > engine->total || !zfs_range_tree_contains(engine->free,
+	    p,
 	    size)) {
 		error = EINVAL;
-	} else if (P2ALIGN_TYPED(p, 1ULL << engine.vd->vdev_ms_shift,
+	} else if (P2ALIGN_TYPED(p, 1ULL << engine->vd->vdev_ms_shift,
 	    uint64_t) != P2ALIGN_TYPED(p + size - 1,
-	    1ULL << engine.vd->vdev_ms_shift, uint64_t)) {
+	    1ULL << engine->vd->vdev_ms_shift, uint64_t)) {
 		error = ERANGE;
 	} else {
-		VERIFY(!engine.test_prefer_active);
-		engine.test_prefer_p = p;
-		engine.test_prefer_end = p + size;
-		engine.test_prefer_active = B_TRUE;
+		VERIFY(!engine->test_prefer_active);
+		engine->test_prefer_p = p;
+		engine->test_prefer_end = p + size;
+		engine->test_prefer_active = B_TRUE;
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (error);
 }
 #endif
@@ -1787,11 +1874,12 @@ void
 pr19262_engine_describe(spa_t *spa, const blkptr_t *bp, const char *site,
     uint64_t a, uint64_t b)
 {
+	engine_t *engine = spa->spa_reloc;
 	const dva_t *dva = &bp->blk_dva[0];
-	mutex_enter(&engine.lock);
-	engine_owner_t *e = engine.spa == spa && engine.vd != NULL &&
-	    DVA_GET_VDEV(dva) == engine.vd->vdev_id ?
-	    engine_find(DVA_GET_OFFSET(dva)) : NULL;
+	mutex_enter(&engine->lock);
+	engine_owner_t *e = engine->spa == spa && engine->vd != NULL &&
+	    DVA_GET_VDEV(dva) == engine->vd->vdev_id ?
+	    engine_find(engine, DVA_GET_OFFSET(dva)) : NULL;
 	uint64_t versions = 0;
 	for (engine_version_t *v = e != NULL ? e->versions : NULL; v != NULL;
 	    v = v->next)
@@ -1814,7 +1902,7 @@ pr19262_engine_describe(spa_t *spa, const blkptr_t *bp, const char *site,
 	    (u_longlong_t)(e != NULL ? e->holds : 0), (u_longlong_t)versions,
 	    (u_longlong_t)(e != NULL && e->cur != NULL ? e->cur->birth : 0),
 	    (u_longlong_t)(e != NULL && e->cur != NULL ? e->cur->p : 0));
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	/* The caller may assert next: do not lose this line in a buffer. */
 	pr19262_flush();
 }
@@ -1823,9 +1911,11 @@ void
 pr19262_engine_inspect(spa_t *spa, const blkptr_t *bp, int d,
     pr19262_engine_info_t *info)
 {
-	mutex_enter(&engine.lock);
-	VERIFY3P(spa, ==, engine.spa);
-	engine_owner_t *e = engine_find(DVA_GET_OFFSET(&bp->blk_dva[d]));
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	VERIFY3P(spa, ==, engine->spa);
+	engine_owner_t *e = engine_find(engine,
+	    DVA_GET_OFFSET(&bp->blk_dva[d]));
 	VERIFY3P(e, !=, NULL);
 	*info = (pr19262_engine_info_t) {
 	    .p = e->cur->p, .vsize = e->size,
@@ -1841,17 +1931,18 @@ pr19262_engine_inspect(spa_t *spa, const blkptr_t *bp, int d,
 		if (b != e->cur)
 			info->old_leases += b->leases;
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 }
 
 static int
 engine_copy_io(engine_copy_t *c, engine_version_t *b, abd_t *abd,
     zio_type_t type)
 {
-	spa_t *spa = engine.spa;
+	engine_t *engine = c->spa->spa_reloc;
+	spa_t *spa = engine->spa;
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 	zio_t *zio = pr19262_engine_physical_io(spa, &c->original,
-	    engine.vd, c->owner->v, abd, c->psize, type,
+	    engine->vd, c->owner->v, abd, c->psize, type,
 	    spa_last_synced_txg(spa) + 1, b, 0);
 	int error = zio_wait(zio);
 	spa_config_exit(spa, SCL_ZIO, FTAG);
@@ -1862,19 +1953,20 @@ engine_copy_io(engine_copy_t *c, engine_version_t *b, abd_t *abd,
 static boolean_t
 engine_copy_settle(engine_copy_t *c, int *error, boolean_t ready)
 {
-	mutex_enter(&engine.lock);
+	engine_t *engine = c->spa->spa_reloc;
+	mutex_enter(&engine->lock);
 	engine_owner_t *e = c->owner;
 	VERIFY(e->copying);
 	VERIFY3P(e->cur, ==, c->source);
 	VERIFY0(c->stage->leases);
 	if (*error == 0 && e->retired)
 		*error = ESTALE;
-	boolean_t journal_attempted = *error == 0 && engine.persistent;
+	boolean_t journal_attempted = *error == 0 && engine->persistent;
 	if (*error == 0) {
 		c->stage->ready = ready;
-		engine_owner_dirty(c->owner);
+		engine_owner_dirty(engine, c->owner);
 	}
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	return (journal_attempted);
 }
 
@@ -1882,43 +1974,44 @@ engine_copy_settle(engine_copy_t *c, int *error, boolean_t ready)
 static int
 engine_copy_publish(engine_copy_t *c, int error, boolean_t journal_attempted)
 {
-	mutex_enter(&engine.lock);
+	engine_t *engine = c->spa->spa_reloc;
+	mutex_enter(&engine->lock);
 	engine_owner_t *e = c->owner;
 	if (error == 0 && e->retired)
 		error = ESTALE;
 	if (error == 0) {
 		e->cur = c->stage;
 		c->source->retired = B_TRUE;
-		engine.retired += c->source->size;
-		engine.copied++;
-		engine.revision++;
+		engine->retired += c->source->size;
+		engine->copied++;
+		engine->revision++;
 		/* The next catalogs list the published version. */
 		if (journal_attempted)
-			engine_journal_fold(engine.spa, e->catalog_txg);
+			engine_journal_fold(engine->spa, e->catalog_txg);
 	} else if (journal_attempted) {
 		/* A prepared record can survive a failed publication. */
 		c->stage->retired = B_TRUE;
-		engine.retired += c->stage->size;
-		engine.copy_aborts++;
-		engine.revision++;
+		engine->retired += c->stage->size;
+		engine->copy_aborts++;
+		engine->revision++;
 	} else {
 		VERIFY3P(e->versions, ==, c->stage);
 		e->versions = c->stage->next;
-		zfs_range_tree_add(engine.free, c->stage->p, c->stage->size);
+		zfs_range_tree_add(engine->free, c->stage->p, c->stage->size);
 		kmem_free(c->stage, sizeof (*c->stage));
-		engine.copy_aborts++;
-		engine.revision++;
+		engine->copy_aborts++;
+		engine->revision++;
 	}
-	engine_owner_dirty(e);
+	engine_owner_dirty(engine, e);
 	VERIFY3U(c->source->leases, >, 0);
 	c->source->leases--;
 	VERIFY3U(e->holds, >, 0);
 	e->holds--;
 	e->copying = B_FALSE;
-	cv_broadcast(&engine.changed);
+	cv_broadcast(&engine->changed);
 	engine_pending_t *pending = e->pending;
 	e->pending = NULL;
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	engine_resume(pending);
 	kmem_free(c, sizeof (*c));
 	return (error);
@@ -1936,6 +2029,7 @@ engine_copy_finish(engine_copy_t *c, int error, boolean_t ready)
 int
 pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 {
+	engine_t *engine = ((engine_copy_t *)arg)->spa->spa_reloc;
 	engine_copy_t *c = arg;
 	abd_t *source = abd_alloc_for_io(c->psize, B_FALSE);
 	abd_t *verify = abd_alloc_for_io(c->psize, B_FALSE);
@@ -1958,13 +2052,13 @@ pr19262_engine_copy_run(void *arg, boolean_t fail_verify)
 	abd_free(source);
 	abd_free(verify);
 	/* Flush data before publishing its J binding: every member at once. */
-	if (error == 0 && engine.persistent) {
-		spa_t *spa = engine.spa;
+	if (error == 0 && engine->persistent) {
+		spa_t *spa = engine->spa;
 		engine_quorum_t q = { 0 };
 		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
 		engine_members_flush(spa, &q);
 		spa_config_exit(spa, SCL_ZIO, FTAG);
-		error = engine_quorum_result(&q);
+		error = engine_quorum_result(engine, &q);
 	}
 	return (engine_copy_finish(c, error, B_TRUE));
 }
@@ -1982,16 +2076,20 @@ void
 pr19262_engine_copy_group(void **handles, uint_t n,
     const boolean_t *speculative, int *errors)
 {
+	if (n == 0)
+		return;
+	engine_t *engine = ((engine_copy_t *)handles[0])->spa->spa_reloc;
 	hrtime_t start = gethrtime();
 	uint64_t bytes = 0;
 	hrtime_t io[3];
 	engine_copy_t **cv = (engine_copy_t **)handles;
-	spa_t *spa = engine.spa;
+	spa_t *spa = engine->spa;
 	abd_t **source = kmem_alloc(n * sizeof (abd_t *), KM_SLEEP);
 	abd_t **verify = kmem_alloc(n * sizeof (abd_t *), KM_SLEEP);
 	zio_t **zio = kmem_alloc(n * sizeof (zio_t *), KM_SLEEP);
 	boolean_t *attempted = kmem_alloc(n * sizeof (boolean_t), KM_SLEEP);
 	for (uint_t i = 0; i < n; i++) {
+		VERIFY3P(cv[i]->spa, ==, spa);
 		errors[i] = 0;
 		bytes += cv[i]->psize;
 		source[i] = abd_alloc_for_io(cv[i]->psize, B_FALSE);
@@ -2006,7 +2104,7 @@ pr19262_engine_copy_group(void **handles, uint_t n,
 			engine_copy_t *c = cv[i];
 			zio[i] = errors[i] != 0 ? NULL :
 			    pr19262_engine_physical_io(spa, &c->original,
-			    engine.vd, c->owner->v,
+			    engine->vd, c->owner->v,
 			    step == 2 ? verify[i] : source[i], c->psize,
 			    step == 1 ? ZIO_TYPE_WRITE : ZIO_TYPE_READ,
 			    spa_last_synced_txg(spa) + 1,
@@ -2030,10 +2128,10 @@ pr19262_engine_copy_group(void **handles, uint_t n,
 	}
 	hrtime_t checked = gethrtime();
 	/* Flush data before publishing its J bindings: every member at once. */
-	if (any && engine.persistent) {
+	if (any && engine->persistent) {
 		engine_quorum_t q = { 0 };
 		engine_members_flush(spa, &q);
-		int error = engine_quorum_result(&q);
+		int error = engine_quorum_result(engine, &q);
 		for (uint_t i = 0; i < n; i++)
 			if (errors[i] == 0)
 				errors[i] = error;
@@ -2053,18 +2151,18 @@ pr19262_engine_copy_group(void **handles, uint_t n,
 	kmem_free(verify, n * sizeof (abd_t *));
 	kmem_free(source, n * sizeof (abd_t *));
 	hrtime_t end = gethrtime();
-	atomic_inc_64(&engine_copy_cost.groups);
-	atomic_add_64(&engine_copy_cost.blocks, n);
-	atomic_add_64(&engine_copy_cost.bytes, bytes);
-	atomic_add_64(&engine_copy_cost.setup, setup - start);
+	atomic_inc_64(&engine->copy_cost.groups);
+	atomic_add_64(&engine->copy_cost.blocks, n);
+	atomic_add_64(&engine->copy_cost.bytes, bytes);
+	atomic_add_64(&engine->copy_cost.setup, setup - start);
 	for (uint_t step = 0; step < 3; step++)
-		atomic_add_64(&engine_copy_cost.io[step], io[step]);
-	atomic_add_64(&engine_copy_cost.check, checked - readback);
-	atomic_add_64(&engine_copy_cost.flush, flushed - checked);
-	atomic_add_64(&engine_copy_cost.settle, settled - flushed);
-	atomic_add_64(&engine_copy_cost.journal, bound - settled);
-	atomic_add_64(&engine_copy_cost.publish, end - bound);
-	atomic_add_64(&engine_copy_cost.total, end - start);
+		atomic_add_64(&engine->copy_cost.io[step], io[step]);
+	atomic_add_64(&engine->copy_cost.check, checked - readback);
+	atomic_add_64(&engine->copy_cost.flush, flushed - checked);
+	atomic_add_64(&engine->copy_cost.settle, settled - flushed);
+	atomic_add_64(&engine->copy_cost.journal, bound - settled);
+	atomic_add_64(&engine->copy_cost.publish, end - bound);
+	atomic_add_64(&engine->copy_cost.total, end - start);
 }
 
 int
@@ -2093,22 +2191,23 @@ pr19262_engine_rebind_unwritten(spa_t *spa, const blkptr_t *bp, int d,
 void
 pr19262_engine_check(spa_t *spa, const char *phase)
 {
-	mutex_enter(&engine.lock);
-	VERIFY3P(spa, ==, engine.spa);
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	VERIFY3P(spa, ==, engine->spa);
 	uint64_t owned = 0, holds = 0, different = 0, leases = 0;
 	uint64_t versions = 0, checkpoint_only = 0;
-	uint64_t count = avl_numnodes(&engine.owners);
+	uint64_t count = avl_numnodes(&engine->owners);
 	zfs_range_seg64_t *virtual = pr19262_alloc(count * sizeof (*virtual),
 	    KM_SLEEP);
 	boolean_t *pending = kmem_alloc(count * sizeof (*pending), KM_SLEEP);
 	uint64_t n = 0;
 	zfs_range_tree_t *seen = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
 	    NULL, 0, 0);
-	for (engine_owner_t *e = avl_first(&engine.owners); e != NULL;
-	    e = AVL_NEXT(&engine.owners, e)) {
+	for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+	    e = AVL_NEXT(&engine->owners, e)) {
 		for (engine_version_t *b = e->versions; b != NULL;
 		    b = b->next) {
-			zfs_range_tree_verify_not_present(engine.free,
+			zfs_range_tree_verify_not_present(engine->free,
 			    b->p, b->size);
 			owned += b->size;
 			zfs_range_tree_add(seen, b->p, b->size);
@@ -2122,23 +2221,23 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 		checkpoint_only += e->checkpoint_only;
 		different += e->v != e->cur->p;
 	}
-	VERIFY3U(owned + zfs_range_tree_space(engine.free) +
-	    zfs_range_tree_space(engine.legacy) +
-	    zfs_range_tree_space(engine.unusable) +
-	    (engine.store_extents == NULL ? 0 :
-	    zfs_range_tree_space(engine.store_extents)) +
-	    (engine.journal_extents == NULL ? 0 :
-	    zfs_range_tree_space(engine.journal_extents)), ==, engine.total);
-	if (engine.store_extents != NULL)
-		zfs_range_tree_walk(engine.store_extents,
+	VERIFY3U(owned + zfs_range_tree_space(engine->free) +
+	    zfs_range_tree_space(engine->legacy) +
+	    zfs_range_tree_space(engine->unusable) +
+	    (engine->store_extents == NULL ? 0 :
+	    zfs_range_tree_space(engine->store_extents)) +
+	    (engine->journal_extents == NULL ? 0 :
+	    zfs_range_tree_space(engine->journal_extents)), ==, engine->total);
+	if (engine->store_extents != NULL)
+		zfs_range_tree_walk(engine->store_extents,
 		    zfs_range_tree_add, seen);
-	if (engine.journal_extents != NULL)
-		zfs_range_tree_walk(engine.journal_extents,
+	if (engine->journal_extents != NULL)
+		zfs_range_tree_walk(engine->journal_extents,
 		    zfs_range_tree_add, seen);
-	zfs_range_tree_walk(engine.free, zfs_range_tree_add, seen);
-	zfs_range_tree_walk(engine.legacy, zfs_range_tree_add, seen);
-	zfs_range_tree_walk(engine.unusable, zfs_range_tree_add, seen);
-	VERIFY3U(zfs_range_tree_space(seen), ==, engine.total);
+	zfs_range_tree_walk(engine->free, zfs_range_tree_add, seen);
+	zfs_range_tree_walk(engine->legacy, zfs_range_tree_add, seen);
+	zfs_range_tree_walk(engine->unusable, zfs_range_tree_add, seen);
+	VERIFY3U(zfs_range_tree_space(seen), ==, engine->total);
 	zfs_range_tree_vacate(seen, NULL, NULL);
 	zfs_range_tree_destroy(seen);
 	pr19262_printf("PR19262_ENGINE %s owners=%llu different=%llu "
@@ -2146,35 +2245,36 @@ pr19262_engine_check(spa_t *spa, const char *phase)
 	    "aborts=%llu io=%llu metadata=%llu legacy=%llu versions=%llu "
 	    "leases=%llu copied=%llu copy_aborts=%llu deferred=%llu "
 	    "checkpoint=%llu cp_catalog=%llu checkpoint_only=%llu\n", phase,
-	    (u_longlong_t)avl_numnodes(&engine.owners),
+	    (u_longlong_t)avl_numnodes(&engine->owners),
 	    (u_longlong_t)different, (u_longlong_t)owned,
-	    (u_longlong_t)zfs_range_tree_space(engine.free),
-	    (u_longlong_t)engine.retired, (u_longlong_t)holds,
-	    (u_longlong_t)engine.pairs, (u_longlong_t)engine.aborts,
-	    (u_longlong_t)engine.translated, (u_longlong_t)engine.metadata,
-	    (u_longlong_t)engine.legacy_reads, (u_longlong_t)versions,
-	    (u_longlong_t)leases, (u_longlong_t)engine.copied,
-	    (u_longlong_t)engine.copy_aborts, (u_longlong_t)engine.deferred,
-	    (u_longlong_t)engine.checkpoint.ub_txg,
-	    (u_longlong_t)engine.checkpoint.ub_pr19262[6],
+	    (u_longlong_t)zfs_range_tree_space(engine->free),
+	    (u_longlong_t)engine->retired, (u_longlong_t)holds,
+	    (u_longlong_t)engine->pairs, (u_longlong_t)engine->aborts,
+	    (u_longlong_t)engine->translated, (u_longlong_t)engine->metadata,
+	    (u_longlong_t)engine->legacy_reads, (u_longlong_t)versions,
+	    (u_longlong_t)leases, (u_longlong_t)engine->copied,
+	    (u_longlong_t)engine->copy_aborts, (u_longlong_t)engine->deferred,
+	    (u_longlong_t)engine->checkpoint.ub_txg,
+	    (u_longlong_t)engine->checkpoint.ub_pr19262[6],
 	    (u_longlong_t)checkpoint_only);
-	mutex_exit(&engine.lock);
+	mutex_exit(&engine->lock);
 	/* Independent native V allocation checks, outside the catalog lock. */
 	spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
 	for (uint64_t i = 0; i < n; i++) {
-		int claim = metaslab_claim_impl(engine.vd, virtual[i].rs_start,
+		int claim = metaslab_claim_impl(engine->vd, virtual[i].rs_start,
 		    virtual[i].rs_end - virtual[i].rs_start, 0);
 		int expected = pending[i] ? 0 : ENOENT;
 		if (claim != expected) {
-			mutex_enter(&engine.lock);
-			engine_owner_t *e = engine_find(virtual[i].rs_start);
+			mutex_enter(&engine->lock);
+			engine_owner_t *e = engine_find(engine,
+			    virtual[i].rs_start);
 			pr19262_printf("PR19262_V_CLAIM v=%llu "
 			    "size=%llu allocation=%llu retired=%u result=%d "
 			    "ub=%llu\n", (u_longlong_t)e->v,
 			    (u_longlong_t)e->size,
 			    (u_longlong_t)e->allocation_txg, e->retired, claim,
 			    (u_longlong_t)spa_last_synced_txg(spa));
-			mutex_exit(&engine.lock);
+			mutex_exit(&engine->lock);
 		}
 		VERIFY3S(claim, ==, expected);
 	}
@@ -2189,3 +2289,60 @@ static int engine_journal_recover(spa_t *);
 #include "vdev_reloc_journal.c"
 #include "vdev_reloc_convert.c"
 #include "vdev_reloc_admit.c"
+
+void
+pr19262_engine_spa_init(spa_t *spa)
+{
+	engine_t *engine = kmem_zalloc(sizeof (*engine), KM_SLEEP);
+	engine->pages = kmem_zalloc(sizeof (*engine->pages), KM_SLEEP);
+	engine->pages->root.p = UINT64_MAX;
+	mutex_init(&engine->lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&engine->journal_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&engine->store_lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&engine->changed, NULL, CV_DEFAULT, NULL);
+	cv_init(&engine->fence_cv, NULL, CV_DEFAULT, NULL);
+	avl_create(&engine->owners, engine_compare, sizeof (engine_owner_t),
+	    offsetof(engine_owner_t, avl));
+	list_create(&engine->dirty, sizeof (engine_owner_t),
+	    offsetof(engine_owner_t, dirty_node));
+	avl_create(&engine->tombstones, engine_tomb_compare,
+	    sizeof (engine_tomb_t), offsetof(engine_tomb_t, avl));
+	spa->spa_reloc = engine;
+#ifdef _KERNEL
+	engine->kernel = kmem_zalloc(sizeof (*engine->kernel), KM_SLEEP);
+	mutex_init(&engine->kernel->lock, NULL, MUTEX_DEFAULT, NULL);
+	(void) strlcpy(engine->kernel->state, "idle", ENGINE_KERNEL_STATE);
+#endif
+}
+
+void
+pr19262_engine_spa_fini(spa_t *spa)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->store_lock);
+	mutex_enter(&engine->lock);
+	VERIFY(!engine->fence_pending);
+	VERIFY3P(engine->parked, ==, NULL);
+	engine_store_clear(engine);
+	mutex_exit(&engine->lock);
+	mutex_exit(&engine->store_lock);
+#ifdef _KERNEL
+	VERIFY(!engine->kernel->running);
+	mutex_destroy(&engine->kernel->lock);
+	kmem_free(engine->kernel, sizeof (*engine->kernel));
+#endif
+	avl_destroy(&engine->owners);
+	avl_destroy(&engine->tombstones);
+	list_destroy(&engine->dirty);
+	if (engine->gone != NULL)
+		kmem_free(engine->gone,
+		    engine->gone_capacity * 2 * sizeof (uint64_t));
+	cv_destroy(&engine->changed);
+	cv_destroy(&engine->fence_cv);
+	mutex_destroy(&engine->journal_lock);
+	mutex_destroy(&engine->store_lock);
+	mutex_destroy(&engine->lock);
+	kmem_free(engine->pages, sizeof (*engine->pages));
+	kmem_free(engine, sizeof (*engine));
+	spa->spa_reloc = NULL;
+}

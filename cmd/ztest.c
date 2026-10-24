@@ -11994,12 +11994,12 @@ pr19262_runtime_wait(void *arg)
 }
 
 static void
-pr19262_runtime_wait_park(boolean_t writers)
+pr19262_runtime_wait_park(spa_t *spa, boolean_t writers)
 {
 	for (int i = 0; i < 10000 &&
-	    pr19262_engine_waiting(writers) == 0; i++)
+	    pr19262_engine_waiting(spa, writers) == 0; i++)
 		(void) poll(NULL, 0, 1);
-	VERIFY3U(pr19262_engine_waiting(writers), >, 0);
+	VERIFY3U(pr19262_engine_waiting(spa, writers), >, 0);
 }
 
 static void
@@ -12041,13 +12041,13 @@ pr19262_runtime_move(spa_t *spa, blkptr_t *bp, uint64_t birth,
 		    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
 		    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL);
 		scan = pr19262_scan_probe_create(spa, bp);
-		pr19262_engine_park_next();
+		pr19262_engine_park_next(spa);
 		read_io.zio = zio_read(NULL, spa, &one, old_data, size,
 		    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
 		    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL);
 		reader = _thread_create(NULL, 0, pr19262_runtime_wait,
 		    &read_io, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
-		pr19262_runtime_wait_park(B_FALSE);
+		pr19262_runtime_wait_park(spa, B_FALSE);
 	}
 	VERIFY0(pr19262_engine_copy_begin(spa, bp, 0, birth, &copy));
 	if (races) {
@@ -12058,7 +12058,7 @@ pr19262_runtime_move(spa_t *spa, blkptr_t *bp, uint64_t birth,
 		    NULL);
 		writer = _thread_create(NULL, 0, pr19262_runtime_wait,
 		    &write_io, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
-		pr19262_runtime_wait_park(B_TRUE);
+		pr19262_runtime_wait_park(spa, B_TRUE);
 	}
 	VERIFY0(pr19262_engine_copy_run(copy, B_FALSE));
 	if (races) {
@@ -12077,10 +12077,10 @@ pr19262_runtime_move(spa_t *spa, blkptr_t *bp, uint64_t birth,
 		pr19262_engine_check(spa, "old-issued-read-new-copy");
 		VERIFY0(zio_wait(pending));
 		VERIFY0(abd_cmp_buf(pending_data, data, size));
-		pr19262_engine_block_new(B_TRUE);
+		pr19262_engine_block_new(spa, B_TRUE);
 		VERIFY0(pr19262_scan_probe_issue(scan));
-		pr19262_engine_block_new(B_FALSE);
-		pr19262_engine_unpark();
+		pr19262_engine_block_new(spa, B_FALSE);
+		pr19262_engine_unpark(spa);
 		VERIFY0(thread_join(reader));
 		VERIFY0(read_io.error);
 		VERIFY0(abd_cmp_buf(old_data, data, size));
@@ -12216,12 +12216,12 @@ pr19262_runtime_test(spa_t *spa)
 	prop.zp_type = DMU_OT_UINT64_OTHER;
 	blkptr_t write_error = { 0 };
 	uint64_t free_before_error = pr19262_engine_limit(spa, B_TRUE);
-	pr19262_engine_fail_writes(B_TRUE);
+	pr19262_engine_fail_writes(spa, B_TRUE);
 	VERIFY3S(zio_wait(zio_write(NULL, spa, dmu_tx_get_txg(fence),
 	    &write_error, fault_data, 16384, 16384, &prop, NULL, NULL,
 	    NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
 	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY, NULL)), ==, EIO);
-	pr19262_engine_fail_writes(B_FALSE);
+	pr19262_engine_fail_writes(spa, B_FALSE);
 	VERIFY3U(pr19262_engine_limit(spa, B_TRUE), ==, free_before_error);
 	blkptr_t unpublished = { 0 };
 	VERIFY0(zio_wait(zio_write(NULL, spa, dmu_tx_get_txg(fence),
@@ -12254,9 +12254,9 @@ pr19262_runtime_test(spa_t *spa)
 	rotated.blk_dva[1] = bp[0].blk_dva[0];
 	void *scan = pr19262_scan_probe_create(spa, &rotated);
 	pr19262_scan_probe_insert(scan, &rotated);
-	pr19262_engine_block_new(B_TRUE);
+	pr19262_engine_block_new(spa, B_TRUE);
 	VERIFY0(pr19262_scan_probe_issue(scan));
-	pr19262_engine_block_new(B_FALSE);
+	pr19262_engine_block_new(spa, B_FALSE);
 	nvlist_t *snaps = fnvlist_alloc();
 	fnvlist_add_boolean(snaps, snapshot);
 	VERIFY0(dsl_dataset_snapshot(snaps, NULL, NULL));
@@ -12353,7 +12353,7 @@ pr19262_runtime_test(spa_t *spa)
 	pr19262_engine_check(spa, "raw-MOS-root");
 	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE,
 	    FTAG, &os));
-	pr19262_engine_retired_limit(1);
+	pr19262_engine_retired_limit(spa, 1);
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_space(tx, 4096);
 	/* Past the limit: the engine schedules a fence; the client restarts. */
@@ -12379,7 +12379,7 @@ pr19262_runtime_test(spa_t *spa)
 	(void) printf("PR19262_RUNTIME_FENCE past=%d requests=%llu auto=%llu "
 	    "waits=%llu\n", past, (u_longlong_t)fr.fence_requests,
 	    (u_longlong_t)fr.fence_auto, (u_longlong_t)fr.fence_waits);
-	pr19262_engine_retired_limit(64ULL << 20);
+	pr19262_engine_retired_limit(spa, 64ULL << 20);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
 	dmu_objset_disown(os, B_TRUE, FTAG);
 	pr19262_engine_check(spa, "blocked-floor-admission-netfree");
@@ -12540,7 +12540,8 @@ pr19262_journal_test(spa_t *spa)
 			kthread_t *thread = _thread_create(NULL, 0,
 			    pr19262_journal_failed_commit, &j, 0, NULL,
 			    TS_RUN | TS_JOINABLE, defclsyspri);
-			VERIFY3S(pr19262_engine_journal_wait_error(), ==, EIO);
+			VERIFY3S(pr19262_engine_journal_wait_error(spa), ==,
+			    EIO);
 			mutex_enter(&j.lock);
 			hrtime_t deadline = gethrtime() + MSEC2NSEC(100);
 			while (!j.done && gethrtime() < deadline)
@@ -12575,7 +12576,7 @@ pr19262_journal_test(spa_t *spa)
 		    (u_longlong_t)dmu_tx_get_txg(fence), (u_longlong_t)ub);
 		(void) fflush(NULL);
 		if (i == 0 && stage != 0)
-			pr19262_engine_journal_fault(stage);
+			pr19262_engine_journal_fault(spa, stage);
 	}
 	pr19262_engine_check(spa, "native-J-ACK-before-UB");
 	(void) fflush(NULL);
@@ -12710,13 +12711,13 @@ pr19262_journal_clone_test(spa_t *spa)
 	fnvlist_free(label);
 	char *fault = getenv("PR19262_COPY_J_FAULT");
 	if (checkpoint_first && fault != NULL)
-		pr19262_engine_journal_fault(atoi(fault));
+		pr19262_engine_journal_fault(spa, atoi(fault));
 	for (uint_t b = 0; b < 2; b++) {
 		VERIFY3U(BP_GET_NDVAS(&bps[b]), ==, 2);
 		for (int d = 0; d < 2; d++) {
 			if (rollover) {
 				if (roll_fault != NULL)
-					pr19262_engine_journal_roll_fault(
+					pr19262_engine_journal_roll_fault(spa,
 					    atoi(roll_fault));
 				int error =
 				    pr19262_engine_journal_roll(spa);
@@ -13123,7 +13124,7 @@ pr19262_store_lock_witness(spa_t *spa)
 	pr19262_store_witness.spa = spa;
 	mutex_init(&pr19262_store_witness.lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&pr19262_store_witness.changed, NULL, CV_DEFAULT, NULL);
-	pr19262_engine_store_test_hook(pr19262_store_witness_hook);
+	pr19262_engine_store_test_hook(spa, pr19262_store_witness_hook);
 	kthread_t *inventory = _thread_create(NULL, 0,
 	    pr19262_store_witness_inventory, spa, 0, NULL,
 	    TS_RUN | TS_JOINABLE, defclsyspri);
@@ -13175,7 +13176,7 @@ pr19262_store_lock_witness(spa_t *spa)
 	VERIFY0(thread_join(inventory));
 	VERIFY0(thread_join(sync));
 	VERIFY0(thread_join(writer));
-	pr19262_engine_store_test_hook(NULL);
+	pr19262_engine_store_test_hook(spa, NULL);
 	VERIFY0(pr19262_store_witness.inventory_error);
 	VERIFY3U(pr19262_store_witness.roots, >, 0);
 	VERIFY3U(pr19262_store_witness.pages, >, 0);
@@ -13284,10 +13285,10 @@ pr19262_alloc_nomem_witness(spa_t *spa, uint64_t txg, abd_t *data,
 		BP_SET_PSIZE(&failed, size);
 		zio_alloc_list_t trace;
 		metaslab_trace_init(&trace);
-		pr19262_engine_alloc_fail_after(attempt);
+		pr19262_engine_alloc_fail_after(spa, attempt);
 		int error = metaslab_alloc(spa, spa_normal_class(spa), size,
 		    &failed, 2, txg, NULL, 0, &trace, 0, FTAG);
-		pr19262_engine_alloc_fail_after(0);
+		pr19262_engine_alloc_fail_after(spa, 0);
 		(void) printf("PR19262_ALLOC_NOMEM NATIVE attempt=%u error=%d "
 		    "ndvas=%u birth=%llu\n", attempt, error,
 		    (uint_t)BP_GET_NDVAS(&failed),
@@ -13300,12 +13301,12 @@ pr19262_alloc_nomem_witness(spa_t *spa, uint64_t txg, abd_t *data,
 		metaslab_trace_fini(&trace);
 	}
 	blkptr_t failed = { 0 };
-	pr19262_engine_alloc_fail_after(1);
+	pr19262_engine_alloc_fail_after(spa, 1);
 	int error = zio_wait(zio_write(NULL, spa, txg, &failed, data,
 	    size, size, prop, NULL, NULL, NULL, NULL,
 	    ZIO_PRIORITY_SYNC_WRITE, ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY,
 	    NULL));
-	pr19262_engine_alloc_fail_after(0);
+	pr19262_engine_alloc_fail_after(spa, 0);
 	(void) printf("PR19262_ALLOC_NOMEM ZIO error=%d ndvas=%u gang=%u\n",
 	    error, (uint_t)BP_GET_NDVAS(&failed),
 	    (uint_t)BP_IS_GANG(&failed));
@@ -13348,15 +13349,15 @@ pr19262_unalloc_zio_witness(spa_t *spa)
 	prop.zp_copies = 1;
 	prop.zp_type = DMU_OT_UINT64_OTHER;
 	pr19262_alloc_nomem_witness(spa, txg, data, size, &prop);
-	pr19262_engine_journal_test_hook(pr19262_unalloc_observe);
+	pr19262_engine_journal_test_hook(spa, pr19262_unalloc_observe);
 	blkptr_t failed = { 0 };
 	uint64_t free_before = pr19262_engine_limit(spa, B_TRUE);
-	pr19262_engine_fail_writes(B_TRUE);
+	pr19262_engine_fail_writes(spa, B_TRUE);
 	int error = zio_wait(zio_write(NULL, spa, txg, &failed, data,
 	    size, size, &prop, pr19262_unalloc_ready, NULL, NULL, NULL,
 	    ZIO_PRIORITY_SYNC_WRITE, ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY,
 	    NULL));
-	pr19262_engine_fail_writes(B_FALSE);
+	pr19262_engine_fail_writes(spa, B_FALSE);
 	(void) printf("PR19262_UNALLOC_ZIO RETURN error=%d aborts=%llu "
 	    "retained=%llu\n", error,
 	    (u_longlong_t)pr19262_unalloc_witness.aborts,
@@ -13435,7 +13436,7 @@ pr19262_unalloc_zio_witness(spa_t *spa)
 	    "wrong_birth_rejected=1 journal_seq=%llu "
 	    "incarnation=%llu\n", (u_longlong_t)retained.journal_seq,
 	    (u_longlong_t)retained.incarnation);
-	pr19262_engine_journal_test_hook(NULL);
+	pr19262_engine_journal_test_hook(spa, NULL);
 	pr19262_engine_check(spa, "actual-ZIO-error-held-owner-abort");
 	abd_free(data);
 	(void) printf("PR19262_UNALLOC_ZIO PASS actual_zio_eio=1 "
@@ -16244,7 +16245,7 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 		VERIFY(write);
 		/* A group of copy frames dies with half of them on disk. */
 		if (getenv("PR19262_ENGINE_COLD_GROUP_CUT") != NULL)
-			pr19262_engine_journal_group_fault(1);
+			pr19262_engine_journal_group_fault(spa, 1);
 		pr19262_convert_finish(spa, parity);
 	}
 	if (getenv("PR19262_ENGINE_COLD_FENCE") != NULL) {
@@ -16340,7 +16341,8 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 			memset(readback, 0x7c, 16384);
 			dmu_write(os, id, 0, 16384, readback, tx, 0);
 			if (crash)
-				pr19262_engine_store_crash(dmu_tx_get_txg(tx));
+				pr19262_engine_store_crash(spa,
+				    dmu_tx_get_txg(tx));
 			dmu_tx_commit(tx);
 			txg_wait_synced(spa->spa_dsl_pool, 0);
 			VERIFY0(dmu_read(os, id, 0, 16384, readback,
@@ -16422,7 +16424,7 @@ pr19262_export_fence_test(spa_t *spa)
 	pr19262_engine_census(spa, 1, &census);
 	VERIFY3U(census.retired_bytes, >, 0);
 	pr19262_engine_export_fence_arm(spa, &test);
-	pr19262_engine_retired_limit(1);
+	pr19262_engine_retired_limit(spa, 1);
 	VERIFY3S(pr19262_engine_admit(spa, PR19262_ADMIT_CLIENT,
 	    0, 0, 0, 0), ==, ERESTART);
 	VERIFY(pr19262_export_fence_wait(&test, &test.paused, "paused"));
@@ -16450,6 +16452,267 @@ pr19262_export_fence_test(spa_t *spa)
 	cv_destroy(&test.changed);
 	mutex_destroy(&test.lock);
 	(void) printf("PR19262_EXPORT_FENCE_PASS\n");
+}
+
+/* Two engaged engines, including export while the peer retains a worker. */
+#define	PR19262_PAIR_BLOCK 65536ULL
+
+typedef struct pr19262_pair_sync {
+	kmutex_t lock;
+	kcondvar_t changed;
+	uint_t ready;
+	boolean_t start;
+	boolean_t first_done;
+	boolean_t peer_paused;
+	boolean_t finish_peer;
+} pr19262_pair_sync_t;
+
+typedef struct pr19262_pair {
+	spa_t *spa;
+	objset_t *os;
+	uint64_t object;
+	uint64_t blocks;
+	uint64_t birth;
+	uint_t id;
+	pr19262_pair_sync_t *sync;
+	pr19262_engine_convert_stats_t stats;
+} pr19262_pair_t;
+
+static void
+pr19262_pair_write(pr19262_pair_t *p, uint64_t first, uint64_t count)
+{
+	void *data = kmem_alloc(PR19262_PAIR_BLOCK, KM_SLEEP);
+	dmu_tx_t *tx = dmu_tx_create(p->os);
+	dmu_tx_hold_write(tx, p->object, first * PR19262_PAIR_BLOCK,
+	    count * PR19262_PAIR_BLOCK);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	for (uint64_t i = first; i < first + count; i++) {
+		memset(data, (p->id + 1) * 61 + i % 31, PR19262_PAIR_BLOCK);
+		dmu_write(p->os, p->object, i * PR19262_PAIR_BLOCK,
+		    PR19262_PAIR_BLOCK, data, tx, 0);
+	}
+	dmu_tx_commit(tx);
+	kmem_free(data, PR19262_PAIR_BLOCK);
+}
+
+static void
+pr19262_pair_writer(void *arg)
+{
+	pr19262_pair_t *p = arg;
+	for (uint_t i = 0; i < 32; i++)
+		pr19262_pair_write(p, i % 16, 1);
+	txg_wait_synced(spa_get_dsl(p->spa), 0);
+	thread_exit();
+}
+
+static void
+pr19262_pair_worker(void *arg)
+{
+	pr19262_pair_t *p = arg;
+	pr19262_pair_sync_t *s = p->sync;
+	mutex_enter(&s->lock);
+	s->ready++;
+	cv_broadcast(&s->changed);
+	while (!s->start)
+		cv_wait(&s->changed, &s->lock);
+	mutex_exit(&s->lock);
+	kthread_t *writer = _thread_create(NULL, 0, pr19262_pair_writer,
+	    p, 0, NULL, TS_RUN | TS_JOINABLE, defclsyspri);
+	VERIFY0(pr19262_engine_convert(p->spa, p->birth, 1ULL << 20,
+	    4096, &p->stats));
+	VERIFY0(thread_join(writer));
+	if (p->id == 1) {
+		mutex_enter(&s->lock);
+		s->peer_paused = B_TRUE;
+		cv_broadcast(&s->changed);
+		while (!s->finish_peer)
+			cv_wait(&s->changed, &s->lock);
+		mutex_exit(&s->lock);
+	}
+	uint64_t floor, reclaimed, released;
+	VERIFY0(pr19262_engine_fence(p->spa, &floor, &reclaimed,
+	    &released, NULL));
+	VERIFY0(pr19262_engine_certify(p->spa, 2));
+	(void) printf("PR19262_PAIR_CONVERT pool=%s copied=%llu floor=%llu\n",
+	    spa_name(p->spa), (u_longlong_t)p->stats.copied,
+	    (u_longlong_t)floor);
+	if (p->id == 0) {
+		mutex_enter(&s->lock);
+		s->first_done = B_TRUE;
+		cv_broadcast(&s->changed);
+		mutex_exit(&s->lock);
+	}
+	thread_exit();
+}
+
+static void
+pr19262_pair_wait(pr19262_pair_sync_t *s, boolean_t *flag)
+{
+	hrtime_t deadline = gethrtime() + SEC2NSEC(120);
+	mutex_enter(&s->lock);
+	while (!*flag && gethrtime() < deadline)
+		(void) cv_timedwait_hires(&s->changed, &s->lock, deadline,
+		    USEC2NSEC(1), CALLOUT_FLAG_ABSOLUTE);
+	VERIFY(*flag);
+	mutex_exit(&s->lock);
+}
+
+static void
+pr19262_pair_verify(spa_t *spa, uint_t id)
+{
+	pr19262_engine_census_t c;
+	pr19262_engine_census(spa, 2, &c);
+	VERIFY0(c.legacy_bytes);
+	VERIFY0(c.weak_current);
+	VERIFY3U(c.certified, ==, 2);
+	void *data = kmem_alloc(PR19262_PAIR_BLOCK, KM_SLEEP);
+	for (uint_t snap = 0; snap < 2; snap++) {
+		char name[ZFS_MAX_DATASET_NAME_LEN];
+		(void) snprintf(name, sizeof (name), "%s/pair%s",
+		    spa_name(spa), snap == 0 ? "" : "@baseline");
+		objset_t *os;
+		VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_TRUE, B_TRUE,
+		    FTAG, &os));
+		uint64_t object = 0;
+		VERIFY0(dmu_object_next(os, &object, B_FALSE, 0));
+		uint64_t blocks = id == 0 ? 128 : 256;
+		for (uint64_t i = 0; i < blocks; i++) {
+			VERIFY0(dmu_read(os, object, i * PR19262_PAIR_BLOCK,
+			    PR19262_PAIR_BLOCK, data, DMU_READ_NO_PREFETCH));
+			for (uint64_t j = 0; j < PR19262_PAIR_BLOCK; j++)
+				VERIFY3U(((uint8_t *)data)[j], ==,
+				    (id + 1) * 61 + i % 31);
+		}
+		dmu_objset_disown(os, B_TRUE, FTAG);
+	}
+	kmem_free(data, PR19262_PAIR_BLOCK);
+	pr19262_verify_all(spa);
+	pr19262_convert_scrub(spa);
+	(void) printf("PR19262_PAIR_VERIFY pool=%s head=1 snapshot=1 "
+	    "legacy=0 weak=0 certified=2\n", spa_name(spa));
+}
+
+static int
+pr19262_pair_driver(const char *first, const char *second, boolean_t cold)
+{
+	const char *dirs[2] = { first, second };
+	char pools[2][32] = { "pr19262_tx", "pr19262_peer" };
+	pr19262_pair_t p[2] = { 0 };
+	pr19262_pair_sync_t s = { 0 };
+	mutex_init(&s.lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&s.changed, NULL, CV_DEFAULT, NULL);
+	char *cache = kmem_asprintf("%s/private-cache", first);
+	spa_config_path = cache;
+	kernel_init(SPA_MODE_READ | SPA_MODE_WRITE);
+	pr19262_arc_limit(256);
+	VERIFY3P(pr19262_engine_hold(NULL, NULL, NULL, B_TRUE, B_FALSE),
+	    ==, NULL);
+	nvlist_t *props = fnvlist_alloc();
+	fnvlist_add_string(props, "cachefile", "none");
+	if (!cold)
+		fnvlist_add_uint64(props, "feature@raidz_parity_epochs", 0);
+	for (uint_t i = 0; i < 2; i++) {
+		if (cold) {
+			char *paths[] = { (char *)dirs[i] };
+			importargs_t args = { .paths = 1, .path = paths,
+			    .can_be_active = B_TRUE };
+			libpc_handle_t handle = {
+			    .lpc_ops = &libzpool_config_ops,
+			    .lpc_printerr = B_TRUE };
+			nvlist_t *config;
+			VERIFY0(zpool_find_config(&handle, pools[i], &config,
+			    &args));
+			VERIFY0(spa_import(pools[i], config, props,
+			    ZFS_IMPORT_SKIP_MMP));
+			fnvlist_free(config);
+		} else {
+			nvlist_t *root = pr19262_fixture_root(dirs[i]);
+			VERIFY0(spa_create(pools[i], root, props,
+			    NULL, NULL, NULL));
+			fnvlist_free(root);
+		}
+		VERIFY0(spa_open(pools[i], &p[i].spa, FTAG));
+		p[i].id = i;
+		p[i].blocks = i == 0 ? 128 : 256;
+		p[i].sync = &s;
+		if (cold)
+			continue;
+		char name[ZFS_MAX_DATASET_NAME_LEN];
+		(void) snprintf(name, sizeof (name), "%s/pair", pools[i]);
+		VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL,
+		    NULL, NULL));
+		VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+		    ZIO_COMPRESS_OFF, B_FALSE));
+		VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE,
+		    FTAG, &p[i].os));
+		dmu_tx_t *tx = dmu_tx_create(p[i].os);
+		dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+		p[i].object = dmu_object_alloc(p[i].os, DMU_OT_UINT64_OTHER,
+		    PR19262_PAIR_BLOCK, DMU_OT_NONE, 0, tx);
+		dmu_tx_commit(tx);
+		for (uint64_t b = 0; b < p[i].blocks; b += 8)
+			pr19262_pair_write(&p[i], b, 8);
+		txg_wait_synced(spa_get_dsl(p[i].spa), 0);
+		nvlist_t *snaps = fnvlist_alloc();
+		char snapshot[ZFS_MAX_DATASET_NAME_LEN];
+		(void) snprintf(snapshot, sizeof (snapshot),
+		    "%s/pair@baseline", pools[i]);
+		fnvlist_add_boolean(snaps, snapshot);
+		VERIFY0(dsl_dataset_snapshot(snaps, NULL, NULL));
+		fnvlist_free(snaps);
+		pr19262_engine_start(p[i].spa);
+		pr19262_engine_store_enable(p[i].spa);
+		VERIFY0(pr19262_engine_epoch(p[i].spa, 2, &p[i].birth));
+	}
+	VERIFY3P(p[0].spa->spa_reloc, !=, p[1].spa->spa_reloc);
+	if (!cold) {
+		kthread_t *workers[2];
+		for (uint_t i = 0; i < 2; i++)
+			workers[i] = _thread_create(NULL, 0,
+			    pr19262_pair_worker, &p[i], 0, NULL,
+			    TS_RUN | TS_JOINABLE, defclsyspri);
+		mutex_enter(&s.lock);
+		hrtime_t deadline = gethrtime() + SEC2NSEC(120);
+		while (s.ready != 2 && gethrtime() < deadline)
+			(void) cv_timedwait_hires(&s.changed, &s.lock, deadline,
+			    USEC2NSEC(1), CALLOUT_FLAG_ABSOLUTE);
+		VERIFY3U(s.ready, ==, 2);
+		s.start = B_TRUE;
+		cv_broadcast(&s.changed);
+		mutex_exit(&s.lock);
+		pr19262_pair_wait(&s, &s.first_done);
+		pr19262_pair_wait(&s, &s.peer_paused);
+		VERIFY0(thread_join(workers[0]));
+		dmu_objset_disown(p[0].os, B_TRUE, FTAG);
+		pr19262_pair_verify(p[0].spa, 0);
+		spa_close(p[0].spa, FTAG);
+		VERIFY0(spa_export(pools[0], NULL, B_FALSE, B_FALSE));
+		VERIFY(pr19262_engine_persistent(p[1].spa));
+		(void) printf("PR19262_PAIR_EXPORT first=0 peer_active=1 "
+		    "peer_worker_waiting=1\n");
+		mutex_enter(&s.lock);
+		s.finish_peer = B_TRUE;
+		cv_broadcast(&s.changed);
+		mutex_exit(&s.lock);
+		VERIFY0(thread_join(workers[1]));
+		dmu_objset_disown(p[1].os, B_TRUE, FTAG);
+	} else {
+		pr19262_pair_verify(p[0].spa, 0);
+		spa_close(p[0].spa, FTAG);
+		VERIFY0(spa_export(pools[0], NULL, B_FALSE, B_FALSE));
+		VERIFY(pr19262_engine_persistent(p[1].spa));
+	}
+	pr19262_pair_verify(p[1].spa, 1);
+	spa_close(p[1].spa, FTAG);
+	VERIFY0(spa_export(pools[1], NULL, B_FALSE, B_FALSE));
+	fnvlist_free(props);
+	kernel_fini();
+	kmem_strfree(cache);
+	cv_destroy(&s.changed);
+	mutex_destroy(&s.lock);
+	(void) printf("PR19262_PAIR_PASS cold=%u\n", cold);
+	return (0);
 }
 
 static void
@@ -16586,6 +16849,13 @@ int
 main(int argc, char **argv)
 {
 	(void) setvbuf(stdout, NULL, _IOLBF, 0);
+	const char *pair = getenv("PR19262_ENGINE_PAIR");
+	if (pair != NULL) {
+		const char *peer = getenv("PR19262_ENGINE_PAIR_PEER");
+		VERIFY3P(peer, !=, NULL);
+		return (pr19262_pair_driver(pair, peer,
+		    getenv("PR19262_ENGINE_PAIR_COLD") != NULL));
+	}
 	const char *journal = getenv("PR19262_JOURNAL_COLD");
 	if (journal != NULL)
 		return (pr19262_journal_cold(journal));

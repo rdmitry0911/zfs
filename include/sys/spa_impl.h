@@ -508,6 +508,7 @@ struct spa {
 
 	/* Physical-credit ledger, owned from spa_add() to spa_remove(). */
 	struct pr19262_tx_state *spa_pr19262_tx;
+	struct pr19262_engine *spa_reloc;
 
 	/*
 	 * spa_refcount & spa_config_lock must be the last elements
