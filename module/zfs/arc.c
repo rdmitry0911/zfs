@@ -7070,6 +7070,57 @@ arc_write_done(zio_t *zio)
 			    exists->b_l1hdr.b_state == arc_anon,
 			    (int)zfs_refcount_count(
 			    &exists->b_l1hdr.b_refcnt));
+			if ((zio->io_flags & (ZIO_FLAG_IO_REWRITE |
+			    ZIO_FLAG_NOPWRITE)) == 0 &&
+			    !BP_GET_DEDUP(zio->io_bp)) {
+				const dva_t *old =
+				    BP_IDENTITY(&zio->io_bp_orig);
+				const dva_t *new = BP_IDENTITY(zio->io_bp);
+
+				pr19262_printf(
+				    "PR19262_ARC_UNEXPECTED txg=%llu "
+				    "flags=%llx original_flags=%llx post=%u "
+				    "stage=%llx original_stage=%llx "
+				    "priority=%u child=%u objset=%llu "
+				    "object=%llu level=%lld blkid=%llu\n",
+				    (u_longlong_t)zio->io_txg,
+				    (u_longlong_t)zio->io_flags,
+				    (u_longlong_t)zio->io_orig_flags,
+				    zio->io_post,
+				    (u_longlong_t)zio->io_stage,
+				    (u_longlong_t)zio->io_orig_stage,
+				    (uint_t)zio->io_priority,
+				    (uint_t)zio->io_child_type,
+				    (u_longlong_t)zio->io_bookmark.zb_objset,
+				    (u_longlong_t)zio->io_bookmark.zb_object,
+				    (longlong_t)zio->io_bookmark.zb_level,
+				    (u_longlong_t)zio->io_bookmark.zb_blkid);
+				pr19262_printf("PR19262_ARC_UNEXPECTED_BP "
+				    "new=%llu/%llu/%llu birth=%llu "
+				    "old=%llu/%llu/%llu "
+				    "birth=%llu old_hole=%u equal=%u\n",
+				    (u_longlong_t)DVA_GET_VDEV(new),
+				    (u_longlong_t)DVA_GET_OFFSET(new),
+				    (u_longlong_t)DVA_GET_ASIZE(new),
+				    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(
+				    zio->io_bp),
+				    (u_longlong_t)DVA_GET_VDEV(old),
+				    (u_longlong_t)DVA_GET_OFFSET(old),
+				    (u_longlong_t)DVA_GET_ASIZE(old),
+				    (u_longlong_t)BP_GET_PHYSICAL_BIRTH(
+				    &zio->io_bp_orig),
+				    BP_IS_HOLE(&zio->io_bp_orig),
+				    BP_EQUAL(&zio->io_bp_orig, zio->io_bp));
+				pr19262_printf("PR19262_ARC_UNEXPECTED_HDR "
+				    "birth=%llu anon=%u refs=%d lsize=%llu "
+				    "psize=%llu\n",
+				    (u_longlong_t)exists->b_birth,
+				    exists->b_l1hdr.b_state == arc_anon,
+				    (int)zfs_refcount_count(
+				    &exists->b_l1hdr.b_refcnt),
+				    (u_longlong_t)HDR_GET_LSIZE(exists),
+				    (u_longlong_t)HDR_GET_PSIZE(exists));
+			}
 			pr19262_flush();
 			if (zio->io_flags & ZIO_FLAG_IO_REWRITE) {
 				if (!BP_EQUAL(&zio->io_bp_orig, zio->io_bp))
