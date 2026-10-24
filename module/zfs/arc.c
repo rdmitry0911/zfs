@@ -7336,10 +7336,11 @@ arc_write_done(zio_t *zio)
 
 				pr19262_printf(
 				    "PR19262_ARC_UNEXPECTED_HDR "
-				    "birth=%llu l1=%u l2=%u "
+				    "spa=%llx birth=%llu l1=%u l2=%u "
 				    "anon=%u io=%u acb=%u "
 				    "refs=%d flags=%x "
 				    "lsize=%llu psize=%llu\n",
+				    (u_longlong_t)exists->b_spa,
 				    (u_longlong_t)exists->b_birth,
 				    exists_l1,
 				    HDR_HAS_L2HDR(exists),
@@ -7354,7 +7355,8 @@ arc_write_done(zio_t *zio)
 				    (u_longlong_t)HDR_GET_PSIZE(exists));
 				pr19262_printf(
 				    "PR19262_ARC_UNEXPECTED_PROVENANCE "
-				    "found=%u origin=%u seq=%llu txg=%llu "
+				    "found=%u spa=%llx "
+				    "origin=%u seq=%llu txg=%llu "
 				    "flags=%llx original_flags=%llx "
 				    "post=%u stage=%llx "
 				    "original_stage=%llx "
@@ -7362,6 +7364,8 @@ arc_write_done(zio_t *zio)
 				    "objset=%llu object=%llu "
 				    "level=%lld blkid=%llu\n",
 				    provenance,
+				    (u_longlong_t)(provenance ?
+				    pap.pap_spa : 0),
 				    provenance ? pap.pap_origin : 0,
 				    (u_longlong_t)provenance_seq,
 				    (u_longlong_t)(provenance ? pap.pap_txg :
