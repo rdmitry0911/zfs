@@ -14980,8 +14980,11 @@ pr19262_full_test(spa_t *spa)
 	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
 	    PR19262_LIVE_BLOCK, DMU_OT_NONE, 0, tx);
 	dmu_tx_commit(tx);
-	/* The target parity is planned before the weak data is written. */
-	pr19262_engine_plan(spa, parity, 0);
+	/* Plan the conversion's actual batch before filling the weak pool. */
+	uint64_t batch = pr19262_env_u64("PR19262_ENGINE_CONVERT_BATCH", 8);
+	VERIFY3U(batch, >, 0);
+	VERIFY3U(batch, <=, 1024);
+	pr19262_engine_plan(spa, parity, batch << 20);
 	pr19262_engine_admit_report_t r;
 	pr19262_engine_admit_report(spa, "full-start", &r);
 	uint64_t refd, avail_before, avail_full, avail_after, objs, aobjs;
