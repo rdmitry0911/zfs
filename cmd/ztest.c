@@ -12429,6 +12429,200 @@ pr19262_journal_get_data(void *arg, uint64_t arg2, lr_write_t *lr,
 	return (error);
 }
 
+/* Defined by dmu.c only in the libzpool build used by this test. */
+extern void (*ztest_dmu_sync_capture)(objset_t *, uint64_t, blkptr_t *,
+    boolean_t);
+
+typedef struct pr19262_dmu_stale {
+	objset_t *os;
+	uint64_t txg;
+	uint64_t older_txg;
+	zio_t *sync_gate;
+	blkptr_t old_bp;
+	boolean_t expect_failure;
+	boolean_t captured;
+} pr19262_dmu_stale_t;
+
+static pr19262_dmu_stale_t *pr19262_dmu_stale;
+
+static void
+pr19262_dmu_stale_capture(objset_t *os, uint64_t txg, blkptr_t *bp,
+    boolean_t nopwrite)
+{
+	pr19262_dmu_stale_t *stale = pr19262_dmu_stale;
+
+	if (stale == NULL || os != stale->os || txg != stale->txg)
+		return;
+	VERIFY(!stale->captured);
+	VERIFY(!nopwrite);
+	if (stale->expect_failure)
+		VERIFY(BP_EQUAL(bp, &stale->old_bp));
+	else
+		VERIFY(BP_IS_HOLE(bp));
+	stale->captured = B_TRUE;
+	zio_nowait(stale->sync_gate);
+	txg_wait_synced(os->os_spa->spa_dsl_pool, stale->older_txg);
+	pr19262_engine_info_t info;
+	pr19262_engine_inspect(os->os_spa, &stale->old_bp, 0, &info);
+	VERIFY(info.retired);
+	(void) printf("PR19262_DMU_STALE_CAPTURE txg=%llu nopwrite=%u "
+	    "baseline_old_bp=%u retired=%u\n", (u_longlong_t)txg, nopwrite,
+	    BP_EQUAL(bp, &stale->old_bp), info.retired);
+}
+
+static void
+pr19262_dmu_stale_done(zgd_t *zgd, int error)
+{
+	int *done = zgd->zgd_private;
+
+	*done = error;
+}
+
+static void
+pr19262_dmu_stale_guard(spa_t *spa, const blkptr_t *old_bp, uint64_t size,
+    void *data)
+{
+	abd_t *read_abd = abd_alloc_for_io(size, B_FALSE);
+	int read_error = zio_wait(zio_read(NULL, spa, old_bp, read_abd, size,
+	    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY | ZIO_FLAG_RAW |
+	    ZIO_FLAG_SPECULATIVE, NULL));
+	abd_free(read_abd);
+	abd_t *write_abd = abd_alloc_for_io(size, B_FALSE);
+	abd_copy_from_buf(write_abd, data, size);
+	blkptr_t rewritten = *old_bp;
+	int rewrite_error = zio_wait(zio_rewrite(NULL, spa,
+	    spa_last_synced_txg(spa) + 1, &rewritten, write_abd, size,
+	    NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY | ZIO_FLAG_RAW |
+	    ZIO_FLAG_SPECULATIVE, NULL));
+	abd_free(write_abd);
+	VERIFY3S(read_error, ==, ESTALE);
+	VERIFY3S(rewrite_error, ==, ESTALE);
+	(void) printf("PR19262_DMU_STALE_GUARD read=%d rewrite=%d\n",
+	    read_error, rewrite_error);
+}
+
+/*
+ * Reproduce the dmu_sync() stale-original-BP order deterministically:
+ * old on-disk A, blocked older B, then a held-open newer C.  The capture
+ * hook lets B replace A after dmu_sync() selected A, but before C's write ZIO
+ * exists.  A safe no-nopwrite path must not carry A into that new ZIO.
+ */
+static void
+pr19262_dmu_stale_test(spa_t *spa)
+{
+	const uint64_t size = 131072;
+	const boolean_t expect_failure =
+	    getenv("PR19262_DMU_STALE_EXPECT_FAIL") != NULL;
+	char name[] = "pr19262_tx/dmu_stale";
+	objset_t *os;
+	dmu_buf_t *dbuf;
+	dmu_buf_impl_t *db;
+	dmu_tx_t *older_tx, *newer_tx;
+	uint64_t older_txg, newer_txg;
+	void *a = kmem_alloc(size, KM_SLEEP);
+	void *b = kmem_alloc(size, KM_SLEEP);
+	void *c = kmem_alloc(size, KM_SLEEP);
+	void *readback = kmem_alloc(size, KM_SLEEP);
+
+	memset(a, 0x31, size);
+	memset(b, 0x62, size);
+	memset(c, 0x93, size);
+	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COPIES, 1, B_FALSE));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+	    ZIO_COMPRESS_OFF, B_FALSE));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_CHECKSUM,
+	    ZIO_CHECKSUM_SHA256, B_FALSE));
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE,
+	    FTAG, &os));
+
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER, size,
+	    DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_write(tx, object, 0, size);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	dmu_write(os, object, 0, size, a, tx, 0);
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+
+	VERIFY0(dmu_buf_hold(os, object, 0, FTAG, &dbuf,
+	    DMU_READ_NO_PREFETCH));
+	db = (dmu_buf_impl_t *)dbuf;
+	VERIFY3P(db->db_blkptr, !=, NULL);
+	pr19262_dmu_stale_t stale = { .os = os,
+	    .expect_failure = expect_failure, .old_bp = *db->db_blkptr };
+	VERIFY(!BP_IS_HOLE(&stale.old_bp));
+
+	older_tx = dmu_tx_create(os);
+	dmu_tx_hold_write(older_tx, object, 0, size);
+	VERIFY0(dmu_tx_assign(older_tx, DMU_TX_NOWAIT | DMU_TX_NOTHROTTLE));
+	older_txg = dmu_tx_get_txg(older_tx);
+	dmu_write(os, object, 0, size, b, older_tx, 0);
+	stale.sync_gate = zio_null(spa->spa_txg_zio[older_txg & TXG_MASK], spa,
+	    NULL, NULL, NULL, 0);
+	dmu_tx_commit(older_tx);
+	txg_wait_open(spa->spa_dsl_pool, older_txg + 1, B_TRUE);
+
+	newer_tx = dmu_tx_create(os);
+	dmu_tx_hold_write(newer_tx, object, 0, size);
+	VERIFY0(dmu_tx_assign(newer_tx, DMU_TX_NOWAIT | DMU_TX_NOTHROTTLE));
+	newer_txg = dmu_tx_get_txg(newer_tx);
+	VERIFY3U(newer_txg, >, older_txg);
+	dmu_write(os, object, 0, size, c, newer_tx, 0);
+	stale.txg = newer_txg;
+	stale.older_txg = older_txg;
+
+	zilog_t *zilog = zil_open(os, pr19262_journal_get_data, NULL);
+	lwb_t *lwb = ztest_dmu_sync_lwb_alloc();
+	lwb->lwb_zilog = zilog;
+	blkptr_t logged_bp = { 0 };
+	int done_error = -1;
+	zgd_t zgd = { .zgd_lwb = lwb, .zgd_bp = &logged_bp, .zgd_db = dbuf,
+	    .zgd_private = &done_error };
+	zio_t *pio = zio_root(spa, NULL, NULL, ZIO_FLAG_CANFAIL);
+	VERIFY3P(pr19262_dmu_stale, ==, NULL);
+	pr19262_dmu_stale = &stale;
+	ztest_dmu_sync_capture = pr19262_dmu_stale_capture;
+	VERIFY0(dmu_sync(pio, newer_txg, pr19262_dmu_stale_done, &zgd));
+	int io_error = zio_wait(pio);
+	ztest_dmu_sync_capture = NULL;
+	pr19262_dmu_stale = NULL;
+	VERIFY(stale.captured);
+	VERIFY3S(done_error, ==, io_error);
+	if (expect_failure)
+		VERIFY3S(io_error, ==, ESTALE);
+	else
+		VERIFY0(io_error);
+	if (lwb->lwb_child_zio != NULL)
+		VERIFY0(zio_wait(lwb->lwb_child_zio));
+	(void) printf("PR19262_DMU_STALE_IO expected_failure=%u error=%d "
+	    "done=%d\n", expect_failure, io_error, done_error);
+
+	dmu_tx_commit(newer_tx);
+	txg_wait_synced(spa->spa_dsl_pool, newer_txg);
+	VERIFY0(dmu_read(os, object, 0, size, readback, DMU_READ_NO_PREFETCH));
+	VERIFY0(memcmp(readback, c, size));
+	pr19262_dmu_stale_guard(spa, &stale.old_bp, size, c);
+	pr19262_engine_check(spa, "dmu-stale-original-bp");
+	(void) printf("PR19262_DMU_STALE_PASS expected_failure=%u txg=%llu\n",
+	    expect_failure, (u_longlong_t)newer_txg);
+
+	ztest_dmu_sync_lwb_free(lwb);
+	zil_close(zilog);
+	dmu_buf_rele(dbuf, FTAG);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	kmem_free(a, size);
+	kmem_free(b, size);
+	kmem_free(c, size);
+	kmem_free(readback, size);
+}
+
 static void
 pr19262_journal_write(objset_t *os, zilog_t *zilog, uint64_t object,
     uint64_t offset, uint8_t value, boolean_t indirect)
@@ -16759,6 +16953,17 @@ pr19262_tx_driver(const char *directory)
 		pr19262_engine_start(spa);
 		if (getenv("PR19262_ENGINE_DURABLE") != NULL)
 			pr19262_engine_store_enable(spa);
+		if (getenv("PR19262_ENGINE_DMU_STALE") != NULL) {
+			pr19262_dmu_stale_test(spa);
+			spa_close(spa, FTAG);
+			VERIFY0(spa_export("pr19262_tx", NULL, B_FALSE,
+			    B_FALSE));
+			fnvlist_free(props);
+			fnvlist_free(root);
+			kernel_fini();
+			free(cache);
+			return (0);
+		}
 		if (getenv("PR19262_JOURNAL_CLONE") != NULL)
 			pr19262_journal_clone_test(spa);
 		if (getenv("PR19262_JOURNAL_TEST") != NULL)

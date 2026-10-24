@@ -59,6 +59,16 @@
  */
 static int zfs_nopwrite_enabled = 1;
 
+#ifndef _KERNEL
+/*
+ * ztest's stale-BP witness stops dmu_sync() after it has decided whether
+ * nopwrite is safe, but before arc_write() creates its write ZIO.  Keeping
+ * this in libzpool makes that ordering testable without adding a kernel test
+ * control or altering normal execution when the hook is unset.
+ */
+void (*ztest_dmu_sync_capture)(objset_t *, uint64_t, blkptr_t *, boolean_t);
+#endif
+
 /*
  * Tunable to control percentage of dirtied L1 blocks from frees allowed into
  * one TXG. After this threshold is crossed, additional dirty blocks from frees
@@ -2367,6 +2377,14 @@ dmu_sync(zio_t *pio, uint64_t txg, dmu_sync_cb_t *done, zgd_t *zgd)
 			zp.zp_nopwrite = B_FALSE;
 		DB_DNODE_EXIT(db);
 	}
+	/*
+	 * zgd_bp carries the old BP solely as nopwrite's comparison target.
+	 * Once nopwrite is unsafe, do not pass that potentially retiring BP to
+	 * the new write ZIO: a prior dirty record can replace and free it after
+	 * db_mtx is dropped but before arc_write() creates the child ZIO.
+	 */
+	if (!zp.zp_nopwrite)
+		BP_ZERO(zgd->zgd_bp);
 
 	ASSERT(dr->dr_txg == txg);
 	if (dr->dt.dl.dr_override_state == DR_IN_DMU_SYNC ||
@@ -2384,6 +2402,11 @@ dmu_sync(zio_t *pio, uint64_t txg, dmu_sync_cb_t *done, zgd_t *zgd)
 	ASSERT(dr->dt.dl.dr_override_state == DR_NOT_OVERRIDDEN);
 	dr->dt.dl.dr_override_state = DR_IN_DMU_SYNC;
 	mutex_exit(&db->db_mtx);
+
+#ifndef _KERNEL
+	if (ztest_dmu_sync_capture != NULL)
+		ztest_dmu_sync_capture(os, txg, zgd->zgd_bp, zp.zp_nopwrite);
+#endif
 
 	dsa = kmem_alloc(sizeof (dmu_sync_arg_t), KM_SLEEP);
 	dsa->dsa_dr = dr;
