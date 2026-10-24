@@ -797,8 +797,11 @@ static buf_hash_table_t buf_hash_table;
  * indirect DMU_OT_DNODE block.  A header carries no indication of which
  * operation first inserted it into the hash table, so retain a bounded
  * provenance record for just that sparse class.  Ring record and lookup are
- * called with the header hash lock held.  The natural-write profile below
- * releases this private lock before taking that hash lock.
+ * called with the header hash lock held.  Lookup accepts only the most recent
+ * record whose saved header address equals the current header; the address is
+ * never dereferenced and is not an allocation-generation token.  The
+ * natural-write profile below releases this private lock before taking that
+ * hash lock.
  */
 #define	PR19262_ARC_PROVENANCE_LEN	64
 #define	PR19262_ARC_HISTORIC_ASIZE	(8ULL << 10)
@@ -813,6 +816,7 @@ typedef struct pr19262_arc_provenance {
 	uint64_t	pap_spa;
 	dva_t		pap_dva;
 	uint64_t	pap_birth;
+	uint64_t	pap_seq;
 	uint64_t	pap_txg;
 	uint64_t	pap_flags;
 	uint64_t	pap_orig_flags;
@@ -829,6 +833,7 @@ typedef struct pr19262_arc_provenance {
 static pr19262_arc_provenance_t
     pr19262_arc_provenance[PR19262_ARC_PROVENANCE_LEN];
 static uint_t pr19262_arc_provenance_next;
+static uint64_t pr19262_arc_provenance_seq;
 static uint_t pr19262_arc_provenance_l5_reports;
 static kmutex_t pr19262_arc_provenance_lock;
 
@@ -911,6 +916,7 @@ pr19262_arc_provenance_record(arc_buf_hdr_t *hdr, const blkptr_t *bp,
 	pap->pap_spa = hdr->b_spa;
 	pap->pap_dva = hdr->b_dva;
 	pap->pap_birth = hdr->b_birth;
+	pap->pap_seq = ++pr19262_arc_provenance_seq;
 	pap->pap_txg = txg;
 	pap->pap_flags = flags;
 	pap->pap_orig_flags = orig_flags;
@@ -938,10 +944,11 @@ pr19262_arc_provenance_lookup(const arc_buf_hdr_t *hdr,
 
 		if (pap->pap_birth == hdr->b_birth &&
 		    pap->pap_spa == hdr->b_spa &&
-		    DVA_EQUAL(&pap->pap_dva, &hdr->b_dva)) {
+		    DVA_EQUAL(&pap->pap_dva, &hdr->b_dva) &&
+		    pap->pap_hdr == hdr &&
+		    (!found || pap->pap_seq > result->pap_seq)) {
 			*result = *pap;
 			found = B_TRUE;
-			break;
 		}
 	}
 	mutex_exit(&pr19262_arc_provenance_lock);
@@ -7282,6 +7289,8 @@ arc_write_done(zio_t *zio)
 				pr19262_arc_provenance_t pap;
 				boolean_t provenance =
 				    pr19262_arc_provenance_lookup(exists, &pap);
+				uint64_t provenance_seq =
+				    provenance ? pap.pap_seq : 0;
 
 				pr19262_printf(
 				    "PR19262_ARC_UNEXPECTED_HDR "
@@ -7303,8 +7312,7 @@ arc_write_done(zio_t *zio)
 				    (u_longlong_t)HDR_GET_PSIZE(exists));
 				pr19262_printf(
 				    "PR19262_ARC_UNEXPECTED_PROVENANCE "
-				    "found=%u origin=%u "
-				    "hdr_equal=%u txg=%llu "
+				    "found=%u origin=%u seq=%llu txg=%llu "
 				    "flags=%llx original_flags=%llx "
 				    "post=%u stage=%llx "
 				    "original_stage=%llx "
@@ -7313,7 +7321,7 @@ arc_write_done(zio_t *zio)
 				    "level=%lld blkid=%llu\n",
 				    provenance,
 				    provenance ? pap.pap_origin : 0,
-				    provenance && pap.pap_hdr == exists,
+				    (u_longlong_t)provenance_seq,
 				    (u_longlong_t)(provenance ? pap.pap_txg :
 				    0),
 				    (u_longlong_t)(provenance ? pap.pap_flags :
@@ -8427,6 +8435,7 @@ arc_init(void)
 	buf_init();
 	memset(pr19262_arc_provenance, 0, sizeof (pr19262_arc_provenance));
 	pr19262_arc_provenance_next = 0;
+	pr19262_arc_provenance_seq = 0;
 	pr19262_arc_provenance_l5_reports = 0;
 	mutex_init(&pr19262_arc_provenance_lock, NULL, MUTEX_DEFAULT, NULL);
 
