@@ -796,11 +796,12 @@ static buf_hash_table_t buf_hash_table;
  * The unsupported arc_write_done() collision seen by PR #19262 was an
  * indirect DMU_OT_DNODE block.  A header carries no indication of which
  * operation first inserted it into the hash table, so retain a bounded
- * provenance record for just that sparse class.  Both record and lookup are
- * called with the header hash lock held; this private lock is therefore never
- * acquired before a hash lock.
+ * provenance record for just that sparse class.  Ring record and lookup are
+ * called with the header hash lock held.  The natural-write profile below
+ * releases this private lock before taking that hash lock.
  */
 #define	PR19262_ARC_PROVENANCE_LEN	64
+#define	PR19262_ARC_HISTORIC_ASIZE	(8ULL << 10)
 
 typedef enum pr19262_arc_origin {
 	PR19262_ARC_ORIGIN_NONE,
@@ -828,12 +829,68 @@ typedef struct pr19262_arc_provenance {
 static pr19262_arc_provenance_t
     pr19262_arc_provenance[PR19262_ARC_PROVENANCE_LEN];
 static uint_t pr19262_arc_provenance_next;
+static uint_t pr19262_arc_provenance_l5_reports;
 static kmutex_t pr19262_arc_provenance_lock;
 
 static boolean_t
 pr19262_arc_provenance_track(const blkptr_t *bp)
 {
 	return (BP_GET_TYPE(bp) == DMU_OT_DNODE && BP_GET_LEVEL(bp) > 0);
+}
+
+/*
+ * The one historical unsupported collision was an asynchronous L5 DNODE
+ * allocation on the native special vdev.  Its eight-KiB DVA can be either
+ * an ordinary allocation or a four-KiB gang header plus a four-KiB member.
+ * Profile the first few natural L5 writes so a rerun can distinguish those
+ * cases without manufacturing an ARC collision.
+ */
+static boolean_t
+pr19262_arc_provenance_historic_shape(const zio_t *zio)
+{
+	const blkptr_t *bp = zio->io_bp;
+
+	return (BP_GET_TYPE(bp) == DMU_OT_DNODE && BP_GET_LEVEL(bp) == 5 &&
+	    DVA_GET_ASIZE(BP_IDENTITY(bp)) == PR19262_ARC_HISTORIC_ASIZE &&
+	    (zio->io_flags & ZIO_FLAG_ALLOC_THROTTLED) != 0);
+}
+
+static void
+pr19262_arc_provenance_l5_record(const zio_t *zio)
+{
+	const blkptr_t *bp = zio->io_bp;
+	boolean_t report = B_FALSE;
+
+	if (BP_GET_TYPE(bp) != DMU_OT_DNODE || BP_GET_LEVEL(bp) != 5)
+		return;
+
+	mutex_enter(&pr19262_arc_provenance_lock);
+	if (pr19262_arc_provenance_l5_reports < PR19262_ARC_PROVENANCE_LEN) {
+		pr19262_arc_provenance_l5_reports++;
+		report = B_TRUE;
+	}
+	mutex_exit(&pr19262_arc_provenance_lock);
+	if (!report)
+		return;
+
+	pr19262_printf("PR19262_ARC_DNODE_L5 txg=%llu historic_shape=%u "
+	    "gang=%u "
+	    "dva_gang=%u vdev=%llu asize=%llu lsize=%llu psize=%llu "
+	    "flags=%llx priority=%u child=%u objset=%llu object=%llu "
+	    "level=%lld blkid=%llu\n",
+	    (u_longlong_t)zio->io_txg,
+	    (uint_t)pr19262_arc_provenance_historic_shape(zio),
+	    (uint_t)BP_IS_GANG(bp),
+	    (uint_t)DVA_GET_GANG(BP_IDENTITY(bp)),
+	    (u_longlong_t)DVA_GET_VDEV(BP_IDENTITY(bp)),
+	    (u_longlong_t)DVA_GET_ASIZE(BP_IDENTITY(bp)),
+	    (u_longlong_t)BP_GET_LSIZE(bp), (u_longlong_t)BP_GET_PSIZE(bp),
+	    (u_longlong_t)zio->io_flags, (uint_t)zio->io_priority,
+	    (uint_t)zio->io_child_type,
+	    (u_longlong_t)zio->io_bookmark.zb_objset,
+	    (u_longlong_t)zio->io_bookmark.zb_object,
+	    (longlong_t)zio->io_bookmark.zb_level,
+	    (u_longlong_t)zio->io_bookmark.zb_blkid);
 }
 
 static void
@@ -7156,6 +7213,7 @@ arc_write_done(zio_t *zio)
 		ASSERT0(zio->io_error);
 
 		arc_cksum_verify(buf);
+		pr19262_arc_provenance_l5_record(zio);
 
 		exists = buf_hash_insert(hdr, &hash_lock);
 		if (exists != NULL) {
@@ -8369,6 +8427,7 @@ arc_init(void)
 	buf_init();
 	memset(pr19262_arc_provenance, 0, sizeof (pr19262_arc_provenance));
 	pr19262_arc_provenance_next = 0;
+	pr19262_arc_provenance_l5_reports = 0;
 	mutex_init(&pr19262_arc_provenance_lock, NULL, MUTEX_DEFAULT, NULL);
 
 	list_create(&arc_prune_list, sizeof (arc_prune_t),
