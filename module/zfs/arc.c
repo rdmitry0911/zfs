@@ -794,7 +794,7 @@ static buf_hash_table_t buf_hash_table;
 
 /*
  * The unsupported arc_write_done() collision seen by PR #19262 was an
- * indirect DMU_OT_OBJSET block.  A header carries no indication of which
+ * indirect DMU_OT_DNODE block.  A header carries no indication of which
  * operation first inserted it into the hash table, so retain a bounded
  * provenance record for just that sparse class.  Both record and lookup are
  * called with the header hash lock held; this private lock is therefore never
