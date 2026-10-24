@@ -798,10 +798,12 @@ static buf_hash_table_t buf_hash_table;
  * operation first inserted it into the hash table, so retain a bounded
  * provenance record for just that sparse class.  Ring record and lookup are
  * called with the header hash lock held.  Lookup accepts only the most recent
- * record whose saved header address equals the current header; the address is
- * never dereferenced and is not an allocation-generation token.  The
- * natural-write profile below releases this private lock before taking that
- * hash lock.
+ * record whose saved header address equals the current header.  Destruction
+ * clears the side record before the cache address can be reused, while an
+ * identity-preserving reallocation transfers it to the replacement header.
+ * The address is never dereferenced and is not an allocation-generation
+ * token.  The natural-write profile below releases this private lock before
+ * taking that hash lock.
  */
 #define	PR19262_ARC_PROVENANCE_LEN	64
 #define	PR19262_ARC_HISTORIC_ASIZE	(8ULL << 10)
@@ -954,6 +956,44 @@ pr19262_arc_provenance_lookup(const arc_buf_hdr_t *hdr,
 	mutex_exit(&pr19262_arc_provenance_lock);
 
 	return (found);
+}
+
+/*
+ * The diagnostic deliberately keeps the header address only as a side-table
+ * association.  Clear it before kmem can recycle the address; otherwise a
+ * later, unrelated header at that address could look like the old producer.
+ * arc_hdr_realloc() transfers the association first because it preserves one
+ * live identity while changing only the header allocation.
+ */
+static void
+pr19262_arc_provenance_forget(const arc_buf_hdr_t *hdr)
+{
+	mutex_enter(&pr19262_arc_provenance_lock);
+	for (uint_t i = 0; i < PR19262_ARC_PROVENANCE_LEN; i++) {
+		pr19262_arc_provenance_t *pap =
+		    &pr19262_arc_provenance[i];
+
+		if (pap->pap_hdr == hdr)
+			bzero(pap, sizeof (*pap));
+	}
+	mutex_exit(&pr19262_arc_provenance_lock);
+}
+
+static void
+pr19262_arc_provenance_reassociate(const arc_buf_hdr_t *old_hdr,
+    const arc_buf_hdr_t *new_hdr)
+{
+	ASSERT3P(old_hdr, !=, new_hdr);
+
+	mutex_enter(&pr19262_arc_provenance_lock);
+	for (uint_t i = 0; i < PR19262_ARC_PROVENANCE_LEN; i++) {
+		pr19262_arc_provenance_t *pap =
+		    &pr19262_arc_provenance[i];
+
+		if (pap->pap_hdr == old_hdr)
+			pap->pap_hdr = new_hdr;
+	}
+	mutex_exit(&pr19262_arc_provenance_lock);
 }
 
 uint64_t zfs_crc64_table[256];
@@ -3528,6 +3568,7 @@ arc_hdr_realloc(arc_buf_hdr_t *hdr, kmem_cache_t *old, kmem_cache_t *new)
 	nhdr = kmem_cache_alloc(new, KM_PUSHPAGE);
 
 	ASSERT(MUTEX_HELD(HDR_LOCK(hdr)));
+	pr19262_arc_provenance_reassociate(hdr, nhdr);
 	buf_hash_remove(hdr);
 
 	memcpy(nhdr, hdr, HDR_L2ONLY_SIZE);
@@ -3838,6 +3879,7 @@ arc_hdr_destroy(arc_buf_hdr_t *hdr)
 	}
 	VERIFY(!HDR_IO_IN_PROGRESS(hdr));
 	VERIFY(!HDR_IN_HASH_TABLE(hdr));
+	pr19262_arc_provenance_forget(hdr);
 	boolean_t l1hdr_destroyed = B_FALSE;
 
 	/*
