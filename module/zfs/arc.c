@@ -974,7 +974,7 @@ pr19262_arc_provenance_forget(const arc_buf_hdr_t *hdr)
 		    &pr19262_arc_provenance[i];
 
 		if (pap->pap_hdr == hdr)
-			bzero(pap, sizeof (*pap));
+			memset(pap, 0, sizeof (*pap));
 	}
 	mutex_exit(&pr19262_arc_provenance_lock);
 }
