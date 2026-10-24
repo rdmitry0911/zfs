@@ -12189,10 +12189,10 @@ pr19262_runtime_test(spa_t *spa)
 	BP_SET_PSIZE(&failed, 4096);
 	zio_alloc_list_t trace;
 	metaslab_trace_init(&trace);
-	pr19262_tx_fail_second(B_TRUE);
+	pr19262_tx_fail_second(spa, B_TRUE);
 	VERIFY3S(metaslab_alloc(spa, spa_normal_class(spa), 4096, &failed,
 	    2, fault_txg, NULL, 0, &trace, 0, FTAG), ==, ENOSPC);
-	pr19262_tx_fail_second(B_FALSE);
+	pr19262_tx_fail_second(spa, B_FALSE);
 	VERIFY0(BP_GET_NDVAS(&failed));
 	VERIFY0(BP_GET_PHYSICAL_BIRTH(&failed));
 	VERIFY0(metaslab_alloc(spa, spa_normal_class(spa), 4096, &failed,
@@ -15015,7 +15015,7 @@ pr19262_full_test(spa_t *spa)
 			}
 			/* Synced credits return; retry until settled. */
 			txg_wait_synced(dp, 0);
-			if (pr19262_tx_reserved() == 0 && ++settled >= 3)
+			if (pr19262_tx_reserved(spa) == 0 && ++settled >= 3)
 				break;
 			continue;
 		}
@@ -16452,6 +16452,13 @@ pr19262_export_fence_test(spa_t *spa)
 	(void) printf("PR19262_EXPORT_FENCE_PASS\n");
 }
 
+static void
+pr19262_tx_probe_thread(void *arg)
+{
+	pr19262_tx_probe(arg);
+	thread_exit();
+}
+
 static int
 pr19262_tx_driver(const char *directory)
 {
@@ -16548,7 +16555,25 @@ pr19262_tx_driver(const char *directory)
 		/* Persistent images need the private importer. */
 		_exit(0);
 	}
-	pr19262_tx_probe(spa);
+	const char *peer_directory = getenv("PR19262_TX_PEER");
+	if (peer_directory != NULL) {
+		nvlist_t *peer_root = pr19262_fixture_root(peer_directory);
+		VERIFY0(spa_create("pr19262_peer", peer_root, props,
+		    NULL, NULL, NULL));
+		fnvlist_free(peer_root);
+		spa_t *peer;
+		VERIFY0(spa_open("pr19262_peer", &peer, FTAG));
+		kthread_t *worker = _thread_create(NULL, 0,
+		    pr19262_tx_probe_thread, peer, 0, NULL,
+		    TS_RUN | TS_JOINABLE, defclsyspri);
+		pr19262_tx_probe(spa);
+		VERIFY0(thread_join(worker));
+		pr19262_tx_isolation(spa, peer);
+		spa_close(peer, FTAG);
+		VERIFY0(spa_export("pr19262_peer", NULL, B_FALSE, B_FALSE));
+	} else {
+		pr19262_tx_probe(spa);
+	}
 	spa_close(spa, FTAG);
 	VERIFY0(spa_export("pr19262_tx", NULL, B_FALSE, B_FALSE));
 	fnvlist_free(props);

@@ -58,6 +58,7 @@
 #include <sys/qat.h>
 #include <sys/zstd/zstd.h>
 #include <sys/vdev_reloc_engine.h>
+#include <sys/vdev_reloc_probe.h>
 
 /*
  * SPA locking
@@ -820,6 +821,7 @@ spa_add(const char *name, nvlist_t *config, const char *altroot)
 	ASSERT(spa_namespace_held());
 
 	spa = kmem_zalloc(sizeof (spa_t), KM_SLEEP);
+	pr19262_tx_init(spa);
 
 	mutex_init(&spa->spa_async_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&spa->spa_errlist_lock, NULL, MUTEX_DEFAULT, NULL);
@@ -963,6 +965,7 @@ spa_remove(spa_t *spa)
 	ASSERT3U(zfs_refcount_count(&spa->spa_refcount), ==, 0);
 	ASSERT0(spa->spa_waiters);
 	ASSERT0(spa->spa_stats_holds);
+	pr19262_tx_fini(spa);
 
 	nvlist_free(spa->spa_config_splitting);
 

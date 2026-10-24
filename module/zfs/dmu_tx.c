@@ -1696,12 +1696,6 @@ dmu_tx_hold_sa(dmu_tx_t *tx, sa_handle_t *hdl, boolean_t may_grow)
 void
 dmu_tx_init(void)
 {
-	mutex_init(&probe_tx.lock, NULL, MUTEX_DEFAULT, NULL);
-	cv_init(&probe_tx.done, NULL, CV_DEFAULT, NULL);
-	list_create(&probe_tx.budgets, sizeof (probe_tx_budget_t),
-	    offsetof(probe_tx_budget_t, link));
-	list_create(&probe_tx.allocations, sizeof (probe_tx_allocation_t),
-	    offsetof(probe_tx_allocation_t, link));
 	dmu_tx_ksp = kstat_create("zfs", 0, "dmu_tx", "misc",
 	    KSTAT_TYPE_NAMED, sizeof (dmu_tx_stats) / sizeof (kstat_named_t),
 	    KSTAT_FLAG_VIRTUAL);
@@ -1715,15 +1709,6 @@ dmu_tx_init(void)
 void
 dmu_tx_fini(void)
 {
-	VERIFY0(probe_tx.reserved);
-	VERIFY0(probe_tx.inflight);
-	VERIFY(list_is_empty(&probe_tx.budgets));
-	VERIFY(list_is_empty(&probe_tx.allocations));
-	list_destroy(&probe_tx.budgets);
-	list_destroy(&probe_tx.allocations);
-	VERIFY3P(probe_tx.os, ==, NULL);
-	cv_destroy(&probe_tx.done);
-	mutex_destroy(&probe_tx.lock);
 	if (dmu_tx_ksp != NULL) {
 		kstat_delete(dmu_tx_ksp);
 		dmu_tx_ksp = NULL;

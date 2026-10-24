@@ -723,7 +723,7 @@ engine_convert_extent(engine_convert_t *c, const blkptr_t *bp,
 		    c->birth);
 		uint64_t pages = pr19262_engine_admit_row_pages(spa);
 		if (pr19262_engine_admit(spa, PR19262_ADMIT_CONVERTER,
-		    pr19262_tx_reserved(), asize, pages, 1) != 0) {
+		    pr19262_tx_reserved(spa), asize, pages, 1) != 0) {
 			st->starved++;
 			c->starved = B_TRUE;
 			break;
