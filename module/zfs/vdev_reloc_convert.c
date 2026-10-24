@@ -272,8 +272,18 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 	if (error != 0)
 		return (error);
 	engine_release_t r = { .catalog = catalog };
-	error = dsl_sync_task(spa_name(spa), NULL, engine_release_sync, &r,
-	    0, ZFS_SPACE_CHECK_NONE);
+	/* The export thread waits for us: do not reopen the SPA by name. */
+	dsl_pool_t *dp = spa_get_dsl(spa);
+	dmu_tx_t *tx = dmu_tx_create_dd(dp->dp_mos_dir);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_SUSPEND);
+	if (error != 0) {
+		dmu_tx_abort(tx);
+		return (error);
+	}
+	uint64_t txg = dmu_tx_get_txg(tx);
+	dsl_sync_task_nowait(dp, engine_release_sync, &r, tx);
+	dmu_tx_commit(tx);
+	txg_wait_synced(dp, txg);
 	*released = r.owners;
 	pr19262_printf("PR19262_FENCE floor=%llu catalog=%llu reclaimed=%llu "
 	    "released_owners=%llu released_bytes=%llu pages_freed=%llu "
@@ -292,9 +302,31 @@ engine_fence_task(void *arg)
 {
 	spa_t *spa = arg;
 	uint64_t floor, reclaimed, released;
+#ifndef _KERNEL
+	mutex_enter(&engine.lock);
+	pr19262_export_fence_test_t *test = engine.export_fence_test;
+	mutex_exit(&engine.lock);
+	if (test != NULL) {
+		mutex_enter(&test->lock);
+		test->paused = B_TRUE;
+		cv_broadcast(&test->changed);
+		while (!test->release)
+			cv_wait(&test->changed, &test->lock);
+		mutex_exit(&test->lock);
+	}
+#endif
 	int error = pr19262_engine_fence(spa, &floor, &reclaimed, &released,
 	    NULL);
 	mutex_enter(&engine.lock);
+#ifndef _KERNEL
+	if (test != NULL) {
+		mutex_enter(&test->lock);
+		test->task_done = B_TRUE;
+		test->fence_error = error;
+		cv_broadcast(&test->changed);
+		mutex_exit(&test->lock);
+	}
+#endif
 	engine.fence_error = error;
 	engine.fence_auto += error == 0;
 	engine.fence_stalled = error == 0 && reclaimed == 0 && released == 0;
@@ -313,6 +345,19 @@ pr19262_engine_fence_schedule(spa_t *spa)
 	    TQ_SLEEP), !=, TASKQID_INVALID);
 }
 
+#ifndef _KERNEL
+void
+pr19262_engine_export_fence_arm(spa_t *spa,
+    pr19262_export_fence_test_t *test)
+{
+	mutex_enter(&engine.lock);
+	VERIFY3P(engine.spa, ==, spa);
+	VERIFY(!engine.fence_pending);
+	engine.export_fence_test = test;
+	mutex_exit(&engine.lock);
+}
+#endif
+
 /* Before the sync thread stops: no new fence, and none in flight. */
 void
 pr19262_engine_quiesce(spa_t *spa)
@@ -320,6 +365,15 @@ pr19262_engine_quiesce(spa_t *spa)
 	mutex_enter(&engine.lock);
 	if (engine.spa == spa) {
 		engine.fence_quiesced = B_TRUE;
+#ifndef _KERNEL
+		pr19262_export_fence_test_t *test = engine.export_fence_test;
+		if (engine.fence_pending && test != NULL) {
+			mutex_enter(&test->lock);
+			test->quiescing = B_TRUE;
+			cv_broadcast(&test->changed);
+			mutex_exit(&test->lock);
+		}
+#endif
 		while (engine.fence_pending)
 			cv_wait(&engine.fence_cv, &engine.lock);
 	}

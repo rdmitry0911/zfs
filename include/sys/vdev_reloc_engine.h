@@ -249,6 +249,22 @@ void pr19262_engine_fence_schedule(spa_t *);
 void pr19262_engine_describe(spa_t *, const blkptr_t *, const char *,
     uint64_t, uint64_t);
 void pr19262_engine_quiesce(spa_t *);
+#ifndef _KERNEL
+/* Deterministic scheduled-fence/export witness, owned by ztest. */
+typedef struct pr19262_export_fence_test {
+	kmutex_t lock;
+	kcondvar_t changed;
+	boolean_t paused;
+	boolean_t release;
+	boolean_t quiescing;
+	boolean_t task_done;
+	boolean_t exported;
+	int fence_error;
+	int export_error;
+} pr19262_export_fence_test_t;
+void pr19262_engine_export_fence_arm(spa_t *,
+    pr19262_export_fence_test_t *);
+#endif
 void pr19262_engine_hold_report(void *);
 int pr19262_engine_epoch(spa_t *, uint64_t, uint64_t *);
 uint64_t pr19262_engine_floor(spa_t *);

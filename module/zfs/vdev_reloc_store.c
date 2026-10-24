@@ -1052,6 +1052,9 @@ engine_store_clear(void)
 	engine.admit_first = NULL;
 	VERIFY(!engine.fence_pending);
 	engine.fence_quiesced = engine.fence_stalled = B_FALSE;
+#ifndef _KERNEL
+	engine.export_fence_test = NULL;
+#endif
 	engine.fence_error = 0;
 	engine.fence_requests = engine.fence_auto = 0;
 	engine.admit_fence_waits = 0;

@@ -2316,6 +2316,9 @@ spa_unload(spa_t *spa)
 	    spa->spa_export_thread == curthread);
 	ASSERT(spa_state(spa) != POOL_STATE_UNINITIALIZED);
 
+	/* A scheduled fence may still dirty TXGs; drain it before final_txg. */
+	pr19262_engine_quiesce(spa);
+
 	spa_import_progress_remove(spa_guid(spa));
 	spa_load_note(spa, "UNLOADING");
 
@@ -2361,9 +2364,6 @@ spa_unload(spa_t *spa)
 		    TXG_DEFER_SIZE + 1;
 		spa_config_exit(spa, SCL_ALL, FTAG);
 	}
-
-	/* A fence of the engine still in flight needs the sync thread. */
-	pr19262_engine_quiesce(spa);
 
 	/*
 	 * Stop syncing.
@@ -8182,6 +8182,9 @@ spa_export_common(const char *pool, int new_state, nvlist_t **oldconfig,
 			spa_namespace_enter(FTAG);
 			goto fail;
 		}
+
+		/* No new fence after this point, and none past final_txg. */
+		pr19262_engine_quiesce(spa);
 
 		/*
 		 * We're about to export or destroy this pool. Make sure

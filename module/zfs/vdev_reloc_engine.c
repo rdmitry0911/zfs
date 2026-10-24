@@ -299,6 +299,9 @@ static struct {
 	kcondvar_t fence_cv;
 	boolean_t fence_pending;
 	boolean_t fence_quiesced;
+#ifndef _KERNEL
+	pr19262_export_fence_test_t *export_fence_test;
+#endif
 	/* The last scheduled fence reclaimed and released nothing. */
 	boolean_t fence_stalled;
 	int fence_error;

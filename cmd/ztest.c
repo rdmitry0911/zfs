@@ -16373,6 +16373,76 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 	return (0);
 }
 
+
+static void
+pr19262_export_fence_thread(void *arg)
+{
+	pr19262_export_fence_test_t *test = arg;
+	int error = spa_export("pr19262_tx", NULL, B_FALSE, B_FALSE);
+	mutex_enter(&test->lock);
+	test->export_error = error;
+	test->exported = B_TRUE;
+	cv_broadcast(&test->changed);
+	mutex_exit(&test->lock);
+	thread_exit();
+}
+
+static boolean_t
+pr19262_export_fence_wait(pr19262_export_fence_test_t *test,
+    boolean_t *flag, const char *phase)
+{
+	hrtime_t deadline = gethrtime() + SEC2NSEC(30);
+	mutex_enter(&test->lock);
+	while (!*flag && gethrtime() < deadline)
+		(void) cv_timedwait_hires(&test->changed, &test->lock,
+		    deadline, USEC2NSEC(1), CALLOUT_FLAG_ABSOLUTE);
+	boolean_t done = *flag;
+	mutex_exit(&test->lock);
+	(void) printf("PR19262_EXPORT_FENCE phase=%s reached=%u\n",
+	    phase, done);
+	return (done);
+}
+
+static void
+pr19262_export_fence_test(spa_t *spa)
+{
+	pr19262_export_fence_test_t test = { 0 };
+	mutex_init(&test.lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&test.changed, NULL, CV_DEFAULT, NULL);
+	pr19262_engine_census_t census;
+	pr19262_engine_census(spa, 1, &census);
+	VERIFY3U(census.retired_bytes, >, 0);
+	pr19262_engine_export_fence_arm(spa, &test);
+	pr19262_engine_retired_limit(1);
+	VERIFY3S(pr19262_engine_admit(spa, PR19262_ADMIT_CLIENT,
+	    0, 0, 0, 0), ==, ERESTART);
+	VERIFY(pr19262_export_fence_wait(&test, &test.paused, "paused"));
+	spa_close(spa, FTAG);
+	kthread_t *thread = _thread_create(NULL, 0,
+	    pr19262_export_fence_thread, &test, 0, NULL,
+	    TS_RUN | TS_JOINABLE, defclsyspri);
+	VERIFY(pr19262_export_fence_wait(&test, &test.quiescing,
+	    "quiescing"));
+	mutex_enter(&test.lock);
+	VERIFY(!test.exported);
+	VERIFY(!test.task_done);
+	test.release = B_TRUE;
+	cv_broadcast(&test.changed);
+	mutex_exit(&test.lock);
+	if (!pr19262_export_fence_wait(&test, &test.exported, "exported")) {
+		(void) printf("PR19262_EXPORT_FENCE_BLOCKED\n");
+		(void) fflush(NULL);
+		_exit(92);
+	}
+	VERIFY0(thread_join(thread));
+	VERIFY(test.task_done);
+	VERIFY0(test.fence_error);
+	VERIFY0(test.export_error);
+	cv_destroy(&test.changed);
+	mutex_destroy(&test.lock);
+	(void) printf("PR19262_EXPORT_FENCE_PASS\n");
+}
+
 static int
 pr19262_tx_driver(const char *directory)
 {
@@ -16425,6 +16495,13 @@ pr19262_tx_driver(const char *directory)
 		if (getenv("PR19262_ENGINE_CLASSES") == NULL &&
 		    getenv("PR19262_ENGINE_SKIP_RUNTIME") == NULL)
 			pr19262_runtime_test(spa);
+		if (getenv("PR19262_ENGINE_EXPORT_FENCE") != NULL) {
+			pr19262_export_fence_test(spa);
+			fnvlist_free(props);
+			fnvlist_free(root);
+			kernel_fini();
+			return (0);
+		}
 		if (getenv("PR19262_ENGINE_CONVERT") != NULL)
 			pr19262_convert_test(spa);
 		if (getenv("PR19262_ENGINE_CHECKPOINT") != NULL) {
