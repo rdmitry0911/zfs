@@ -833,7 +833,7 @@ static kmutex_t pr19262_arc_provenance_lock;
 static boolean_t
 pr19262_arc_provenance_track(const blkptr_t *bp)
 {
-	return (BP_GET_TYPE(bp) == DMU_OT_OBJSET && BP_GET_LEVEL(bp) > 0);
+	return (BP_GET_TYPE(bp) == DMU_OT_DNODE && BP_GET_LEVEL(bp) > 0);
 }
 
 static void
