@@ -171,6 +171,10 @@ typedef struct pr19262_engine_info {
 void pr19262_engine_inspect(spa_t *, const blkptr_t *, int,
     pr19262_engine_info_t *);
 boolean_t pr19262_engine_free_range(spa_t *, uint64_t, uint64_t);
+#ifndef _KERNEL
+/* ztest only: prefer a verified free P extent for one real DMU allocation. */
+int pr19262_engine_test_prefer_p(spa_t *, uint64_t, uint64_t);
+#endif
 void pr19262_engine_check(spa_t *, const char *);
 zio_t *pr19262_engine_read_bound(zio_t *, spa_t *, const blkptr_t *,
     abd_t *, uint64_t, zio_done_func_t *, void *, zio_priority_t,

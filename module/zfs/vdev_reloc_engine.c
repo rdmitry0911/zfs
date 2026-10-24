@@ -301,6 +301,10 @@ static struct {
 	boolean_t fence_quiesced;
 #ifndef _KERNEL
 	pr19262_export_fence_test_t *export_fence_test;
+	/* One ztest allocation may prefer this already-free physical range. */
+	uint64_t test_prefer_p;
+	uint64_t test_prefer_end;
+	boolean_t test_prefer_active;
 #endif
 	/* The last scheduled fence reclaimed and released nothing. */
 	boolean_t fence_stalled;
@@ -896,6 +900,26 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
 		.align = 1ULL << vd->vdev_ashift,
 		.found = UINT64_MAX
 	};
+#ifndef _KERNEL
+	/*
+	 * Gate C needs a real ordinary DMU owner in a returned P extent.  The
+	 * hook is armed only after ztest has proved the whole range free.  It
+	 * merely selects that valid P range; native V selection, accounting and
+	 * the owner commit below remain the regular allocator path.
+	 */
+	if (engine.test_prefer_active) {
+		if (engine.test_prefer_p < p.low ||
+		    engine.test_prefer_p + size > p.high ||
+		    engine.test_prefer_p + size > engine.test_prefer_end ||
+		    !zfs_range_tree_contains(engine.free, engine.test_prefer_p,
+		    size)) {
+			result = PR19262_ALLOC_P_BLOCKED;
+			goto out;
+		}
+		p.found = engine.test_prefer_p;
+		p.size = size;
+	} else
+#endif
 	zfs_range_tree_walk(engine.free, engine_alloc_p, &p);
 	if (p.found == UINT64_MAX) {
 		result = PR19262_ALLOC_P_BLOCKED;
@@ -945,6 +969,9 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
 	engine_owner_dirty(e);
 	engine.pairs++;
 	engine.revision++;
+#ifndef _KERNEL
+	engine.test_prefer_active = B_FALSE;
+#endif
 	*offset = v.found;
 	*actual_size = v.size;
 	e = NULL;
@@ -1702,6 +1729,37 @@ pr19262_engine_free_range(spa_t *spa, uint64_t p, uint64_t size)
 	mutex_exit(&engine.lock);
 	return (free);
 }
+
+#ifndef _KERNEL
+/*
+ * ztest-only placement steering.  Do not reserve or synthesize a P owner:
+ * the normal allocation transaction must still find native V space and
+ * atomically pair it with this already-free physical extent.
+ */
+int
+pr19262_engine_test_prefer_p(spa_t *spa, uint64_t p, uint64_t size)
+{
+	int error = 0;
+	mutex_enter(&engine.lock);
+	if (engine.spa != spa || engine.vd == NULL || size == 0 ||
+	    p + size < p || P2PHASE(p, 1ULL << engine.vd->vdev_ashift) != 0 ||
+	    p + size > engine.total || !zfs_range_tree_contains(engine.free, p,
+	    size)) {
+		error = EINVAL;
+	} else if (P2ALIGN_TYPED(p, 1ULL << engine.vd->vdev_ms_shift,
+	    uint64_t) != P2ALIGN_TYPED(p + size - 1,
+	    1ULL << engine.vd->vdev_ms_shift, uint64_t)) {
+		error = ERANGE;
+	} else {
+		VERIFY(!engine.test_prefer_active);
+		engine.test_prefer_p = p;
+		engine.test_prefer_end = p + size;
+		engine.test_prefer_active = B_TRUE;
+	}
+	mutex_exit(&engine.lock);
+	return (error);
+}
+#endif
 
 /* Diagnostic: the owner state behind a block pointer, at a named site. */
 void

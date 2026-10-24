@@ -12886,6 +12886,9 @@ pr19262_journal_intent_owner(spa_t *spa)
 			if (!grow_only)
 				VERIFY(pr19262_engine_free_range(spa, target,
 				    6ULL << 20));
+			if (!grow_only)
+				VERIFY0(pr19262_engine_test_prefer_p(spa,
+				    target, 6ULL << 20));
 			tx = dmu_tx_create(os);
 			dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
 			VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
@@ -12921,6 +12924,12 @@ pr19262_journal_intent_owner(spa_t *spa)
 					if (grow_only ||
 					    info.p >= target + (6ULL << 20) ||
 					    target >= info.p + info.psize)
+						continue;
+					/*
+					 * Exact owner is steered.
+					 * Later owners can use the remainder.
+					 */
+					if (!grow_only && info.p != target)
 						continue;
 					found = B_TRUE;
 					(void) printf("PR19262_J_INTENT_OWNER "
