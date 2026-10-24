@@ -792,6 +792,106 @@ static buf_hash_table_t buf_hash_table;
 #define	HDR_LOCK(hdr) \
 	(BUF_HASH_LOCK(BUF_HASH_INDEX(hdr->b_spa, &hdr->b_dva, hdr->b_birth)))
 
+/*
+ * The unsupported arc_write_done() collision seen by PR #19262 was an
+ * indirect DMU_OT_OBJSET block.  A header carries no indication of which
+ * operation first inserted it into the hash table, so retain a bounded
+ * provenance record for just that sparse class.  Both record and lookup are
+ * called with the header hash lock held; this private lock is therefore never
+ * acquired before a hash lock.
+ */
+#define	PR19262_ARC_PROVENANCE_LEN	64
+
+typedef enum pr19262_arc_origin {
+	PR19262_ARC_ORIGIN_NONE,
+	PR19262_ARC_ORIGIN_READ,
+	PR19262_ARC_ORIGIN_WRITE,
+} pr19262_arc_origin_t;
+
+typedef struct pr19262_arc_provenance {
+	uint64_t	pap_spa;
+	dva_t		pap_dva;
+	uint64_t	pap_birth;
+	uint64_t	pap_txg;
+	uint64_t	pap_flags;
+	uint64_t	pap_orig_flags;
+	uint64_t	pap_stage;
+	uint64_t	pap_orig_stage;
+	zbookmark_phys_t pap_zb;
+	const arc_buf_hdr_t *pap_hdr;
+	uint32_t	pap_post;
+	uint8_t		pap_origin;
+	uint8_t		pap_priority;
+	uint8_t		pap_child_type;
+} pr19262_arc_provenance_t;
+
+static pr19262_arc_provenance_t
+    pr19262_arc_provenance[PR19262_ARC_PROVENANCE_LEN];
+static uint_t pr19262_arc_provenance_next;
+static kmutex_t pr19262_arc_provenance_lock;
+
+static boolean_t
+pr19262_arc_provenance_track(const blkptr_t *bp)
+{
+	return (BP_GET_TYPE(bp) == DMU_OT_OBJSET && BP_GET_LEVEL(bp) > 0);
+}
+
+static void
+pr19262_arc_provenance_record(arc_buf_hdr_t *hdr, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, uint64_t txg, uint64_t flags,
+    uint64_t orig_flags, uint32_t post, uint64_t stage, uint64_t orig_stage,
+    zio_priority_t priority, enum zio_child child_type,
+    pr19262_arc_origin_t origin)
+{
+	pr19262_arc_provenance_t *pap;
+
+	if (!pr19262_arc_provenance_track(bp))
+		return;
+
+	mutex_enter(&pr19262_arc_provenance_lock);
+	pap = &pr19262_arc_provenance[
+	    pr19262_arc_provenance_next++ % PR19262_ARC_PROVENANCE_LEN];
+	pap->pap_spa = hdr->b_spa;
+	pap->pap_dva = hdr->b_dva;
+	pap->pap_birth = hdr->b_birth;
+	pap->pap_txg = txg;
+	pap->pap_flags = flags;
+	pap->pap_orig_flags = orig_flags;
+	pap->pap_stage = stage;
+	pap->pap_orig_stage = orig_stage;
+	pap->pap_zb = *zb;
+	pap->pap_hdr = hdr;
+	pap->pap_post = post;
+	pap->pap_origin = origin;
+	pap->pap_priority = priority;
+	pap->pap_child_type = child_type;
+	mutex_exit(&pr19262_arc_provenance_lock);
+}
+
+static boolean_t
+pr19262_arc_provenance_lookup(const arc_buf_hdr_t *hdr,
+    pr19262_arc_provenance_t *result)
+{
+	boolean_t found = B_FALSE;
+
+	mutex_enter(&pr19262_arc_provenance_lock);
+	for (uint_t i = 0; i < PR19262_ARC_PROVENANCE_LEN; i++) {
+		const pr19262_arc_provenance_t *pap =
+		    &pr19262_arc_provenance[i];
+
+		if (pap->pap_birth == hdr->b_birth &&
+		    pap->pap_spa == hdr->b_spa &&
+		    DVA_EQUAL(&pap->pap_dva, &hdr->b_dva)) {
+			*result = *pap;
+			found = B_TRUE;
+			break;
+		}
+	}
+	mutex_exit(&pr19262_arc_provenance_lock);
+
+	return (found);
+}
+
 uint64_t zfs_crc64_table[256];
 
 /*
@@ -6170,6 +6270,14 @@ top:
 				arc_hdr_destroy(hdr);
 				goto top; /* restart the IO request */
 			}
+			if (!embedded_bp) {
+				pr19262_arc_provenance_record(hdr, bp, zb,
+				    pio != NULL ? pio->io_txg : 0,
+				    zio_flags, 0, 0, 0, 0, priority,
+				    pio != NULL ? pio->io_child_type :
+				    ZIO_CHILD_LOGICAL,
+				    PR19262_ARC_ORIGIN_READ);
+			}
 		} else {
 			/*
 			 * This block is in the ghost cache or encrypted data
@@ -7051,6 +7159,8 @@ arc_write_done(zio_t *zio)
 
 		exists = buf_hash_insert(hdr, &hash_lock);
 		if (exists != NULL) {
+			boolean_t exists_l1 = HDR_HAS_L1HDR(exists);
+
 			/*
 			 * This can only happen if we overwrite for
 			 * sync-to-convergence, because we remove
@@ -7067,9 +7177,9 @@ arc_write_done(zio_t *zio)
 			    (u_longlong_t)BP_GET_LOGICAL_BIRTH(
 			    &zio->io_bp_orig),
 			    zio->io_prop.zp_nopwrite, zio->io_prop.zp_rewrite,
-			    exists->b_l1hdr.b_state == arc_anon,
-			    (int)zfs_refcount_count(
-			    &exists->b_l1hdr.b_refcnt));
+			    exists_l1 && exists->b_l1hdr.b_state == arc_anon,
+			    exists_l1 ? (int)zfs_refcount_count(
+			    &exists->b_l1hdr.b_refcnt) : -1);
 			if ((zio->io_flags & (ZIO_FLAG_IO_REWRITE |
 			    ZIO_FLAG_NOPWRITE)) == 0 &&
 			    !BP_GET_DEDUP(zio->io_bp)) {
@@ -7111,15 +7221,62 @@ arc_write_done(zio_t *zio)
 				    &zio->io_bp_orig),
 				    BP_IS_HOLE(&zio->io_bp_orig),
 				    BP_EQUAL(&zio->io_bp_orig, zio->io_bp));
-				pr19262_printf("PR19262_ARC_UNEXPECTED_HDR "
-				    "birth=%llu anon=%u refs=%d lsize=%llu "
-				    "psize=%llu\n",
+				pr19262_arc_provenance_t pap;
+				boolean_t provenance =
+				    pr19262_arc_provenance_lookup(exists, &pap);
+
+				pr19262_printf(
+				    "PR19262_ARC_UNEXPECTED_HDR "
+				    "birth=%llu l1=%u l2=%u "
+				    "anon=%u io=%u acb=%u "
+				    "refs=%d flags=%x "
+				    "lsize=%llu psize=%llu\n",
 				    (u_longlong_t)exists->b_birth,
+				    exists_l1,
+				    HDR_HAS_L2HDR(exists),
+				    exists_l1 &&
 				    exists->b_l1hdr.b_state == arc_anon,
-				    (int)zfs_refcount_count(
-				    &exists->b_l1hdr.b_refcnt),
+				    exists_l1 && HDR_IO_IN_PROGRESS(exists),
+				    exists_l1 && exists->b_l1hdr.b_acb != NULL,
+				    exists_l1 ? (int)zfs_refcount_count(
+				    &exists->b_l1hdr.b_refcnt) : -1,
+				    (uint_t)exists->b_flags,
 				    (u_longlong_t)HDR_GET_LSIZE(exists),
 				    (u_longlong_t)HDR_GET_PSIZE(exists));
+				pr19262_printf(
+				    "PR19262_ARC_UNEXPECTED_PROVENANCE "
+				    "found=%u origin=%u "
+				    "hdr_equal=%u txg=%llu "
+				    "flags=%llx original_flags=%llx "
+				    "post=%u stage=%llx "
+				    "original_stage=%llx "
+				    "priority=%u child=%u "
+				    "objset=%llu object=%llu "
+				    "level=%lld blkid=%llu\n",
+				    provenance,
+				    provenance ? pap.pap_origin : 0,
+				    provenance && pap.pap_hdr == exists,
+				    (u_longlong_t)(provenance ? pap.pap_txg :
+				    0),
+				    (u_longlong_t)(provenance ? pap.pap_flags :
+				    0),
+				    (u_longlong_t)(provenance ?
+				    pap.pap_orig_flags : 0),
+				    provenance ? pap.pap_post : 0,
+				    (u_longlong_t)(provenance ? pap.pap_stage :
+				    0),
+				    (u_longlong_t)(provenance ?
+				    pap.pap_orig_stage : 0),
+				    provenance ? pap.pap_priority : 0,
+				    provenance ? pap.pap_child_type : 0,
+				    (u_longlong_t)(provenance ?
+				    pap.pap_zb.zb_objset : 0),
+				    (u_longlong_t)(provenance ?
+				    pap.pap_zb.zb_object : 0),
+				    (longlong_t)(provenance ?
+				    pap.pap_zb.zb_level : 0),
+				    (u_longlong_t)(provenance ?
+				    pap.pap_zb.zb_blkid : 0));
 			}
 			pr19262_flush();
 			if (zio->io_flags & ZIO_FLAG_IO_REWRITE) {
@@ -7152,6 +7309,13 @@ arc_write_done(zio_t *zio)
 				ASSERT(BP_GET_DEDUP(zio->io_bp));
 				ASSERT0(BP_GET_LEVEL(zio->io_bp));
 			}
+		}
+		if (exists == NULL) {
+			pr19262_arc_provenance_record(hdr, zio->io_bp,
+			    &zio->io_bookmark, zio->io_txg, zio->io_flags,
+			    zio->io_orig_flags, zio->io_post, zio->io_stage,
+			    zio->io_orig_stage, zio->io_priority,
+			    zio->io_child_type, PR19262_ARC_ORIGIN_WRITE);
 		}
 		/* if it's not anon, we are doing a scrub */
 		if (exists == NULL && hdr->b_l1hdr.b_state == arc_anon)
@@ -8203,6 +8367,9 @@ arc_init(void)
 	arc_state_init();
 
 	buf_init();
+	memset(pr19262_arc_provenance, 0, sizeof (pr19262_arc_provenance));
+	pr19262_arc_provenance_next = 0;
+	mutex_init(&pr19262_arc_provenance_lock, NULL, MUTEX_DEFAULT, NULL);
 
 	list_create(&arc_prune_list, sizeof (arc_prune_t),
 	    offsetof(arc_prune_t, p_node));
@@ -8355,6 +8522,7 @@ arc_fini(void)
 	 */
 	zthr_destroy(arc_evict_zthr);
 	zthr_destroy(arc_reap_zthr);
+	mutex_destroy(&pr19262_arc_provenance_lock);
 
 	ASSERT0(arc_loaned_bytes);
 }
