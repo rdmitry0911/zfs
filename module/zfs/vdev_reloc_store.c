@@ -1311,6 +1311,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 		avl_add(&engine.owners, e);
 		for (uint_t j = 0; j < np; j += 8) {
 			if (p[j + 3] <= p[j + 4] ||
+			    p[j + 3] > UINT16_MAX ||
 			    p[j + 3] > engine.vd->vdev_children ||
 			    p[j + 4] == 0 || p[j + 4] > 3 ||
 			    p[j + 5] > 1 || p[j + 6] > 1 ||
@@ -1329,7 +1330,7 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 				ENGINE_REFUSE(18);
 			engine_version_t *b = engine_version_new(e, p[j],
 			    p[j + 1], p[j + 2], B_TRUE);
-			b->width = p[j + 3]; b->parity = p[j + 4];
+			engine_version_geometry(b, p[j + 3], p[j + 4]);
 			b->retired = p[j + 6];
 			b->ready = p[j + 5]; b->generation = p[j + 7];
 			if (j != 0)

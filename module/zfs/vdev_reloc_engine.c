@@ -18,8 +18,8 @@ typedef struct engine_version {
 	uint64_t p;
 	uint64_t size;
 	uint64_t birth;
-	uint64_t width;
-	uint64_t parity;
+	uint16_t width;
+	uint16_t parity;
 	uint64_t leases;
 	uint64_t writers;
 	uint64_t generation;
@@ -29,6 +29,9 @@ typedef struct engine_version {
 	boolean_t ready;
 	boolean_t retired;
 } engine_version_t;
+
+_Static_assert(sizeof (engine_version_t) <= 96,
+	"engine version must remain in the 96-byte kmem class");
 
 typedef struct engine_pending {
 	struct engine_pending *next;
@@ -389,6 +392,24 @@ engine_owner_gone(engine_owner_t *e)
 	engine.gone_count++;
 }
 
+static void
+engine_version_geometry(engine_version_t *b, uint64_t width, uint64_t parity)
+{
+	VERIFY3U(width, <=, UINT16_MAX);
+	VERIFY3U(parity, <=, UINT16_MAX);
+	b->width = width;
+	b->parity = parity;
+}
+
+static void
+engine_version_layout(engine_version_t *b, vdev_t *vd, uint64_t birth)
+{
+	uint64_t width, parity;
+
+	vdev_raidz_layout_for_birth(vd, birth, &width, &parity);
+	engine_version_geometry(b, width, parity);
+}
+
 static engine_version_t *
 engine_version_new(engine_owner_t *e, uint64_t p, uint64_t size,
     uint64_t birth, boolean_t ready)
@@ -399,7 +420,7 @@ engine_version_new(engine_owner_t *e, uint64_t p, uint64_t size,
 	b->size = size;
 	b->birth = birth;
 	b->generation = ++engine.sequence;
-	vdev_raidz_layout_for_birth(engine.vd, birth, &b->width, &b->parity);
+	engine_version_layout(b, engine.vd, birth);
 	b->ready = ready;
 	b->next = e->versions;
 	e->versions = b;
@@ -962,7 +983,7 @@ pr19262_engine_alloc(spa_t *spa, vdev_t *vd, zfs_range_tree_t *native,
 	b->size = v.size;
 	b->birth = txg;
 	b->generation = ++engine.sequence;
-	vdev_raidz_layout_for_birth(vd, txg, &b->width, &b->parity);
+	engine_version_layout(b, vd, txg);
 	e->cur = e->versions = b;
 	zfs_range_tree_remove(engine.free, b->p, b->size);
 	avl_add(&engine.owners, e);

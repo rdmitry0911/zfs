@@ -551,9 +551,11 @@ engine_journal_apply(uint64_t *w)
 	if (v >= engine.total || size == 0 || size > engine.total - v ||
 	    !IS_P2ALIGNED(v, sector) ||
 	    !IS_P2ALIGNED(size, sector) || w[6] == 0 ||
-	    w[13] <= w[14] || w[13] > engine.vd->vdev_children ||
+	    w[13] <= w[14] || w[13] > UINT16_MAX ||
+	    w[13] > engine.vd->vdev_children ||
 	    w[14] == 0 || w[14] > 3 || w[17] > 1 || w[15] == 0 ||
 	    w[29] == 0 || w[29] > w[15] || w[27] <= w[28] ||
+	    w[27] > UINT16_MAX ||
 	    w[27] > engine.vd->vdev_children || w[28] == 0 || w[28] > 3)
 		return (ENGINE_EINVAL(2));
 	/* A released owner's bindings are folded into the catalog. */
@@ -575,7 +577,7 @@ engine_journal_apply(uint64_t *w)
 			zfs_range_tree_remove(engine.legacy, v, size);
 			engine_version_t *old = engine_version_new(e, v, size,
 			    w[26], B_TRUE);
-			old->width = w[27]; old->parity = w[28];
+			engine_version_geometry(old, w[27], w[28]);
 			old->generation = w[29];
 			e->cur = old;
 		}
@@ -619,7 +621,8 @@ engine_journal_apply(uint64_t *w)
 	if (!engine_store_extent(w[10], w[11]))
 		return (ENGINE_EINVAL(7));
 	engine_version_t *b = engine_version_new(e, w[10], w[11], w[12], w[17]);
-	b->width = w[13]; b->parity = w[14]; b->generation = w[15];
+	engine_version_geometry(b, w[13], w[14]);
+	b->generation = w[15];
 	b->journal_seq = w[3];
 	zfs_range_tree_remove(engine.free, b->p, b->size);
 	if (e->cur == NULL || b->generation > e->cur->generation) {
