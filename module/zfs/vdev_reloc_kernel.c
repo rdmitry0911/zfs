@@ -74,7 +74,9 @@ static void
 engine_kernel_cache(spa_t *spa)
 {
 	char *buf = kmem_alloc(PAGE_SIZE, KM_SLEEP);
-	(void) engine_kernel_snapshot(spa, buf);
+	if (engine_kernel_snapshot(spa, buf) < 0)
+		(void) strlcpy(buf, "ram_v=1 ram_complete=0 "
+		    "ram_error=status_truncated\n", PAGE_SIZE);
 	mutex_enter(&engine_selector.lock);
 	if (strcmp(engine_selector.pool, spa_name(spa)) == 0)
 		(void) strlcpy(engine_selector.cached_status, buf, PAGE_SIZE);
@@ -313,6 +315,164 @@ engine_kernel_status_get(char *buf, zfs_kernel_param_t *kp)
 	return (n);
 }
 
+/* Request bytes only; no allocator charge, scratch or shared helper costs. */
+typedef struct engine_ram_snapshot {
+	uint64_t owners;
+	uint64_t versions;
+	uint64_t tombs;
+	uint64_t pending;
+	uint64_t gone;
+	uint64_t cached;
+	uint64_t capacity;
+	uint64_t arenas;
+	uint64_t arena_pages;
+	uint64_t bitmap;
+	uint64_t mirror;
+	uint64_t jlive;
+	uint64_t jretired;
+	uint64_t jpending;
+	uint64_t vcur;
+	uint64_t vretired;
+	uint64_t vother;
+	uint64_t pending_owner;
+	uint64_t pending_parked;
+} engine_ram_snapshot_t;
+
+/* Each row is count:unit_request_B:subtotal_request_B:source_tag. */
+static int
+engine_kernel_ram_class(char *buf, size_t size, size_t *used,
+    const char *name, const char *source, uint64_t count, uint64_t unit,
+    uint64_t *total)
+{
+	if (count > (UINT64_MAX - *total) / unit)
+		return (-EOVERFLOW);
+	uint64_t bytes = count * unit;
+	int n = snprintf(buf + *used, size - *used,
+	    " ram_%s=%llu:%llu:%llu:%s", name, (u_longlong_t)count,
+	    (u_longlong_t)unit, (u_longlong_t)bytes, source);
+	if (n < 0 || (size_t)n >= size - *used)
+		return (-ENOSPC);
+	*used += n;
+	*total += bytes;
+	return (0);
+}
+
+/*
+ * store_lock pins cache nodes, arrays, arenas and the optional row mirror.
+ * engine->lock pins owners, every linked version, pending nodes, tombs,
+ * gone capacity and journal list topology (not journal payload fields).
+ * SPA lifetime pins engine/pages/job; never follow cur/tail/current aliases
+ * a second time, or pending ZIOs, or cached page data/headers here.
+ * Source tags and exclusions are defined by retained-v1's private verifier.
+ */
+static int
+engine_kernel_ram(spa_t *spa, char *buf, size_t size)
+{
+	engine_t *engine = spa->spa_reloc;
+	engine_pages_t *pages = engine->pages;
+	engine_ram_snapshot_t r = { 0 };
+	ASSERT(MUTEX_HELD(&engine->store_lock));
+	ASSERT(MUTEX_HELD(&engine->lock));
+	hrtime_t when = gethrtime();
+	for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+	    e = AVL_NEXT(&engine->owners, e)) {
+		r.owners++;
+		for (engine_version_t *v = e->versions; v != NULL;
+		    v = v->next) {
+			r.versions++;
+			if (v->retired)
+				r.vretired++;
+			else if (v == e->cur)
+				r.vcur++;
+			else
+				r.vother++;
+		}
+		for (engine_pending_t *p = e->pending; p != NULL;
+		    p = p->next)
+			r.pending_owner++;
+	}
+	for (engine_pending_t *p = engine->parked; p != NULL; p = p->next)
+		r.pending_parked++;
+	r.pending = r.pending_owner + r.pending_parked;
+	r.tombs = avl_numnodes(&engine->tombstones);
+	r.gone = engine->gone_capacity;
+	r.capacity = pages->capacity;
+	for (uint64_t i = 0; i < r.capacity; i++)
+		r.cached += pages->cache[i] != NULL;
+	for (engine_marena_t *a = pages->arenas; a != NULL; a = a->next) {
+		r.arenas++;
+		r.arena_pages += a->pages;
+	}
+	r.bitmap = engine->bitmap != NULL;
+	/* A retained empty mirror still owns MAX(1, count) rows. */
+	r.mirror = pages->rows != NULL ? MAX(1, pages->count) : 0;
+	for (engine_j_segment_t *s = engine->journal_segments; s != NULL;
+	    s = s->next)
+		r.jlive++;
+	for (engine_j_segment_t *s = engine->journal_retired; s != NULL;
+	    s = s->next)
+		r.jretired++;
+	/* Pending is disjoint; publication links and clears it under lock. */
+	r.jpending = engine->journal_pending != NULL;
+	int n = snprintf(buf, size, "ram_v=1 ram_complete=1 "
+	    "ram_scope=partial_retained_owned ram_unit=request_B "
+	    "ram_source=retained-v1 ram_den=resident_owner_records "
+	    "ram_den_n=%llu ram_spa=%llu ram_vdev=%llu ram_hrtime=%llu "
+	    "ram_active=%u ram_vcur=%llu ram_vretired=%llu ram_vother=%llu "
+	    "ram_pending_owner=%llu ram_pending_parked=%llu "
+	    "ram_gone_used=%u ram_mirror_rows=%u ram_mirror_present=%u "
+	    "ram_diag_stack_B=%llu ram_diag_selector_B=%llu",
+	    (u_longlong_t)r.owners, (u_longlong_t)spa_load_guid(spa),
+	    (u_longlong_t)(engine->spa == spa ? engine->vd_guid : 0),
+	    (u_longlong_t)when, engine->spa == spa,
+	    (u_longlong_t)r.vcur, (u_longlong_t)r.vretired,
+	    (u_longlong_t)r.vother, (u_longlong_t)r.pending_owner,
+	    (u_longlong_t)r.pending_parked, engine->gone_count, pages->count,
+	    pages->rows != NULL, (u_longlong_t)sizeof (r),
+	    (u_longlong_t)sizeof (engine_selector));
+	if (n < 0 || (size_t)n >= size)
+		return (-ENOSPC);
+	size_t used = n;
+	uint64_t total = 0;
+	int error;
+#define	ENGINE_RAM_CLASS(name, source, count, unit) \
+	do { \
+		error = engine_kernel_ram_class(buf, size, &used, name, \
+		    source, count, unit, &total); \
+		if (error != 0) \
+			return (error); \
+	} while (0)
+	ENGINE_RAM_CLASS("owners", "Eo", r.owners, sizeof (engine_owner_t));
+	ENGINE_RAM_CLASS("versions", "Ev", r.versions,
+	    sizeof (engine_version_t));
+	ENGINE_RAM_CLASS("tombs", "Et", r.tombs, sizeof (engine_tomb_t));
+	ENGINE_RAM_CLASS("pending", "Ep", r.pending, sizeof (engine_pending_t));
+	ENGINE_RAM_CLASS("gone", "Eg", r.gone, 2 * sizeof (uint64_t));
+	ENGINE_RAM_CLASS("engine", "Ei", 1, sizeof (engine_t));
+	ENGINE_RAM_CLASS("pages", "Ei", 1, sizeof (engine_pages_t));
+	ENGINE_RAM_CLASS("job", "Ki", 1, sizeof (engine_kernel_t));
+	ENGINE_RAM_CLASS("nodes", "Pn", r.cached, sizeof (engine_mnode_t));
+	ENGINE_RAM_CLASS("buffers", "Pn", r.cached, ENGINE_STORE_PAGE);
+	ENGINE_RAM_CLASS("pointers", "Pa", r.capacity,
+	    sizeof (engine_mnode_t *));
+	ENGINE_RAM_CLASS("bits", "Pa", r.capacity, sizeof (uint8_t));
+	ENGINE_RAM_CLASS("arenas", "Pa", r.arenas, sizeof (engine_marena_t));
+	ENGINE_RAM_CLASS("slots", "Pa", r.arena_pages, 2 * sizeof (uint8_t));
+	ENGINE_RAM_CLASS("bitmap", "Sb", r.bitmap, ENGINE_STORE_PAGES);
+	ENGINE_RAM_CLASS("mirror", "Pm", r.mirror, sizeof (engine_mrow_t));
+	ENGINE_RAM_CLASS("jlive", "Jd", r.jlive, sizeof (engine_j_segment_t));
+	ENGINE_RAM_CLASS("jretired", "Jd", r.jretired,
+	    sizeof (engine_j_segment_t));
+	ENGINE_RAM_CLASS("jpending", "Jd", r.jpending,
+	    sizeof (engine_j_segment_t));
+#undef ENGINE_RAM_CLASS
+	n = snprintf(buf + used, size - used,
+	    " ram_request_B=%llu ram_end=1\n", (u_longlong_t)total);
+	if (n < 0 || (size_t)n >= size - used)
+		return (-ENOSPC);
+	return (used + n);
+}
+
 static int
 engine_kernel_snapshot(spa_t *spa, char *buf)
 {
@@ -328,12 +488,12 @@ engine_kernel_snapshot(spa_t *spa, char *buf)
 	int error = job->error;
 	mutex_exit(&job->lock);
 	pr19262_engine_census_t c = { 0 };
-	boolean_t active = pr19262_engine_active(spa);
 	mutex_enter(&engine->store_lock);
+	boolean_t active = pr19262_engine_active(spa);
 	if (active)
 		pr19262_engine_census(spa, parity != 0 ? parity : 2, &c);
 	mutex_enter(&engine->lock);
-	int n = scnprintf(buf, PAGE_SIZE, "state=%s pool=%s active=%u "
+	int n = snprintf(buf, PAGE_SIZE, "state=%s pool=%s active=%u "
 	    "parity=%llu owners=%llu legacy=%llu weak=%llu retired=%llu "
 	    "certified=%llu floor=%llu journal_segments=%llu pages=%llu "
 	    "copied=%llu passes=%llu error=%d versions=%llu "
@@ -416,6 +576,27 @@ engine_kernel_snapshot(spa_t *spa, char *buf)
 	    (u_longlong_t)sizeof (engine_version_t),
 	    (u_longlong_t)engine->pages->available);
 #undef ENGINE_COST_MS
+	/* Append a complete RAM line or a refusal after the legacy line. */
+	if (n < 0 || n >= PAGE_SIZE) {
+		buf[0] = '\0';
+		n = -EOVERFLOW;
+	} else {
+		int ram = engine_kernel_ram(spa, buf + n, PAGE_SIZE - n);
+		if (ram < 0) {
+			const char *why = ram == -ENOSPC ? "truncated" :
+			    "arithmetic_overflow";
+			ram = snprintf(buf + n, PAGE_SIZE - n,
+			    "ram_v=1 ram_complete=0 ram_error=%s\n", why);
+			if (ram < 0 || ram >= PAGE_SIZE - n) {
+				buf[0] = '\0';
+				n = -EOVERFLOW;
+			} else {
+				n += ram;
+			}
+		} else {
+			n += ram;
+		}
+	}
 	mutex_exit(&engine->lock);
 	mutex_exit(&engine->store_lock);
 	return (n);
