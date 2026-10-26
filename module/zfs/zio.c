@@ -5317,12 +5317,6 @@ zio_vdev_io_start(zio_t *zio)
 	ASSERT0(zio->io_child_error[ZIO_CHILD_VDEV]);
 
 	if (vd == NULL) {
-		/* New/gang allocations gained DVAs after zio_create(). */
-		void *hold = pr19262_engine_hold(spa, zio->io_bp,
-		    zio->io_pr19262_owner_hold, zio->io_type == ZIO_TYPE_READ,
-		    (zio->io_flags & ZIO_FLAG_GANG_CHILD) != 0);
-		pr19262_engine_rele(zio->io_pr19262_owner_hold);
-		zio->io_pr19262_owner_hold = hold;
 		if (!(zio->io_flags & ZIO_FLAG_CONFIG_WRITER)) {
 			/*
 			 * A deadlock workaround. The ddt_prune_unique_entries()
@@ -5346,6 +5340,12 @@ zio_vdev_io_start(zio_t *zio)
 				spa_config_enter(spa, SCL_ZIO, zio,
 				    RW_READER);
 		}
+		/* Bind preexisting zios after the activation fence too. */
+		void *hold = pr19262_engine_hold(spa, zio->io_bp,
+		    zio->io_pr19262_owner_hold, zio->io_type == ZIO_TYPE_READ,
+		    (zio->io_flags & ZIO_FLAG_GANG_CHILD) != 0);
+		pr19262_engine_rele(zio->io_pr19262_owner_hold);
+		zio->io_pr19262_owner_hold = hold;
 
 		/*
 		 * The mirror_ops handle multiple DVAs in a single BP.

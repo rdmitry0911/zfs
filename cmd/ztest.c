@@ -16856,7 +16856,7 @@ pr19262_pair_driver(const char *first, const char *second, boolean_t cold)
 		VERIFY0(dsl_dataset_snapshot(snaps, NULL, NULL));
 		fnvlist_free(snaps);
 		pr19262_engine_start(p[i].spa);
-		pr19262_engine_store_enable(p[i].spa);
+		VERIFY0(pr19262_engine_store_enable(p[i].spa));
 		VERIFY0(pr19262_engine_epoch(p[i].spa, 2, &p[i].birth));
 	}
 	VERIFY3P(p[0].spa->spa_reloc, !=, p[1].spa->spa_reloc);
@@ -16952,7 +16952,7 @@ pr19262_tx_driver(const char *directory)
 	if (getenv("PR19262_RUNTIME_ENGINE") != NULL) {
 		pr19262_engine_start(spa);
 		if (getenv("PR19262_ENGINE_DURABLE") != NULL)
-			pr19262_engine_store_enable(spa);
+			VERIFY0(pr19262_engine_store_enable(spa));
 		if (getenv("PR19262_ENGINE_DMU_STALE") != NULL) {
 			pr19262_dmu_stale_test(spa);
 			spa_close(spa, FTAG);

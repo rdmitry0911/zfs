@@ -50,7 +50,7 @@ extern void libspl_backtrace(int);
 #define	PR19262_ENGINE_LABEL_FEATURE "org.openzfs:pr19262_private_vp"
 boolean_t pr19262_engine_persistent(spa_t *);
 boolean_t pr19262_engine_store_dirty(spa_t *);
-void pr19262_engine_store_enable(spa_t *);
+int pr19262_engine_store_enable(spa_t *);
 int pr19262_engine_store_sync(spa_t *, uberblock_t *);
 int pr19262_engine_store_load(spa_t *, const uberblock_t *);
 int pr19262_engine_store_recover(spa_t *);
@@ -112,6 +112,8 @@ void pr19262_engine_spa_fini(spa_t *);
 void pr19262_engine_init(void);
 void pr19262_engine_fini(void);
 void pr19262_engine_start(spa_t *);
+int pr19262_engine_start_persistent(spa_t *);
+int pr19262_engine_legacy_recover(spa_t *);
 boolean_t pr19262_engine_active(spa_t *);
 vdev_t *pr19262_engine_vdev(spa_t *);
 boolean_t pr19262_engine_bp_foreign(spa_t *, const blkptr_t *);

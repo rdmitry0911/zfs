@@ -36,6 +36,7 @@
 
 static void metaslab_unalloc_dva_impl(spa_t *, const dva_t *, uint64_t,
     boolean_t);
+static void engine_native_free(vdev_t *, zfs_range_tree_t *);
 
 #define	GANG_ALLOCATION(flags) \
 	((flags) & (METASLAB_GANG_CHILD | METASLAB_GANG_HEADER))
@@ -350,6 +351,7 @@ static uint64_t metaslab_weight_from_range_tree(metaslab_t *msp);
 static void metaslab_flush_update(metaslab_t *, dmu_tx_t *);
 static unsigned int metaslab_idx_func(multilist_t *, void *);
 static void metaslab_evict(metaslab_t *, uint64_t);
+static boolean_t engine_metaslab_pinned(metaslab_t *);
 static void metaslab_rt_add(zfs_range_tree_t *rt, zfs_range_seg_t *rs,
     void *arg);
 #ifdef METASLAB_TRACE
@@ -2806,7 +2808,7 @@ metaslab_unload(metaslab_t *msp)
 	 * metaslab_potentially_evict) and then unloaded during spa_sync (via
 	 * metaslab_class_evict_old).
 	 */
-	if (!msp->ms_loaded)
+	if (!msp->ms_loaded || engine_metaslab_pinned(msp))
 		return;
 
 	zfs_range_tree_vacate(msp->ms_allocatable, NULL, NULL);
@@ -4677,6 +4679,9 @@ metaslab_sync_done(metaslab_t *msp, uint64_t txg)
 	 * the defer_tree -- this is safe to do because we've
 	 * just emptied out the defer_tree.
 	 */
+	engine_native_free(vd, *defer_tree);
+	if (!defer_allowed)
+		engine_native_free(vd, msp->ms_freed);
 	zfs_range_tree_vacate(*defer_tree,
 	    msp->ms_loaded ? zfs_range_tree_add : NULL, msp->ms_allocatable);
 	if (defer_allowed) {
@@ -5908,6 +5913,8 @@ metaslab_unalloc_dva_impl(spa_t *spa, const dva_t *dva, uint64_t txg,
 	 * Outstanding holds/leases retain its owner as a picker exclusion.
 	 */
 	if (pair_created) {
+		VERIFY(zfs_range_tree_contains(
+		    msp->ms_allocating[txg & TXG_MASK], offset, size));
 		if (pr19262_engine_abort(spa, vd, offset, size, txg)) {
 			mutex_exit(&msp->ms_lock);
 			return;

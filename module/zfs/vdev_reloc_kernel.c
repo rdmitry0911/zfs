@@ -148,9 +148,9 @@ engine_kernel_engine_set(const char *val, zfs_kernel_param_t *kp)
 		if (!pr19262_engine_persistent(spa))
 			error = ENOTSUP;
 	} else {
-		pr19262_engine_start(spa);
-		pr19262_engine_store_enable(spa);
-		txg_wait_synced(spa_get_dsl(spa), 0);
+		error = pr19262_engine_start_persistent(spa);
+		if (error == 0)
+			txg_wait_synced(spa_get_dsl(spa), 0);
 	}
 out:
 	mutex_exit(&job->lock);

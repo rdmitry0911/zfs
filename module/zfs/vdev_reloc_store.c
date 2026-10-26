@@ -46,6 +46,16 @@ pr19262_engine_store_ub(const uberblock_t *ub)
 	return (ub->ub_pr19262[0] == ENGINE_STORE_MAGIC);
 }
 
+/* Native checkpoints have no catalog pages to pin in the engine graph. */
+static boolean_t
+engine_native_checkpoint(uberblock_t *ub)
+{
+	uint64_t absent[ARRAY_SIZE(ub->ub_pr19262)] = { 0 };
+	return (uberblock_verify(ub) == 0 && ub->ub_txg != 0 &&
+	    ub->ub_checkpoint_txg == ub->ub_txg &&
+	    memcmp(ub->ub_pr19262, absent, sizeof (absent)) == 0);
+}
+
 boolean_t
 pr19262_engine_persistent(spa_t *spa)
 {
@@ -68,35 +78,53 @@ pr19262_engine_store_dirty(spa_t *spa)
 	return (dirty);
 }
 
+typedef struct engine_store_pick_arg {
+	uint64_t stripe;
+	uint64_t bytes;
+	uint64_t found;
+} engine_store_pick_arg_t;
+
 static void
 engine_store_pick(void *arg, uint64_t start, uint64_t size)
 {
-	engine_t *engine = ((engine_walk_arg_t *)arg)->engine;
-	arg = ((engine_walk_arg_t *)arg)->arg;
-	uint64_t *found = arg;
-	uint64_t stripe = engine->vd->vdev_children * ENGINE_STORE_PAGE;
-	uint64_t bytes = engine->vd->vdev_children *
-	    (engine->arena_bytes == 0 ? ENGINE_STORE_BYTES :
-	    ENGINE_JOURNAL_BYTES);
-	uint64_t p = roundup(start, stripe);
-	if (p >= start && p - start <= size && bytes <= size - (p - start))
-		*found = p;
+	engine_store_pick_arg_t *pick = arg;
+	uint64_t p = roundup(start, pick->stripe);
+	if (p >= start && p - start <= size &&
+	    pick->bytes <= size - (p - start))
+		pick->found = p;
 }
 
-void
-pr19262_engine_store_enable(spa_t *spa)
+static int
+engine_store_enable_locked(spa_t *spa)
 {
 	engine_t *engine = spa->spa_reloc;
-	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_WRITER);
+	ASSERT(spa_config_held(spa, SCL_CONFIG, RW_WRITER));
 	mutex_enter(&engine->lock);
-	VERIFY3P(spa, ==, engine->spa);
+	VERIFY(engine->spa == NULL || engine->spa == spa);
 	VERIFY(!engine->persistent);
 	/* Raw pages are whole sectors: ashift up to the page size. */
 	VERIFY0(ENGINE_STORE_PAGE % (1ULL << engine->vd->vdev_ashift));
-	uint64_t p = UINT64_MAX;
-	engine_walk_arg_t walk = { engine, &p };
-	zfs_range_tree_walk(engine->free, engine_store_pick, &walk);
-	VERIFY3U(p, !=, UINT64_MAX);
+	uint64_t children = engine->vd->vdev_children;
+	engine_store_pick_arg_t pick = { children * ENGINE_STORE_PAGE,
+	    children * ENGINE_STORE_BYTES, UINT64_MAX };
+	zfs_range_tree_walk(engine->free, engine_store_pick, &pick);
+	if (pick.found == UINT64_MAX) {
+		mutex_exit(&engine->lock);
+		return (SET_ERROR(ENOSPC));
+	}
+	uint64_t p = pick.found;
+	zfs_range_tree_remove(engine->free, p, pick.bytes);
+	pick.bytes = children * ENGINE_JOURNAL_BYTES;
+	pick.found = UINT64_MAX;
+	zfs_range_tree_walk(engine->free, engine_store_pick, &pick);
+	if (pick.found == UINT64_MAX) {
+		zfs_range_tree_add(engine->free, p,
+		    children * ENGINE_STORE_BYTES);
+		mutex_exit(&engine->lock);
+		return (SET_ERROR(ENOSPC));
+	}
+	uint64_t journal = pick.found;
+	zfs_range_tree_remove(engine->free, journal, pick.bytes);
 	engine->arena = p;
 	engine->arena_bytes = ENGINE_STORE_BYTES;
 	engine->bitmap = kmem_zalloc(ENGINE_STORE_PAGES, KM_SLEEP);
@@ -105,19 +133,13 @@ pr19262_engine_store_enable(spa_t *spa)
 	engine->persistent = B_TRUE;
 	engine->store_all = B_TRUE;
 	engine->revision++;
-	zfs_range_tree_remove(engine->free, p,
-	    ENGINE_STORE_BYTES * engine->vd->vdev_children);
 	engine->store_extents = zfs_range_tree_create(NULL,
 	    ZFS_RANGE_SEG64, NULL, 0, 0);
 	zfs_range_tree_add(engine->store_extents, p,
 	    ENGINE_STORE_BYTES * engine->vd->vdev_children);
-	p = UINT64_MAX;
-	zfs_range_tree_walk(engine->free, engine_store_pick, &walk);
-	VERIFY3U(p, !=, UINT64_MAX);
+	p = journal;
 	engine->journal_arena = p;
 	engine->journal_bytes = ENGINE_JOURNAL_BYTES;
-	zfs_range_tree_remove(engine->free, p,
-	    ENGINE_JOURNAL_BYTES * engine->vd->vdev_children);
 	VERIFY0(random_get_pseudo_bytes((void *)engine->journal_epoch,
 	    sizeof (engine->journal_epoch)));
 	engine->journal_root = p;
@@ -139,7 +161,13 @@ pr19262_engine_store_enable(spa_t *spa)
 	fnvlist_add_uint64(spa->spa_label_features,
 	    PR19262_ENGINE_LABEL_FEATURE, 0);
 	vdev_config_dirty(engine->vd);
-	spa_config_exit(spa, SCL_CONFIG, FTAG);
+	return (0);
+}
+
+static void
+engine_store_enable_done(spa_t *spa)
+{
+	engine_t *engine = spa->spa_reloc;
 	VERIFY0(engine_journal_format(spa));
 	mutex_enter(&engine->lock);
 	engine->journal_formatted = B_TRUE;
@@ -149,6 +177,17 @@ pr19262_engine_store_enable(spa_t *spa)
 	mutex_enter(&engine->lock);
 	VERIFY(engine->journal_ready);
 	mutex_exit(&engine->lock);
+}
+
+int
+pr19262_engine_store_enable(spa_t *spa)
+{
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_WRITER);
+	int error = engine_store_enable_locked(spa);
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+	if (error == 0)
+		engine_store_enable_done(spa);
+	return (error);
 }
 
 /* Create one raw member I/O as a child of pio (NULL: caller waits). */
@@ -1173,7 +1212,8 @@ engine_store_decode(spa_t *spa, const uberblock_t *ub, nvlist_t *nv)
 	    (engine->checkpoint.ub_checkpoint_txg !=
 	    engine->checkpoint.ub_txg ||
 	    engine->checkpoint.ub_txg > ub->ub_txg ||
-	    !pr19262_engine_store_ub(&engine->checkpoint)))
+	    (!pr19262_engine_store_ub(&engine->checkpoint) &&
+	    !engine_native_checkpoint(&engine->checkpoint))))
 		ENGINE_REFUSE(5);
 	if (txg != ub->ub_pr19262[6] || pool != spa_guid(spa) ||
 	    top != engine->vd->vdev_guid || nm != 16 || ng != 6 || ns != 3 ||
@@ -1477,7 +1517,7 @@ engine_root_read(engine_root_graph_t *g, const uberblock_t *ub)
 			    pin.ub_checkpoint_txg != pin.ub_txg ||
 			    pin.ub_pr19262[6] >= d[6])
 				error = ENGINE_EINVAL(104);
-			else
+			else if (!engine_native_checkpoint(&pin))
 				error = engine_root_add(g, &pin);
 		}
 		if (error == 0) {

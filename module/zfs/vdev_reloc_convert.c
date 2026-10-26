@@ -213,7 +213,9 @@ pr19262_engine_fence(spa_t *spa, uint64_t *floor, uint64_t *reclaimed,
 	mutex_enter(&engine->lock);
 	uint64_t ub = engine->durable_ub_txg;
 	uint64_t catalog = engine->durable_catalog_txg;
-	boolean_t checkpoint = engine->checkpoint.ub_txg != 0;
+	/* A split native checkpoint SM must finish draining before reuse. */
+	boolean_t checkpoint = engine->checkpoint.ub_txg != 0 ||
+	    spa->spa_checkpoint_info.sci_timestamp != 0;
 	mutex_exit(&engine->lock);
 	int error = 0;
 	uint64_t pages_freed = 0, journal_segments = 0, journal_bytes = 0;
@@ -440,7 +442,9 @@ pr19262_engine_certify(spa_t *spa, uint64_t parity)
 	pr19262_engine_census_t c;
 	pr19262_engine_census(spa, parity, &c);
 	mutex_enter(&engine->lock);
-	boolean_t checkpoint = engine->checkpoint.ub_txg != 0;
+	/* A split native checkpoint SM must finish draining before reuse. */
+	boolean_t checkpoint = engine->checkpoint.ub_txg != 0 ||
+	    spa->spa_checkpoint_info.sci_timestamp != 0;
 	mutex_exit(&engine->lock);
 	if (c.legacy_bytes != 0 || c.weak_current != 0 ||
 	    c.weak_retired != 0 || c.floor == 0 || checkpoint ||

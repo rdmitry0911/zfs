@@ -6013,7 +6013,10 @@ spa_ld_read_checkpoint_txg(spa_t *spa)
 	    sizeof (uberblock_t) / sizeof (uint64_t), &checkpoint);
 
 	if (error == ENOENT) {
-		return (pr19262_engine_checkpoint_validate(spa, NULL));
+		error = pr19262_engine_checkpoint_validate(spa, NULL);
+		if (error == 0)
+			pr19262_engine_checkpoint(spa, NULL);
+		return (error);
 	}
 	if (error != 0)
 		return (error);
@@ -6025,6 +6028,7 @@ spa_ld_read_checkpoint_txg(spa_t *spa)
 	ASSERT3U(checkpoint.ub_timestamp, !=, 0);
 	spa->spa_checkpoint_txg = checkpoint.ub_txg;
 	spa->spa_checkpoint_info.sci_timestamp = checkpoint.ub_timestamp;
+	pr19262_engine_checkpoint(spa, &checkpoint);
 
 	return (0);
 }
@@ -6490,6 +6494,12 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 		error = spa_ld_claim_log_blocks(spa);
 		if (error != 0)
 			goto fail;
+		error = pr19262_engine_legacy_recover(spa);
+		if (error != 0) {
+			spa_load_failed(spa, "private legacy recovery failed "
+			    "[error=%d]", error);
+			goto fail;
+		}
 
 		/*
 		 * Have the first txg rewrite the labels of the raidz vdevs

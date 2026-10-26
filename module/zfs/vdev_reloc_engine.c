@@ -219,6 +219,8 @@ struct pr19262_engine {
 	kcondvar_t changed;
 	spa_t *spa;
 	vdev_t *vd;
+	/* Space maps loaded before publication may not be evicted yet. */
+	vdev_t *loading_vd;
 	uint64_t vd_guid;
 	/* Another normal-class top-level vdev: client data can fall back. */
 	boolean_t foreign_normal;
@@ -779,37 +781,98 @@ pr19262_engine_bp_foreign(spa_t *spa, const blkptr_t *bp)
 	return (foreign);
 }
 
-void
-pr19262_engine_start(spa_t *spa)
+static boolean_t
+engine_metaslab_pinned(metaslab_t *ms)
+{
+	if (ms->ms_group == NULL)
+		return (B_FALSE);
+	vdev_t *vd = ms->ms_group->mg_vd;
+	engine_t *engine = vd->vdev_spa->spa_reloc;
+	if (engine == NULL)
+		return (B_FALSE);
+	mutex_enter(&engine->lock);
+	boolean_t pinned = engine->loading_vd == vd;
+	mutex_exit(&engine->lock);
+	return (pinned);
+}
+
+static int engine_store_enable_locked(spa_t *);
+static void engine_store_enable_done(spa_t *);
+static void engine_store_clear(engine_t *);
+
+static int
+engine_start(spa_t *spa, boolean_t persistent)
 {
 	engine_t *engine = spa->spa_reloc;
 	VERIFY(spa_writeable(spa));
 	VERIFY(spa->spa_trust_config);
+	/* Serialize topology changes through preparation and publication. */
+	mutex_enter(&spa->spa_vdev_top_lock);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
-	VERIFY3P(engine->spa, ==, NULL);
-	/*
-	 * Fresh fixture without background client writers.  The first RAIDZ
-	 * top-level vdev is translated; log, special and further normal
-	 * vdevs stay native.
-	 */
-	spa_config_enter(spa, SCL_ALLOC | SCL_FREE, FTAG, RW_WRITER);
+
+	/* DMU space-map reads must precede every config writer lock. */
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
 	vdev_t *vd = engine_target_vdev(spa, 0);
 	VERIFY3P(vd, !=, NULL);
+	mutex_enter(&engine->lock);
+	VERIFY3P(engine->spa, ==, NULL);
+	VERIFY3P(engine->loading_vd, ==, NULL);
+	engine->loading_vd = vd;
+	mutex_exit(&engine->lock);
+	for (uint64_t i = 0; i < vd->vdev_ms_count; i++) {
+		metaslab_t *ms = vd->vdev_ms[i];
+		mutex_enter(&ms->ms_lock);
+		VERIFY0(metaslab_load(ms));
+		mutex_exit(&ms->ms_lock);
+	}
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+	/*
+	 * CONFIG drains sync, including deferred-free turnover.  ALLOC stops
+	 * new native reservations.  Leave ZIO and FREE open while loading
+	 * space maps; a native rollback can still finish during the scan.
+	 */
+	spa_config_enter(spa, SCL_CONFIG | SCL_ALLOC, FTAG, RW_WRITER);
+	VERIFY3P(engine->spa, ==, NULL);
+	VERIFY3P(engine_target_vdev(spa, 0), ==, vd);
 	zfs_range_tree_t *free = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
 	    NULL, 0, 0);
 	zfs_range_tree_t *legacy = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	    NULL, 0, 0);
+	zfs_range_tree_t *pending = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
 	    NULL, 0, 0);
 	zfs_range_tree_add(legacy, 0, vd->vdev_asize);
 	for (uint64_t i = 0; i < vd->vdev_ms_count; i++) {
 		metaslab_t *ms = vd->vdev_ms[i];
 		mutex_enter(&ms->ms_lock);
-		VERIFY0(metaslab_load(ms));
+		VERIFY(ms->ms_loaded);
 		zfs_range_tree_walk(ms->ms_allocatable, zfs_range_tree_add,
 		    free);
 		zfs_range_tree_walk(ms->ms_allocatable, zfs_range_tree_remove,
 		    legacy);
+		for (uint_t t = 0; t < TXG_SIZE; t++)
+			zfs_range_tree_walk(ms->ms_allocating[t],
+			    zfs_range_tree_add, pending);
 		mutex_exit(&ms->ms_lock);
 	}
+	/*
+	 * Drain native vdev I/O before publishing translated ownership.  The
+	 * bp-level hold is acquired under SCL_ZIO, so waiting I/O will bind
+	 * after publication.  FREE then stops the remaining immediate undo.
+	 * No pool I/O may be issued under these lower writer locks.
+	 */
+	spa_config_enter(spa, SCL_ZIO | SCL_FREE, FTAG, RW_WRITER);
+	for (uint64_t i = 0; i < vd->vdev_ms_count; i++) {
+		metaslab_t *ms = vd->vdev_ms[i];
+		mutex_enter(&ms->ms_lock);
+		for (uint_t t = 0; t < TXG_SIZE; t++)
+			zfs_range_tree_walk(ms->ms_allocating[t],
+			    zfs_range_tree_remove, pending);
+		mutex_exit(&ms->ms_lock);
+	}
+	/* With allocation and sync stopped, only undo can shrink pending. */
+	zfs_range_tree_walk(pending, zfs_range_tree_add, free);
+	zfs_range_tree_vacate(pending, zfs_range_tree_remove, legacy);
+	zfs_range_tree_destroy(pending);
 	/* Rows past the last metaslab belong to neither domain. */
 	zfs_range_tree_t *unusable = zfs_range_tree_create(NULL,
 	    ZFS_RANGE_SEG64, NULL, 0, 0);
@@ -830,7 +893,6 @@ pr19262_engine_start(spa_t *spa)
 	engine->foreign_normal = engine_foreign_normal(spa, vd);
 	engine->total = vd->vdev_asize;
 	engine->retired_limit = 64ULL << 20;
-	engine->spa = spa;
 	engine->admit_batch = ENGINE_ADMIT_BATCH;
 	engine->admit_refreshed = UINT64_MAX;
 	engine->admit_cached_parity = UINT64_MAX;
@@ -838,7 +900,130 @@ pr19262_engine_start(spa_t *spa)
 	vdev_raidz_layout_for_birth(vd, spa_last_synced_txg(spa) + 1, NULL,
 	    &engine->admit_parity);
 	mutex_exit(&engine->lock);
-	spa_config_exit(spa, SCL_ALLOC | SCL_FREE, FTAG);
+	/* Publish authority only after both raw arenas have been reserved. */
+	int error = persistent ? engine_store_enable_locked(spa) : 0;
+	mutex_enter(&engine->lock);
+	if (error == 0)
+		engine->spa = spa;
+	else
+		engine_store_clear(engine);
+	engine->loading_vd = NULL;
+	mutex_exit(&engine->lock);
+	spa_config_exit(spa, SCL_CONFIG | SCL_ALLOC | SCL_ZIO | SCL_FREE,
+	    FTAG);
+	mutex_exit(&spa->spa_vdev_top_lock);
+	if (persistent && error == 0)
+		engine_store_enable_done(spa);
+	return (error);
+}
+
+void
+pr19262_engine_start(spa_t *spa)
+{
+	VERIFY0(engine_start(spa, B_FALSE));
+}
+
+int
+pr19262_engine_start_persistent(spa_t *spa)
+{
+	return (engine_start(spa, B_TRUE));
+}
+
+/*
+ * A native free can predate activation and return to circulation later.
+ * Only its still-unowned identity backing belongs to legacy; released
+ * engine owners have already returned their P through the durable fence.
+ */
+static void
+engine_legacy_free(void *arg, uint64_t start, uint64_t size)
+{
+	engine_t *engine = arg;
+	ASSERT(MUTEX_HELD(&engine->lock));
+	uint64_t found, length;
+	while (zfs_range_tree_find_in(engine->legacy, start, size,
+	    &found, &length)) {
+		VERIFY3P(engine_overlap(engine, found, length), ==, NULL);
+		zfs_range_tree_remove(engine->legacy, found, length);
+		zfs_range_tree_verify_not_present(engine->free, found, length);
+		zfs_range_tree_add(engine->free, found, length);
+		engine->revision++;
+	}
+}
+
+/* Caller holds the native metaslab lock, before making V reusable. */
+static void
+engine_native_free(vdev_t *vd, zfs_range_tree_t *native)
+{
+	engine_t *engine = vd->vdev_spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->spa == vd->vdev_spa && engine->vd == vd)
+		zfs_range_tree_walk(native, engine_legacy_free, engine);
+	mutex_exit(&engine->lock);
+}
+
+/*
+ * Deferred trees are not restored on import.  Reconcile their catalog
+ * legacy quarantine only after native ZIL claims, which may still need
+ * identity extents that the selected space maps describe as free.
+ */
+int
+pr19262_engine_legacy_recover(spa_t *spa)
+{
+	if (!pr19262_engine_persistent(spa))
+		return (0);
+	engine_t *engine = spa->spa_reloc;
+	ASSERT(!spa->spa_sync_on);
+	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
+	vdev_t *vd = pr19262_engine_vdev(spa);
+	int error = 0;
+	for (uint64_t i = 0; error == 0 && i < vd->vdev_ms_count; i++) {
+		metaslab_t *ms = vd->vdev_ms[i];
+		mutex_enter(&ms->ms_lock);
+		error = metaslab_load(ms);
+		if (error == 0)
+			engine_native_free(vd, ms->ms_allocatable);
+		mutex_exit(&ms->ms_lock);
+	}
+	/*
+	 * A catalog may also have materialized a native reservation before
+	 * its allocating txg committed.  If no ZIL claim needs that V, keep
+	 * its P retired through the ordinary floor fence.  Claim V first so
+	 * that the eventual owner release performs exactly one native free.
+	 */
+	mutex_enter(&engine->lock);
+	for (engine_owner_t *e = avl_first(&engine->owners);
+	    error == 0 && e != NULL; e = AVL_NEXT(&engine->owners, e)) {
+		uint64_t v = e->v;
+		uint64_t size = e->size;
+		e->holds++;
+		mutex_exit(&engine->lock);
+		int native = metaslab_claim_impl(vd, v, size, 0);
+		mutex_enter(&engine->lock);
+		if (native == 0 && (e->allocation_txg != 0 ||
+		    e->checkpoint_only || e->journal_pending))
+			error = ENGINE_EINVAL(5);
+		mutex_exit(&engine->lock);
+		if (native == 0 && error == 0)
+			error = metaslab_claim_impl(vd, v, size,
+			    spa_first_txg(spa));
+		else if (native != 0 && native != ENOENT)
+			error = native;
+		mutex_enter(&engine->lock);
+		e->holds--;
+		if (native == 0 && error == 0) {
+			if (!e->retired) {
+				e->retired = B_TRUE;
+				e->retired_at = ++engine->sequence;
+				engine->retired += e->cur->size;
+			}
+			e->catalog_txg = e->claimed_txg = spa_first_txg(spa);
+			engine_owner_dirty(engine, e);
+			engine->revision++;
+		}
+	}
+	mutex_exit(&engine->lock);
+	spa_config_exit(spa, SCL_ALLOC, FTAG);
+	return (error);
 }
 
 typedef struct engine_pick {
@@ -1167,9 +1352,15 @@ pr19262_engine_abort(spa_t *spa, vdev_t *vd, uint64_t v, uint64_t size,
 	mutex_enter(&engine->lock);
 	if (engine->spa == spa && spa != NULL && vd == engine->vd) {
 		engine_owner_t *e = engine_find(engine, v);
-		if (e != NULL) {
+		if (e == NULL) {
+			/* The caller proved the native reservation exists. */
+			VERIFY(zfs_range_tree_contains(engine->legacy,
+			    v, size));
+			engine_legacy_free(engine, v, size);
+		} else {
 			VERIFY3U(e->size, ==, size);
-			VERIFY3U(e->allocation_txg, ==, txg);
+			VERIFY3U(e->allocation_txg != 0 ? e->allocation_txg :
+			    e->cur->birth, ==, txg);
 			VERIFY(!e->aborted);
 			classified = B_TRUE;
 			/* Admission and abort choose exactly one outcome. */
@@ -1271,13 +1462,16 @@ pr19262_engine_checkpoint(spa_t *spa, const uberblock_t *checkpoint)
 {
 	engine_t *engine = spa->spa_reloc;
 	mutex_enter(&engine->lock);
-	if (engine->spa == spa && engine->persistent) {
-		if (checkpoint != NULL)
-			engine->checkpoint = *checkpoint;
-		else
-			memset(&engine->checkpoint, 0,
-			    sizeof (engine->checkpoint));
-		engine->revision++;
+	/* Cache native roots before activation as well as translated roots. */
+	if (engine->spa == NULL || engine->spa == spa) {
+		uberblock_t absent = { 0 };
+		const uberblock_t *next = checkpoint != NULL ?
+		    checkpoint : &absent;
+		if (memcmp(&engine->checkpoint, next,
+		    sizeof (engine->checkpoint)) != 0) {
+			engine->checkpoint = *next;
+			engine->revision++;
+		}
 	}
 	mutex_exit(&engine->lock);
 }
@@ -1326,17 +1520,48 @@ pr19262_engine_checkpoint_discard(vdev_t *vd, uint64_t v, uint64_t size,
 		mutex_exit(&engine->lock);
 		return (ENGINE_EINVAL(1));
 	}
-	/* SM runs can merge allocations or split one allocation into runs. */
+	/* SM runs may merge legacy extents and split or merge owners. */
 	for (uint64_t cursor = v; cursor < v + size; ) {
 		engine_owner_t *e = engine_checkpoint_owner(engine, cursor);
-		if (e == NULL || (!e->checkpoint_only && !e->retired)) {
-			mutex_exit(&engine->lock);
-			return (ENGINE_EINVAL(2));
+		if (e != NULL) {
+			if (!e->checkpoint_only && !e->retired) {
+				mutex_exit(&engine->lock);
+				return (ENGINE_EINVAL(2));
+			}
+			cursor = MIN(v + size, e->v + e->size);
+		} else {
+			uint64_t found, length;
+			if (!zfs_range_tree_find_in(engine->legacy, cursor,
+			    v + size - cursor, &found, &length) ||
+			    found != cursor) {
+				mutex_exit(&engine->lock);
+				return (ENGINE_EINVAL(6));
+			}
+			cursor += length;
 		}
-		cursor = MIN(v + size, e->v + e->size);
 	}
 	for (uint64_t cursor = v; cursor < v + size; ) {
 		engine_owner_t *e = engine_checkpoint_owner(engine, cursor);
+		if (e == NULL) {
+			uint64_t found, length;
+			VERIFY(zfs_range_tree_find_in(engine->legacy, cursor,
+			    v + size - cursor, &found, &length));
+			VERIFY3U(found, ==, cursor);
+			/*
+			 * This is a retired identity extent, not a live BP.
+			 * Old catalogs may still reach its native checkpoint.
+			 * Keep both V and P until their ordinary durable floor.
+			 */
+			e = engine_owner_alloc(KM_SLEEP);
+			e->v = cursor;
+			e->size = length;
+			e->cur = engine_version_new(engine, e, cursor,
+			    length, 0, B_TRUE);
+			e->incarnation = ++engine->next_incarnation;
+			e->created = ++engine->sequence;
+			zfs_range_tree_remove(engine->legacy, cursor, length);
+			avl_add(&engine->owners, e);
+		}
 		if (!e->retired) {
 			e->checkpoint_only = B_FALSE;
 			e->retired = B_TRUE;
@@ -1781,10 +2006,13 @@ engine_copy_begin(spa_t *spa, const blkptr_t *bp, int d, uint64_t birth,
 	 */
 	boolean_t legacy = e->allocation_txg == 0 && e->cur->p == e->v &&
 	    e->cur->journal_seq == 0;
+	/* A native allocation crossing activation still permits undo. */
+	boolean_t native_pending = e->allocation_txg == 0 &&
+	    e->cur->p == e->v && e->cur->birth > spa_last_synced_txg(spa);
 	if (e->copying || (e->cur->ready == unwritten &&
 	    !(unwritten && legacy)) ||
 	    e->cur->writers != 0 || e->queued_writers != 0 ||
-	    e->catalog_txg > spa_last_synced_txg(spa)) {
+	    e->catalog_txg > spa_last_synced_txg(spa) || native_pending) {
 		mutex_exit(&engine->lock);
 		return (EBUSY);
 	}

@@ -304,8 +304,12 @@ engine_journal_segment(engine_t *engine, uint64_t arena,
 {
 	mutex_enter(&engine->lock);
 	if (allocate) {
-		engine_walk_arg_t walk = { engine, &arena };
-		zfs_range_tree_walk(engine->free, engine_store_pick, &walk);
+		engine_store_pick_arg_t pick = {
+			engine->vd->vdev_children * ENGINE_STORE_PAGE,
+			engine->journal_bytes * engine->vd->vdev_children,
+			UINT64_MAX };
+		zfs_range_tree_walk(engine->free, engine_store_pick, &pick);
+		arena = pick.found;
 		if (arena == UINT64_MAX) {
 			mutex_exit(&engine->lock);
 			return (ENOSPC);
@@ -977,6 +981,9 @@ engine_journal_admit_locked(spa_t *spa, engine_hold_t *h)
 		return (ENOENT);
 	if (h->error != 0)
 		return (h->error);
+	/* Fall back to TXG sync before admitting any startup journal work. */
+	if (!engine->journal_ready)
+		return (EAGAIN);
 	for (uint_t i = 0; i < h->count; i++) {
 		engine_owner_t *e = h->owner[i];
 		if (e->aborted || engine_find(engine, e->v) != e)
