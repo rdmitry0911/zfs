@@ -1,0 +1,43 @@
+{
+  "scope": "author-run finite observations; no independent review or complete engine qualification",
+  "production_source46_manifest_sha256": "9d0ba115675bffc9e23c8f9a28d6c6ef54aa32d7622d1293b2f964bb84f59e4f",
+  "tested_vm_prerequisite": "b0de7972fbfd318d3e320345b786b776fe68b9ff",
+  "small_native_smoke": {
+    "passed": true,
+    "build": "Linux6.8.12 VM, debug, kernel+userspace build of candidate05",
+    "commands": [
+      {
+        "label": "convert",
+        "exit": 0,
+        "seconds": 15.911095130999456
+      },
+      {
+        "label": "cold-readonly",
+        "exit": 0,
+        "seconds": 2.278159281995613
+      }
+    ],
+    "binaries": {
+      ".libs/ztest": "7313179f4ad9e0793901c0f6fce433afd80cd13f0a56a3dc2367eb4f7a63311b",
+      ".libs/libzpool.so.7.0.0": "0fc07fffedfd606cef193ed9c4865cc6c9fb94e48089df6aff95fe67976400d9"
+    },
+    "certified_parity": 2,
+    "raw_members": 6,
+    "readonly_raw_unchanged": true,
+    "final_script_same_executable_ast_as_run": true
+  },
+  "historical_exact_source_checks": {
+    "kernel_build_unit_full_style": "PASS",
+    "debug_native_matrix_commands": 49,
+    "release_native_matrix_commands": 49,
+    "kernel_activation_ordered_fsync_acks": 64,
+    "native_inflight_schedules_per_flavour": 8,
+    "named_kernel_inflight_schedules": 3,
+    "native_snapshot_clone_schedules_per_flavour": 2
+  },
+  "common_fixture_comparison_run": false,
+  "complete_current_ram_or_peak_known": false,
+  "real_devices_or_power_loss_qualified": false,
+  "all_activation_or_repair_intersections_qualified": false,
+  "public_pr_head_ci_pass_claimed": false
+}
