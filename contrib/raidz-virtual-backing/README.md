@@ -101,12 +101,23 @@ Author-run local evidence for this source, not independent verification:
 | Experiment | Observed boundary |
 | --- | --- |
 | Linux 6.8.12 VM build | Kernel build, unit tests and full style pass for candidate05 |
-| Native regression matrices | Debug/release, 36 conversion/recovery commands plus 13 torn-write commands per flavour; original bounded outcome predicates retained |
+| Native regression matrices | Two configure flavours (libzpool debug in both), 36 conversion/recovery commands plus 13 torn-write commands per flavour; original bounded outcome predicates retained |
 | Live activation | Kernel run with 64 ordered fsync acknowledgements spanning activation; cold head and two snapshot payloads, journal rollover and certificate |
-| Startup space admission | Successful activation, missing catalog reserve, missing journal reserve after catalog selection; native release and actual kernel controls |
-| In-flight activation | Eight named native schedules per debug/release; three named kernel schedules for READY-delayed logical I/O, native SCL drain and real sorted scan queue |
+| Startup space admission | Successful activation, missing catalog reserve, missing journal reserve after catalog selection; native configure-disable-debug flavour and actual kernel controls |
+| In-flight activation | Eight named native schedules per configure flavour; three named kernel schedules for READY-delayed logical I/O, native SCL drain and real sorted scan queue |
 | Preactivation checkpoint | Cold native import/enable, readonly preview, refused writable rewind, fence refusal until discard, subsequent retirement/release and cold reads |
 | Snapshot/clone turnover | Two native deletion orders per flavour; held read, final-reference retirement, exact V/P exclusion, fresh ESTALE, ordinary floor/drain/release and cold head |
+
+Build qualification correction after tigerblue77's review: `config/Rules.am`
+forces `-DDEBUG -UNDEBUG -DZFS_DEBUG` for libzpool and its consumers, even
+with `configure --disable-debug`. Historical native "release" runs without
+an override therefore have libzpool debug enabled. Their finite correctness
+observations stand; they do not qualify a true-release libzpool or provide
+true-release performance measurements. A fresh release build must rebuild
+libraries and all their consumers with matching
+`LIBZPOOL_CPPFLAGS='-UDEBUG -DNDEBUG -UZFS_DEBUG'`, retain actual compiler
+commands/macro evidence, and avoid mixing ABIs. Kernel build qualification
+is separate.
 
 `smoke.py` exercises a smaller subset. Large raw fixtures, detailed observer
 campaigns and original failure logs remain in the local evidence archive;

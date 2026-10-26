@@ -39,5 +39,15 @@
   "complete_current_ram_or_peak_known": false,
   "real_devices_or_power_loss_qualified": false,
   "all_activation_or_repair_intersections_qualified": false,
-  "public_pr_head_ci_pass_claimed": false
+  "public_pr_head_ci_pass_claimed": false,
+  "native_build_qualification": {
+    "configure_flavours": [
+      "--enable-debug",
+      "--disable-debug"
+    ],
+    "libzpool_debug_forced_in_both": true,
+    "true_release_libzpool_qualified": false,
+    "required_release_override": "LIBZPOOL_CPPFLAGS=-UDEBUG -DNDEBUG -UZFS_DEBUG",
+    "scope": "historical native correctness observations; no true-release performance claim"
+  }
 }
