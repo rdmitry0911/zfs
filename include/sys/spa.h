@@ -403,7 +403,7 @@ typedef struct blkptr {
 /*
  * Note, for gang blocks, DVA_GET_ASIZE() is the total space allocated for
  * this gang DVA including its children BP's.  The space allocated at this
- * DVA's vdev/offset is vdev_gang_header_asize(vdev).
+ * DVA's vdev/offset is vdev_gang_header_asize(vdev, physical birth).
  */
 #define	DVA_GET_ASIZE(dva)	\
 	BF64_GET_SB((dva)->dva_word[0], 0, SPA_ASIZEBITS, SPA_MINBLOCKSHIFT, 0)
@@ -1125,6 +1125,7 @@ extern metaslab_class_t *spa_special_embedded_log_class(spa_t *spa);
 extern metaslab_class_t *spa_dedup_class(spa_t *spa);
 extern metaslab_class_t *spa_preferred_class(spa_t *spa, const zio_t *zio);
 extern boolean_t spa_special_has_ddt(spa_t *spa);
+extern boolean_t spa_dynamic_gang_header(spa_t *spa);
 
 extern void spa_evicting_os_register(spa_t *, objset_t *os);
 extern void spa_evicting_os_deregister(spa_t *, objset_t *os);
@@ -1173,11 +1174,14 @@ extern boolean_t spa_has_spare(spa_t *, uint64_t guid);
 extern uint64_t dva_get_dsize_sync(spa_t *spa, const dva_t *dva);
 extern uint64_t bp_get_dsize_sync(spa_t *spa, const blkptr_t *bp);
 extern uint64_t bp_get_dsize(spa_t *spa, const blkptr_t *bp);
+extern boolean_t bp_asize_is_current(spa_t *spa, const blkptr_t *bp,
+    uint64_t txg);
 extern boolean_t spa_has_dedup(spa_t *spa);
 extern boolean_t spa_has_slogs(spa_t *spa);
 extern boolean_t spa_has_special(spa_t *spa);
 extern boolean_t spa_is_root(spa_t *spa);
 extern boolean_t spa_writeable(spa_t *spa);
+extern boolean_t spa_self_heal_allowed(spa_t *spa);
 extern boolean_t spa_has_pending_synctask(spa_t *spa);
 extern int spa_maxblocksize(spa_t *spa);
 extern int spa_maxdnodesize(spa_t *spa);

@@ -1294,8 +1294,10 @@ zfs_blkptr_verify(spa_t *spa, const blkptr_t *bp,
 		}
 		uint64_t offset = DVA_GET_OFFSET(dva);
 		uint64_t asize = DVA_GET_ASIZE(dva);
-		if (DVA_GET_GANG(dva))
-			asize = vdev_gang_header_asize(vd);
+		if (DVA_GET_GANG(dva)) {
+			asize = vdev_gang_header_asize(vd,
+			    BP_GET_PHYSICAL_BIRTH(bp));
+		}
 		if (unlikely(offset + asize > vd->vdev_asize)) {
 			errors += zfs_blkptr_verify_log(spa, bp, blk_verify,
 			    "blkptr at %px DVA %u has invalid OFFSET %llu",
@@ -1312,7 +1314,6 @@ zfs_blkptr_verify(spa_t *spa, const blkptr_t *bp,
 boolean_t
 zfs_dva_valid(spa_t *spa, const dva_t *dva, const blkptr_t *bp)
 {
-	(void) bp;
 	uint64_t vdevid = DVA_GET_VDEV(dva);
 
 	if (vdevid >= spa->spa_root_vdev->vdev_children)
@@ -1333,7 +1334,7 @@ zfs_dva_valid(spa_t *spa, const dva_t *dva, const blkptr_t *bp)
 	uint64_t asize = DVA_GET_ASIZE(dva);
 
 	if (DVA_GET_GANG(dva))
-		asize = vdev_gang_header_asize(vd);
+		asize = vdev_gang_header_asize(vd, BP_GET_PHYSICAL_BIRTH(bp));
 	if (offset + asize > vd->vdev_asize)
 		return (B_FALSE);
 
@@ -1484,7 +1485,6 @@ zio_free_sync(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 
 	metaslab_check_free(spa, bp);
 	arc_freed(spa, bp);
-	dsl_scan_freed(spa, bp);
 
 	if (BP_IS_GANG(bp) ||
 	    BP_GET_DEDUP(bp) ||
@@ -1502,6 +1502,7 @@ zio_free_sync(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 		    ZIO_TYPE_FREE, ZIO_PRIORITY_NOW,
 		    flags, NULL, 0, NULL, ZIO_STAGE_OPEN, stage));
 	} else {
+		dsl_scan_freed(spa, bp);
 		metaslab_free(spa, bp, txg, B_FALSE);
 		return (NULL);
 	}
@@ -1737,11 +1738,11 @@ zio_vdev_child_io(zio_t *pio, blkptr_t *bp, vdev_t *vd, uint64_t offset,
 			 * The batch is dispatched to the taskq chosen for
 			 * whichever member arrives last, so they all have to
 			 * choose the same one.  The flags that steer the choice
-			 * are vdev-inherited, and type and priority come from
-			 * the parent at every call site.
+			 * are vdev-inherited, and type comes from the parent at
+			 * every call site.  Priority can mismatch though, since
+			 * zio_change_priority() may change it at any time.
 			 */
 			ASSERT3U(zio->io_type, ==, pio->io_type);
-			ASSERT3U(zio->io_priority, ==, pio->io_priority);
 			zio_batch_join(pio->io_child_batch, zio);
 		}
 	}
@@ -1932,7 +1933,12 @@ zio_write_bp_init(zio_t *zio)
 		 */
 		if (!BP_IS_HOLE(bp) && zp->zp_nopwrite) {
 			ASSERT(!zp->zp_dedup);
-			ASSERT3U(BP_GET_CHECKSUM(bp), ==, zp->zp_checksum);
+			/*
+			 * A data-less override (Direct I/O) is written with
+			 * the WP_NOFILL policy, whose checksum is off.
+			 */
+			IMPLY(zio->io_abd != NULL,
+			    BP_GET_CHECKSUM(bp) == zp->zp_checksum);
 			zio->io_flags |= ZIO_FLAG_NOPWRITE;
 			return (zio);
 		}
@@ -3289,8 +3295,7 @@ static void
 zio_gang_tree_assemble(zio_t *gio, blkptr_t *bp, zio_gang_node_t **gnpp)
 {
 	uint64_t gangblocksize = UINT64_MAX;
-	if (spa_feature_is_active(gio->io_spa,
-	    SPA_FEATURE_DYNAMIC_GANG_HEADER)) {
+	if (spa_dynamic_gang_header(gio->io_spa)) {
 		spa_config_enter(gio->io_spa, SCL_VDEV, FTAG, RW_READER);
 		for (int dva = 0; dva < BP_GET_NDVAS(bp); dva++) {
 			vdev_t *vd = vdev_lookup_top(gio->io_spa,
@@ -3324,8 +3329,11 @@ zio_gang_tree_assemble_done(zio_t *zio)
 	ASSERT(gio == zio_unique_parent(zio));
 	ASSERT(list_is_empty(&zio->io_child_list));
 
-	if (zio->io_error)
+	if (zio->io_error) {
+		/* free the ABD from zio_gang_tree_assemble() on failure too */
+		abd_free(zio->io_abd);
 		return;
+	}
 
 	/* this ABD was created from a linear buf in zio_gang_tree_assemble */
 	if (BP_SHOULD_BYTESWAP(bp))
@@ -3485,6 +3493,20 @@ zio_update_feature(void *arg, dmu_tx_t *tx)
 	spa_feature_incr(spa, (spa_feature_t)(uintptr_t)arg, tx);
 }
 
+/*
+ * An allocation fails with ENOSPC when no vdev in the class can be
+ * written, too. Report that as EIO to a zio that may fail. Other
+ * zios keep ENOSPC, which makes zio_done() suspend the pool.
+ */
+static int
+zio_alloc_error(zio_t *zio, metaslab_class_t *mc, int error)
+{
+	if (error == ENOSPC && (zio->io_flags & ZIO_FLAG_CANFAIL) &&
+	    metaslab_class_unwritable(mc))
+		return (SET_ERROR(EIO));
+	return (error);
+}
+
 static zio_t *
 zio_write_gang_block(zio_t *pio, metaslab_class_t *mc)
 {
@@ -3536,7 +3558,7 @@ zio_write_gang_block(zio_t *pio, metaslab_class_t *mc)
 	    bp, gbh_copies, txg, pio == gio ? NULL : gio->io_bp, flags,
 	    ZIO_ALLOC_LIST(pio), pio->io_allocator, pio, &candidate);
 	if (error) {
-		pio->io_error = error;
+		pio->io_error = zio_alloc_error(pio, mc, error);
 		return (pio);
 	}
 	if (spa_feature_is_active(spa, SPA_FEATURE_DYNAMIC_GANG_HEADER))
@@ -4860,7 +4882,7 @@ again:
 			    spa_name(spa), zio, (u_longlong_t)zio->io_size,
 			    error);
 		}
-		zio->io_error = error;
+		zio->io_error = zio_alloc_error(zio, mc, error);
 	} else if (zio->io_prop.zp_rewrite) {
 		/*
 		 * For rewrite operations, preserve the logical birth time
@@ -4878,6 +4900,11 @@ again:
 static zio_t *
 zio_dva_free(zio_t *zio)
 {
+	/*
+	 * A dedup or cloned block may still have other references, so its
+	 * queued scan I/O is dropped only once its space is freed here.
+	 */
+	dsl_scan_freed(zio->io_spa, zio->io_bp);
 	metaslab_free(zio->io_spa, zio->io_bp, zio->io_txg, B_FALSE);
 
 	return (zio);

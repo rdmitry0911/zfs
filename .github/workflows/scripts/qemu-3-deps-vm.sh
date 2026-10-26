@@ -280,7 +280,6 @@ case "$1" in
     sudo -E rc-update add qemu-guest-agent
     sudo -E rc-update add nfs
     sudo -E rc-update add samba
-    sudo -E rc-update add dhcpcd
     # Remove services related to cloud-init.
     sudo -E rc-update del cloud-init-local boot
     sudo -E rc-update del cloud-init default
@@ -359,7 +358,16 @@ case "$1" in
 esac
 
 case "$1" in
-  alpine*|archlinux|freebsd*)
+  alpine*)
+    # kmemleak on and CPU mitigations off by default. The -nokmemleak
+    # and -mitigations suffixes keep the kernel's defaults instead.
+    kmemleak=on mitigations=off
+    [[ "$1" == *-nokmemleak* ]] && kmemleak=off
+    [[ "$1" == *-mitigations* ]] && mitigations=auto
+    opts="kmemleak=$kmemleak mitigations=$mitigations"
+    sudo sed -i "/^\s*cmdline:/s/\$/ $opts/" /boot/limine/limine.conf
+    ;;
+  archlinux|freebsd*)
     true
     ;;
   *)

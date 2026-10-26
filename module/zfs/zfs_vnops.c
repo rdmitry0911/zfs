@@ -18,6 +18,7 @@
  * Copyright (c) 2021, 2022 by Pawel Jakub Dawidek
  * Copyright (c) 2025, Rob Norris <robn@despairlabs.com>
  * Copyright (c) 2025, Klara, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 /* Portions Copyright 2007 Jeremy Teo */
@@ -1118,7 +1119,7 @@ zfs_write(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
  * Returns B_TRUE if block should be skipped.
  */
 static boolean_t
-zfs_rewrite_skip(dmu_buf_t *db, objset_t *os, uint64_t flags)
+zfs_rewrite_skip(dmu_buf_t *db, objset_t *os, uint64_t flags, uint64_t txg)
 {
 	/*
 	 * This may be slightly stale and racy, but should be OK for
@@ -1135,6 +1136,11 @@ zfs_rewrite_skip(dmu_buf_t *db, objset_t *os, uint64_t flags)
 
 	if (flags & ZFS_REWRITE_SKIP_BRT) {
 		if (brt_maybe_exists(os->os_spa, bp))
+			return (B_TRUE);
+	}
+
+	if (flags & ZFS_REWRITE_SKIP_CURRENT_ASIZE) {
+		if (bp_asize_is_current(os->os_spa, bp, txg))
 			return (B_TRUE);
 	}
 
@@ -1161,7 +1167,7 @@ zfs_rewrite(znode_t *zp, uint64_t off, uint64_t len, uint64_t flags,
 
 #define	ZFS_REWRITE_VALID_FLAGS \
 	(ZFS_REWRITE_PHYSICAL | ZFS_REWRITE_SKIP_SNAPSHOT | \
-	ZFS_REWRITE_SKIP_BRT)
+	ZFS_REWRITE_SKIP_BRT | ZFS_REWRITE_SKIP_CURRENT_ASIZE)
 
 	if ((flags & ~ZFS_REWRITE_VALID_FLAGS) != 0 || arg != 0)
 		return (SET_ERROR(EINVAL));
@@ -1265,7 +1271,8 @@ zfs_rewrite(znode_t *zp, uint64_t off, uint64_t len, uint64_t flags,
 			if (dmu_buf_is_dirty(dbp[i], tx))
 				continue;
 
-			if (zfs_rewrite_skip(dbp[i], zfsvfs->z_os, flags))
+			if (zfs_rewrite_skip(dbp[i], zfsvfs->z_os, flags,
+			    dmu_tx_get_txg(tx)))
 				continue;
 
 			nw += dbp[i]->db_size;
@@ -1397,10 +1404,19 @@ zfs_get_data(void *arg, uint64_t gen, lr_write_t *lr, char *buf,
 	ASSERT3U(size, !=, 0);
 
 	/*
-	 * Nothing to do if the file has been removed
+	 * Nothing to do if the file has been removed.  Any other failure
+	 * to get the znode (e.g. EBUSY on FreeBSD while the file system is
+	 * being unmounted, or ENOENT because a znode couldn't be allocated
+	 * for an object that still exists) is not a sign that the file is
+	 * gone: report EIO, and the ZIL waits for the txg to sync instead.
 	 */
-	if (zfs_zget(zfsvfs, object, &zp) != 0)
-		return (SET_ERROR(ENOENT));
+	error = zfs_zget(zfsvfs, object, &zp);
+	if (error != 0) {
+		if (error == ENOENT &&
+		    dmu_object_info(os, object, NULL) == ENOENT)
+			return (SET_ERROR(ENOENT));
+		return (SET_ERROR(EIO));
+	}
 	if (zp->z_unlinked) {
 		/*
 		 * Release the vnode asynchronously as we currently have the

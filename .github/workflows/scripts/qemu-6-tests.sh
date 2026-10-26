@@ -252,7 +252,9 @@ sudo dmesg -c > dmesg-prerun.txt
 mount > mount.txt
 df -h > df-prerun.txt
 RV=0
-$TDIR/zfs-tests.sh -vKO -s 3GB -T $TAGS || RV=$?
+KMEMLEAK=""
+grep -qw kmemleak=on /proc/cmdline && KMEMLEAK="-m"
+$TDIR/zfs-tests.sh -vKO $KMEMLEAK -s 3GB -T $TAGS || RV=$?
 
 df -h > df-postrun.txt
 echo $RV > tests-exitcode.txt

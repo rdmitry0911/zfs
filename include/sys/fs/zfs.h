@@ -939,6 +939,8 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_NPARITY		"nparity"
 #define	ZPOOL_CONFIG_RAIDZ_EXPANDING	"raidz_expanding"
 #define	ZPOOL_CONFIG_RAIDZ_EXPAND_TXGS	"raidz_expand_txgs"
+#define	ZPOOL_CONFIG_RAIDZ_PARITY_EPOCHS \
+	"org.openzfs:raidz_parity_epochs"
 #define	ZPOOL_CONFIG_HOSTID		"hostid"
 #define	ZPOOL_CONFIG_HOSTNAME		"hostname"
 #define	ZPOOL_CONFIG_LOADED_TIME	"initial_load_time"
@@ -974,6 +976,11 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_UNSUP_FEAT		"unsup_feat"	/* not stored on disk */
 #define	ZPOOL_CONFIG_ENABLED_FEAT	"enabled_feat"	/* not stored on disk */
 #define	ZPOOL_CONFIG_CAN_RDONLY		"can_rdonly"	/* not stored on disk */
+/* A RAID-Z parity-epoch table refused the import; not stored on disk */
+#define	ZPOOL_CONFIG_RAIDZ_EPOCHS_RDONLY	"raidz_epochs_rdonly"
+#define	ZPOOL_CONFIG_RAIDZ_EPOCHS_EXPANDED	"raidz_epochs_expanded"
+/* raidz_ignore_parity_epochs refused it; not stored on disk */
+#define	ZPOOL_CONFIG_RAIDZ_EPOCHS_IGNORED	"raidz_epochs_ignored"
 #define	ZPOOL_CONFIG_FEATURES_FOR_READ	"features_for_read"
 #define	ZPOOL_CONFIG_FEATURE_STATS	"feature_stats"	/* not stored on disk */
 #define	ZPOOL_CONFIG_ERRATA		"errata"	/* not stored on disk */
@@ -1075,6 +1082,8 @@ typedef struct zpool_load_policy {
 	"org.openzfs:raidz_expand_end_time"
 #define	VDEV_TOP_ZAP_RAIDZ_EXPAND_BYTES_COPIED \
 	"org.openzfs:raidz_expand_bytes_copied"
+#define	VDEV_TOP_ZAP_RAIDZ_PARITY_EPOCHS \
+	"org.openzfs:raidz_parity_epochs"
 
 /* vdev metaslab allocation bias */
 #define	VDEV_ALLOC_BIAS_LOG		"log"
@@ -1777,6 +1786,7 @@ typedef struct zfs_rewrite_args {
 #define	ZFS_REWRITE_PHYSICAL		0x1 /* Preserve logical birth time. */
 #define	ZFS_REWRITE_SKIP_SNAPSHOT	0x2 /* Skip snapshot-shared blocks. */
 #define	ZFS_REWRITE_SKIP_BRT		0x4 /* Skip BRT-cloned blocks. */
+#define	ZFS_REWRITE_SKIP_CURRENT_ASIZE	0x8 /* Skip blocks of current asize. */
 
 #define	ZFS_IOC_REWRITE		_IOW(0x83, 3, zfs_rewrite_args_t)
 
@@ -1823,6 +1833,8 @@ typedef enum {
 	ZFS_ERR_STREAM_LARGE_MICROZAP,
 	ZFS_ERR_TOO_MANY_SITOUTS,
 	ZFS_ERR_NO_USER_NS_SUPPORT,
+	ZFS_ERR_CRYPTO_KEY_MISMATCH,
+	ZFS_ERR_RAIDZ_EXPAND_TOO_WIDE,
 } zfs_errno_t;
 
 /*
