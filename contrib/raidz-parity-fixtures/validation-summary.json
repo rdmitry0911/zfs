@@ -1,0 +1,110 @@
+{
+  "scope": "neutral userspace fixture creation/data verification only; no mover/performance comparison",
+  "passed": true,
+  "platform": "Linux 6.8.12 VM, prebuilt candidate05 debug libzpool",
+  "production_source46_manifest_sha256": "9d0ba115675bffc9e23c8f9a28d6c6ef54aa32d7622d1293b2f964bb84f59e4f",
+  "production_source46_match": true,
+  "effective_driver_macros": {
+    "DEBUG": true,
+    "ZFS_DEBUG": true,
+    "NDEBUG": false
+  },
+  "binary_sha256": "7fe86f71368dad74ea9b04de9b093a19082a7843e028e53b86dc190bac858a55",
+  "library_sha256": {
+    "libzpool.so.7.0.0": "0fc07fffedfd606cef193ed9c4865cc6c9fb94e48089df6aff95fe67976400d9",
+    "libzfs_core.so": "3c47480f08e16bdc84b955449925f68a55b9b8f37d8255719b750123b7e3605b",
+    "libnvpair.so": "97c4f9264aea3cead74cbd78f3727b8aee29b7df5cb5bc0446147249d10b1504",
+    "librange_tree.a": "0c760b2225d05640eca423f1f4abff54d097807dd4e0bb498f2f9b3d65cb9f09"
+  },
+  "fixture_source_sha256": "dc655a0c6c9dfcd9583a6f7dc3f2fe3deb67d303fc2575209707e84488589398",
+  "runner_sha256": "b21c647a11101a3da5ba535829577cc493571b3b1f0ba10de97936447dd0452d",
+  "input_cases": 8,
+  "input_commands": 16,
+  "input_payload_per_case": 13107200,
+  "deletion_cases": 8,
+  "deletion_commands": 32,
+  "deletion_payload_per_case": 1310720,
+  "independent_c_read_sha_matches_python_expectation": true,
+  "readonly_raw_members_unchanged": true,
+  "negative_wrong_expected_sha_rejected": true,
+  "raw_fixtures_and_logs_retained": true,
+  "true_release_qualified": false,
+  "peer_prototype_independently_run": false,
+  "migration_comparison_run": false,
+  "extended_mix_qualified": false,
+  "kernel_runtime_test": false,
+  "cases": [
+    {
+      "record_kib": 128,
+      "retained_pct": 0,
+      "retained_bytes": 0,
+      "head_bytes": 13107200,
+      "expected_retained_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_head_sha256": "94d01c3d8045c1047fa93b4130911e9b310f307c89f2dadb7b5493ca07e441c7",
+      "passed": true
+    },
+    {
+      "record_kib": 128,
+      "retained_pct": 10,
+      "retained_bytes": 1310720,
+      "head_bytes": 11796480,
+      "expected_retained_sha256": "05255a2d979e6c70bc50716f38fb8773b93ee6a1c16d57ed21feb30004566db7",
+      "expected_head_sha256": "ae2e9267336248011c7b4f176f26166ac62535b241bfad07d3d64ef9a990163e",
+      "passed": true
+    },
+    {
+      "record_kib": 128,
+      "retained_pct": 30,
+      "retained_bytes": 3932160,
+      "head_bytes": 9175040,
+      "expected_retained_sha256": "8b0bb624bf2ecc74f939897759ab5f0f548a862453bb6b7aebd1b4d80a32ab0b",
+      "expected_head_sha256": "9f3aebd54cfae7300386c12e965ea8051f17aebe7d7672593ca9199d2c518ac7",
+      "passed": true
+    },
+    {
+      "record_kib": 128,
+      "retained_pct": 100,
+      "retained_bytes": 13107200,
+      "head_bytes": 0,
+      "expected_retained_sha256": "50b788ee4b94ccf0d21ebbf5f278e259f57255b44dc7cde91e991dff2c0ee65f",
+      "expected_head_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "passed": true
+    },
+    {
+      "record_kib": 16,
+      "retained_pct": 0,
+      "retained_bytes": 0,
+      "head_bytes": 13107200,
+      "expected_retained_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_head_sha256": "94d01c3d8045c1047fa93b4130911e9b310f307c89f2dadb7b5493ca07e441c7",
+      "passed": true
+    },
+    {
+      "record_kib": 16,
+      "retained_pct": 10,
+      "retained_bytes": 1310720,
+      "head_bytes": 11796480,
+      "expected_retained_sha256": "05255a2d979e6c70bc50716f38fb8773b93ee6a1c16d57ed21feb30004566db7",
+      "expected_head_sha256": "ae2e9267336248011c7b4f176f26166ac62535b241bfad07d3d64ef9a990163e",
+      "passed": true
+    },
+    {
+      "record_kib": 16,
+      "retained_pct": 30,
+      "retained_bytes": 3932160,
+      "head_bytes": 9175040,
+      "expected_retained_sha256": "8b0bb624bf2ecc74f939897759ab5f0f548a862453bb6b7aebd1b4d80a32ab0b",
+      "expected_head_sha256": "9f3aebd54cfae7300386c12e965ea8051f17aebe7d7672593ca9199d2c518ac7",
+      "passed": true
+    },
+    {
+      "record_kib": 16,
+      "retained_pct": 100,
+      "retained_bytes": 13107200,
+      "head_bytes": 0,
+      "expected_retained_sha256": "50b788ee4b94ccf0d21ebbf5f278e259f57255b44dc7cde91e991dff2c0ee65f",
+      "expected_head_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "passed": true
+    }
+  ]
+}
