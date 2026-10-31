@@ -1,0 +1,367 @@
+{
+  "passed": true,
+  "profiles": [
+    {
+      "profile": "release",
+      "report_sha256": "d855dc1d09b892c16ec70cc12d285741e2f6206e4313ade66701dc39b9a9bbdf",
+      "cases": 24,
+      "logs_rehashed": 384,
+      "payload_records_independently_verified": 396,
+      "readonly_hash_pairs_checked": 96,
+      "build_abi_matches": true,
+      "timer_io_scope_matches": true,
+      "observations": [
+        {
+          "record_kib": 128,
+          "retained_pct": 0,
+          "repeat": 0,
+          "cold_owners": 350,
+          "cold_retired_owners": 81
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 10,
+          "repeat": 0,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 30,
+          "repeat": 0,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 100,
+          "repeat": 0,
+          "cold_owners": 373,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 0,
+          "repeat": 0,
+          "cold_owners": 1053,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 10,
+          "repeat": 0,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 30,
+          "repeat": 0,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 100,
+          "repeat": 0,
+          "cold_owners": 1073,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 0,
+          "repeat": 1,
+          "cold_owners": 353,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 10,
+          "repeat": 1,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 30,
+          "repeat": 1,
+          "cold_owners": 372,
+          "cold_retired_owners": 81
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 100,
+          "repeat": 1,
+          "cold_owners": 373,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 0,
+          "repeat": 1,
+          "cold_owners": 1053,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 10,
+          "repeat": 1,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 30,
+          "repeat": 1,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 100,
+          "repeat": 1,
+          "cold_owners": 1073,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 0,
+          "repeat": 2,
+          "cold_owners": 353,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 10,
+          "repeat": 2,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 30,
+          "repeat": 2,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 100,
+          "repeat": 2,
+          "cold_owners": 370,
+          "cold_retired_owners": 81
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 0,
+          "repeat": 2,
+          "cold_owners": 1053,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 10,
+          "repeat": 2,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 30,
+          "repeat": 2,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 100,
+          "repeat": 2,
+          "cold_owners": 1073,
+          "cold_retired_owners": 84
+        }
+      ]
+    },
+    {
+      "profile": "debug",
+      "report_sha256": "fc26f2090bbab0e5701257902e9ad0a8765ae058240d426cb25156c427636e4c",
+      "cases": 24,
+      "logs_rehashed": 384,
+      "payload_records_independently_verified": 396,
+      "readonly_hash_pairs_checked": 96,
+      "build_abi_matches": true,
+      "timer_io_scope_matches": true,
+      "observations": [
+        {
+          "record_kib": 128,
+          "retained_pct": 0,
+          "repeat": 0,
+          "cold_owners": 353,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 10,
+          "repeat": 0,
+          "cold_owners": 372,
+          "cold_retired_owners": 81
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 30,
+          "repeat": 0,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 100,
+          "repeat": 0,
+          "cold_owners": 373,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 0,
+          "repeat": 0,
+          "cold_owners": 1053,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 10,
+          "repeat": 0,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 30,
+          "repeat": 0,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 100,
+          "repeat": 0,
+          "cold_owners": 1073,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 0,
+          "repeat": 1,
+          "cold_owners": 353,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 10,
+          "repeat": 1,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 30,
+          "repeat": 1,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 100,
+          "repeat": 1,
+          "cold_owners": 373,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 0,
+          "repeat": 1,
+          "cold_owners": 1053,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 10,
+          "repeat": 1,
+          "cold_owners": 1072,
+          "cold_retired_owners": 81
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 30,
+          "repeat": 1,
+          "cold_owners": 1072,
+          "cold_retired_owners": 81
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 100,
+          "repeat": 1,
+          "cold_owners": 1070,
+          "cold_retired_owners": 81
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 0,
+          "repeat": 2,
+          "cold_owners": 350,
+          "cold_retired_owners": 81
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 10,
+          "repeat": 2,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 30,
+          "repeat": 2,
+          "cold_owners": 375,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 128,
+          "retained_pct": 100,
+          "repeat": 2,
+          "cold_owners": 373,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 0,
+          "repeat": 2,
+          "cold_owners": 1053,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 10,
+          "repeat": 2,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 30,
+          "repeat": 2,
+          "cold_owners": 1075,
+          "cold_retired_owners": 84
+        },
+        {
+          "record_kib": 16,
+          "retained_pct": 100,
+          "repeat": 2,
+          "cold_owners": 1073,
+          "cold_retired_owners": 84
+        }
+      ]
+    }
+  ],
+  "source_commit": "63202c07a5e044875d9a12217e802e27930e4266",
+  "raw_members_not_rehashed": "recorded before/after pairs checked; full raw images retained"
+}

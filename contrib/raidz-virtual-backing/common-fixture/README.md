@@ -18,6 +18,21 @@ consumer and retain verbose compiler commands. `--disable-debug` alone does
 not establish a release libzpool ABI. The companion `build.py` creates both
 native drivers and records their source, macro, library and binary identities.
 
+For the library build used here, in a fresh debug checkout:
+
+```sh
+./autogen.sh
+./configure --with-config=user --enable-debug --prefix=/usr/local
+make -j2 V=1 LIBZPOOL_CPPFLAGS='-DDEBUG -UNDEBUG -DZFS_DEBUG' \
+    libzpool.la libzfs_core.la libnvpair.la librange_tree.la \
+    > /absolute/path/to/debug-build.log 2>&1
+```
+
+In a separate fresh release checkout, use `--disable-debug` and
+`LIBZPOOL_CPPFLAGS='-UDEBUG -DNDEBUG -UZFS_DEBUG'` with the same targets.
+These builds create the required userspace libraries; no installation or
+kernel/module replacement is needed. Then build the matching drivers:
+
 ```sh
 python3 contrib/raidz-virtual-backing/common-fixture/build.py \
     --tree /absolute/path/to/debug-tree --profile debug \
@@ -94,3 +109,17 @@ Parser acceptance tests need Python only:
 python3 contrib/raidz-virtual-backing/common-fixture/test_report.py
 python3 -O contrib/raidz-virtual-backing/common-fixture/test_report.py
 ```
+
+After both full profiles pass, generate the combined report:
+
+```sh
+python3 contrib/raidz-virtual-backing/common-fixture/summarize.py \
+    --debug /absolute/path/to/debug-results/report.json \
+    --release /absolute/path/to/release-results/report.json \
+    --output /absolute/path/to/new-combined-results
+```
+
+The summary rejects incomplete or duplicate case grids, mismatched build
+macros, missing readonly phases and inconsistent owner/space accounting.
+The [31 October results](results-20261031/RESULTS.md) include both raw JSON
+reports and the finite author-run validation record.

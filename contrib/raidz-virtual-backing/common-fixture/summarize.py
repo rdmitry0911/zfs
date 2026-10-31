@@ -83,6 +83,14 @@ def validate(report):
                     census['weak_current'] == 0 and
                     census['weak_retired'] == 0,
                     'incomplete conversion at ' + phase)
+            require(census['owners'] == census['current_versions'] +
+                    census['retired_owners'],
+                    'owner population identity failed at ' + phase)
+            partition = sum(census[key] for key in (
+                'legacy_bytes', 'current_bytes', 'retired_bytes',
+                'store_bytes', 'journal_bytes', 'free_bytes'))
+            require(partition == value(row, phase, 'native_space_bytes'),
+                    'physical allocation partition failed at ' + phase)
         require(value(row, 'convert', 'heap_sample_count') > 0,
                 'heap sampler did not observe mover')
 
@@ -94,7 +102,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     reports = {}
-    inputs = {}
+    inputs = {'summary_script_sha256': sha(Path(__file__).resolve())}
     for profile, path in (('debug', args.debug), ('release', args.release)):
         report = json.loads(path.read_text())
         require(report.get('profile') == profile, 'profile mismatch')
@@ -180,6 +188,14 @@ def main():
         'and cold snapshots are recorded. Snapshot deletion includes admin',
         'metadata updates, ordinary txgs and export, so its net row delta',
         'does not isolate the deleted payload population.',
+        'Retired bytes include pending strong metadata versions; they are',
+        'not necessarily the cost of snapshot-retained old data. Native',
+        'allocation fields are vdev_stat observations: readonly imports may',
+        'leave these native counters unloaded and report zero. Use the',
+        'writable before-mover snapshot for the initial native inventory.',
+        'Native allocation accounts for the virtual domain; physical copy',
+        'space is described by the engine census. These are not disjoint',
+        'charges that can be added together.',
         '',
         'Catalog/journal bytes are raw reserved extent accounting across',
         'the members, not live MOS table bytes or an in-memory charge.',
@@ -188,14 +204,28 @@ def main():
         'mmap-backed allocations and is not a complete allocator or kernel',
         'RAM peak. Process-lifetime ru_maxrss is reported separately.', '',
         'The peer results were obtained on another VM. Shared inputs make',
-        'the behavior and row populations comparable; these times do not',
+        'the input workload reproducible. Counting coverage also differs:',
+        'virtual/backing includes MOS and subsequent paired allocations,',
+        'whereas the redirect table excludes MOS. Row differences therefore',
+        'include those policy and population differences. These times do not',
         'establish a three-way speedup on one machine. Host page cache was',
         'not flushed; native processes ran sequentially with niceness +10.',
+        'Our ARC cap is 256 MiB; the 29 October peer report used its default',
+        'ARC cap of 5,164,007,424 bytes and a nominal 10 ms heap sampler.',
+        'Its physical_rewrite-alignment rerun is pending separately.',
+        '[Peer report](https://github.com/tigerblue77/zfs/blob/98dc0fa/'
+        'contrib/raidz-redirect-spike/fixture-results-20261029.txt).',
         '',
         'Clones, dedup/BRT, keyless ZIL, gang/multi-DVA, crash/full-pool and',
         'replacement/kernel qualification remain outside this core matrix.',
-        'Raw images and complete logs remain in the author VM; the published',
-        'reports retain all member hashes and process-output hashes.', '',
+        'Raw images remain in the author VM. Process logs, library build',
+        'logs and macro dumps are published in the compressed archive.', '',
+        '## Artifacts', '',
+        '[Release raw JSON](report-release.json), '
+        '[debug raw JSON](report-debug.json),',
+        '[process/build logs](raw-logs-20261031.tar.gz),',
+        '[separate audit](independent-audit-20261031.json),',
+        '[validation record](VALIDATION.md).', '',
     ]
     (args.output / 'RESULTS.md').write_text('\n'.join(lines))
     (args.output / 'inputs.json').write_text(

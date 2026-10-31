@@ -1,0 +1,11 @@
+{
+  "summary_script_sha256": "9580642e31c3d397cbba2073016e4271dddd214afafdce4f952fff291a88ce67",
+  "debug": {
+    "report_sha256": "fc26f2090bbab0e5701257902e9ad0a8765ae058240d426cb25156c427636e4c",
+    "source46_sha256": "9d0ba115675bffc9e23c8f9a28d6c6ef54aa32d7622d1293b2f964bb84f59e4f"
+  },
+  "release": {
+    "report_sha256": "d855dc1d09b892c16ec70cc12d285741e2f6206e4313ade66701dc39b9a9bbdf",
+    "source46_sha256": "9d0ba115675bffc9e23c8f9a28d6c6ef54aa32d7622d1293b2f964bb84f59e4f"
+  }
+}
