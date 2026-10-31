@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: CDDL-1.0
+
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# https://opensource.org/license/CDDL-1.0.
 """Validate both complete profiles and publish the common-fixture summary."""
 
 import argparse
@@ -114,9 +123,10 @@ def main():
         report = reports[profile]
         lines += [
             '## ' + profile.capitalize(), '',
-            '| block KiB | retained % | cold mapping owners | after drop | '
+            '| block KiB | retained % | cold current mappings | '
+            'cold retired owners | after-drop current mappings | '
             'whole mover s | sweep + final fence s |',
-            '|---|---|---|---|---|---|',
+            '|---|---|---|---|---|---|---|',
         ]
         for record in (128, 16):
             for retained in (0, 10, 30, 100):
@@ -127,11 +137,13 @@ def main():
                 def data(phase, key):
                     return [value(r, phase, key) for r in rows]
 
-                lines.append('| %d | %d | %s | %s | %s | %s |' % (
+                lines.append('| %d | %d | %s | %s | %s | %s | %s |' % (
                     record, retained,
-                    span(data('converted-readonly', 'census.owners'),
+                    span(data('converted-readonly', 'census.current_versions'),
                          decimals=0),
-                    span(data('dropped-readonly', 'census.owners'),
+                    span(data('converted-readonly', 'census.retired_owners'),
+                         decimals=0),
+                    span(data('dropped-readonly', 'census.current_versions'),
                          decimals=0),
                     span(data('convert', 'mover_total_s')),
                     span(data('convert', 'elapsed_s'))))
@@ -162,9 +174,12 @@ def main():
         'fencing, certification and census; it excludes payload checking.',
         'The converter I/O window begins after activation/epoch and ends',
         'after final census. Raw reports retain its separate counters and',
-        'the inclusive mover I/O window. Cold owners include metadata and',
-        'new allocations paired by this prototype; they are not a count',
-        'of user data blocks alone. Hot and cold counts are both recorded.',
+        'the inclusive mover I/O window. Current mappings include metadata',
+        'and new allocations paired by this prototype. The total owners',
+        'counter also includes retired owners; all three counters and hot',
+        'and cold snapshots are recorded. Snapshot deletion includes admin',
+        'metadata updates, ordinary txgs and export, so its net row delta',
+        'does not isolate the deleted payload population.',
         '',
         'Catalog/journal bytes are raw reserved extent accounting across',
         'the members, not live MOS table bytes or an in-memory charge.',
