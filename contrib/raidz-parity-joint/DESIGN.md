@@ -360,8 +360,14 @@ converter walks the MOS, then each dataset with
 `traverse_dataset_resume()`, in slices that each start from a fresh root
 (`vb:vdev_reloc_convert.c:903-955`). The first evidence asked for (Q6 of
 #2), the traversal timed against a scrub, is about the same for
-virtual/backing (4 s against 4-5 s, 22 October) and not yet measured for
-redirect.
+virtual/backing (4 s against 4-5 s, 22 October). Redirect has it only
+at the 12.5 MiB scale of the common fixture (section 4): a census walk
+alone, run just after an inventory walk of the same pool, takes
+0.004-0.007 s against 0.10-0.15 s for a scrub, release medians of the
+1 November rerun
+(`contrib/raidz-redirect-spike/fixture-results-20261101.txt` on
+`spike/bypass-fixture-adapter`, `55420b5de`), too small a pool to tell
+what the traversal costs.
 
 **14. Scope, expansion and removal.** At first, a move converts one
 top-level vdev, selected explicitly, per pool at a time, and no move
@@ -426,8 +432,130 @@ certified at parity 2 writable with two of six members hidden, reads
 and writes, is refused with three hidden, and resilvers and scrubs
 the members on return (`vb:pr19262_degraded_pos.ksh:5-8`). These
 rules remain to be selected and demonstrated for the joint design;
-section 4 needs the publication and recovery cuts of an update made
-while a member is missing or stale.
+section 4, item 7, asks for the publication and recovery cuts of an
+update made while a member is missing or stale.
+
+### Relation to AnyRAID
+
+Draft by tigerblue77, 1 November, from reading, not run. AnyRAID is the
+tiled top-level vdev of openzfs/zfs#17567 (phase 1, `anymirror`) and
+openzfs/zfs#18406 (phase 2: `anyraidz`, rebalance, contraction), both
+unmerged. `ar1:` is phase 1 at `5ffeee877`, `ar2:` phase 2 at
+`18d064529`, cited only for what phase 2 adds.
+
+**Scope.** An AnyRAID vdev is a top-level type of its own
+(`ar1:vdev.c:890-891`), its parity and width fixed at creation
+(`ar2:vdev_anyraid.c:342-350`): our epochs and mapping do not reach it.
+Its format plans "new entry types ... to store information like parity
+changes" (`ar1:include/sys/vdev_anyraid.h:112-113`); that is AnyRAID's.
+
+**Block mapping and tile mapping.** Both keep block pointers intact.
+
+- AnyRAID maps a logical tile, 16 GiB or more by default
+  (`ar1:vdev_anyraid.c:112-117`), to one physical tile on each child it
+  uses (`ar1:include/sys/vdev_anyraid.h:58-69`). No metaslab spans a
+  tile (`ar1:vdev_anyraid.c:1028-1033`), an I/O is translated by its
+  offset alone (`1079-1080`), and a block keeps its layout in the tile.
+- This design maps blocks, because a parity change gives each block a
+  new layout (point 1). A tile cannot be copied to a new parity: the
+  copy of phase 2 works from the metaslab's allocated ranges
+  (`ar2:vdev_anyraid.c:3149-3160`), in which adjacent blocks merge.
+- So an `anymirror` parity change would be a tile operation, one more
+  copy and entry per tile, while an `anyraidz` tile is a RAID-Z map of
+  `vd_width` columns (`ar2:vdev_anyraid.c:1391-1392`), whose parity
+  change is this design's problem again. Neither phase does either.
+
+**A map read before the MOS (points 7 and 16).** Each child holds four
+copies of the whole map, two after the front labels and two before the
+back ones (`ar1:vdev_anyraid.c:119-128`): a header nvlist (version, txg,
+pool guid, tile size, child sizes) and up to 64 MiB of 4-byte entries
+(`ar1:include/sys/vdev_anyraid.h:71-118`, `245-263`). At every txg the
+next copy is rewritten in full on every writable child, after the even
+labels and before the uberblocks (`ar1:vdev_anyraid.c:1433-1440`;
+`ar1:vdev_label.c:1993-2011`, `2312-2345`). At open, the copy whose txg
+is nearest `spa_load_max_txg()` is used, falling back to the next copy
+or child (`ar1:vdev_anyraid.c:391`, `501-519`, `557-614`), as it also
+does past a copy whose version or entry type it does not know
+(`437-443`, `672-676`, `687-693`). What keeps older code out is the
+feature, `ZFEATURE_FLAG_MOS`
+(`ar1:module/zcommon/zfeature_common.c:815-817`): older code refuses
+the pool from its label, as point 5 asks of ours.
+
+- The regions are reserved at creation, every child offset shifted past
+  them (`ar1:vdev_anyraid.c:1079-1080`, `1620-1622`). An existing
+  `raidz` vdev's children have none, so a region added later is found
+  through a pointer, as virtual/backing's arenas are through the
+  uberblock. The selection and fallback carry over, not the placement.
+- A full rewrite each txg works because the map is bounded by its tiles
+  (2^24 at most); a block mapping, 1.7e7 entries in redirect's scale
+  test, needs the log or journal both prototypes have. A stale child
+  losing by txg answers point 16 the same way: for a small record only.
+- Phase 2 keeps the current relocation task, which routes I/O before
+  the MOS can be read, in the pre-MOS header
+  (`ar2:vdev_anyraid.c:742-800`, `1931-1970`), the rest of the plan in a
+  MOS object loaded with the vdev (`2256-2323`, `ar2:vdev.c:4125-4129`).
+  The same split would let redirect map MOS blocks from a small pre-MOS
+  record and keep its table in the MOS: an option for point 7, unbuilt.
+
+**Acknowledged writes (point 11).** A tile is created by the first write
+that reaches it (`ar1:vdev_anyraid.c:1144-1192`); ZIL and `dmu_sync()`
+writes use it only once all four copies hold it (`1150`, `1474-1475`,
+`1633-1645`; `ar1:metaslab.c:3555-3557`, `5560-5562`; `ar1:dmu.c:2253`,
+`2466`). No acknowledged block depends on map state not yet durable, and
+no journal is needed; point 2's default gives our ZIL the same (no row,
+new parity), while virtual/backing journals its new pairs.
+
+**Rebalance as a mover (points 8, 10 and 13).** Phase 2 moves a tile by
+copying, chunk by chunk at the physical level, every range of the
+metaslabs over it that is not allocatable
+(`ar2:vdev_anyraid.c:3124-3160`, `3027-3097`), records progress each txg
+(`2484-2530`) and switches the tile's entry when done (`3304-3329`).
+Every I/O takes a range lock as reader (as raidz expansion's I/O does
+during a reflow), the copy takes it as writer, and an I/O below the
+progress goes to the destination (`1489-1510`, `3050-3051`). The copy
+checks no checksum, so the source is freed only after a scrub
+(`2606-2659`, `2532-2560`). One relocation runs per pool, none starts
+while a checkpoint exists, and no checkpoint is taken during one
+(`ar2:spa.c:12078-12095`, `12160-12178`; `ar2:spa_checkpoint.c:472-473`).
+
+- That is the shape point 8 proposes for redirect, except that phase 2
+  locks on every I/O, not only while a move runs. A copy behind an
+  offset also misses writes behind it (a MOS block rewritten in a later
+  sync pass, a ZIL block written after its allocation); tigerblue77's
+  fixes for phase 2 write both slots until the switch is on disk
+  (`3cd048adde` on this fork). Freeing the source only after a scrub is
+  the opposite of redirect's tail freed at the move, close to
+  virtual/backing's retire-whole. Neither mover replaces the other:
+  this one gives no block a new parity, and ours moves no tile.
+- If a scan is running when a relocation ends, phase 2 frees the source
+  without the scrub (`ar2:vdev_anyraid.c:2652-2657`,
+  `ar2:dsl_scan.c:973-975`). A mover run as a `dsl_scan` pass (point 13)
+  would make every relocation ending during a move skip its scrub.
+
+**On one pool.** No kernel code of either phase refuses a pool with a
+`raidz` vdev and an AnyRAID vdev. Each mechanism keeps to its vdev, a
+block with a DVA on each being handled by each for its DVA. Constraints:
+
+- Point 14's pool-wide exclusions gain an AnyRAID rebalance or
+  contraction, until its scrub ends, both ways: phase 2 checks only its
+  own relocation and the checkpoint (above), and an attach, raidz
+  expansion included, checks removal and expansion, not a relocation
+  (`ar2:spa.c:8337-8360`). Reasons: the scan above, and the move's
+  pre-flight and reservation (point 12), which a contraction undoes by
+  removing a child (`ar2:spa.c:9571-9590`).
+- Section 5, step 2: `anyraidz` builds RAID-Z maps with its own width
+  and parity and starts them through `vdev_raidz_io_start_impl()`, which
+  phase 2 factors out of `vdev_raidz_io_start()`
+  (`ar2:vdev_anyraid.c:1391-1398`, `ar2:vdev_raidz.c:2696-2710`): the
+  tail the epoch series changes to take the layout from the birth
+  (`spike:vdev_raidz.c:4796`, `4904-4926`). Step 2 must keep an
+  explicit-geometry entry for `anyraidz`, and whichever lands second
+  rebases on the other.
+- Point 5: phase 2 adds its relocation state to the version-0 header
+  under the same feature (`ar2:vdev_anyraid.c:1914`, `1931-1970`), and
+  the phase 1 reader ignores keys it does not know
+  (`ar1:vdev_anyraid.c:425-490`). AnyRAID faces point 5's rule: an
+  incompatible addition lands with its feature, or under a new one.
 
 ### Where the earlier questions went
 
