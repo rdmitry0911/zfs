@@ -4,6 +4,11 @@ Comparison source for [tigerblue77/zfs#2](https://github.com/tigerblue77/zfs/iss
 and the joint `parity-joint` design discussion. This branch is an experimental
 review snapshot. Its PR is not intended to be merged.
 
+The [3 November engineering progress report](progress-20261103/README.md)
+collects the accepted upstream fixes, common-fixture results, reproduction
+links and current design status. It distinguishes the dated evidence below
+from the later 48-run debug/true-release matrix.
+
 The prototype raises parity by copying physical backing beneath unchanged
 block pointers. It keeps a virtual allocation identity V and one or more
 physical versions P. Current new allocations are paired too; keeping new
