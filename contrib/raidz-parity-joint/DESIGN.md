@@ -22,7 +22,7 @@ Writes: tigerblue77. Reviews: rdmitry0911.
 Writes: rdmitry0911; tigerblue77 corrects the column describing the
 redirect prototype. Each reviews the other's column.
 
-Draft contribution by rdmitry0911, updated 31 October. The redirect column
+Draft contribution by rdmitry0911, updated 3 November. The redirect column
 follows [tigerblue77's source-qualified review of 28 October](https://github.com/tigerblue77/zfs/pull/5#discussion_r4404987395), at
 `spike/bypass-free` `094d2a05f9` with upstream references at `ea111ca50f`.
 These are comparison baselines, not a jointly selected implementation.
@@ -37,7 +37,7 @@ proof that every allocated old-layout extent has been covered.
 | Concern | Rewrite heads plus redirects | Virtual identity and physical backing |
 | --- | --- | --- |
 | Current policy | Hybrid probe: rewrite the one head's plain-file level-0 blocks (logical birth after its last snapshot, key loaded), logical birth kept; redirect every other old DVA outside the MOS and the ZIL, except gang DVAs (counted, not moved); MOS rewritten in one probe only | Relocate backing beneath unchanged BPs for all populations; new allocations also get a V/P pair |
-| Table population | One entry per redirected DVA, keyed by offset and physical birth, until its last reference is freed, then an in-memory tombstone until its extents are reusable. Dedup under the hybrid not witnessed; BRT exclusion not built | Rows for materialized owners, including rewritten/new allocations and retained retirement state; untouched legacy extents use an identity range tree |
+| Table population | One entry per redirected DVA, keyed by offset and physical birth, until its last reference is freed, then an in-memory tombstone until its extents are reusable. Dedup under the hybrid not witnessed; BRT exclusion not built | Materialized data and metadata allocation identities, new allocations included, with retired ownership accounted separately; untouched legacy extents use an identity range tree |
 | Lookup | Offset and physical birth map to N, its birth and sizes. Every raidz I/O, the free, zdb's claims, scan routing, the resilver check and the root mirror look it up, lock-free, skipped when no entry can match; not on allocation | Logical V names an allocation incarnation; dispatch selects the current physical version and its own birth |
 | Sharing | A dedup or BRT-shared block is redirected once, its BPs and DDT/BRT entries unchanged, and freed at the last reference (witnessed). Hybrid: dedup goes to the census round (not witnessed); BRT-shared head blocks would be rewritten and un-shared, as the `brt_maybe_exists()` exclusion is not built | Original BPs and DDT/BRT references remain unchanged when backing moves |
 | Free and reuse | At the move, keep 1 + ((s - 1) mod (p + 1)) of O's s sectors, p the new parity, and free the tail as a deferred free; at the last reference, free N and the kept sectors. Cost: a tail cannot hold a same-size block at the new parity while the block lives | Retire the old physical version and keep V/P ownership until an ordinary durable floor and all applicable holds/leases/copies have drained |
@@ -99,7 +99,7 @@ Writes: tigerblue77. Reviews: rdmitry0911.
 
 Each author for their own prototype; both review.
 
-Draft measurement contribution by rdmitry0911, updated 31 October. Each
+Draft measurement contribution by rdmitry0911, updated 3 November. Each
 author has now run their prototype on the core common head/snapshot
 generator. The results below retain the different counting domains and
 measurement environments. The complete qualification protocol that follows
@@ -177,17 +177,20 @@ flavour with libzpool debug enabled, not true-release performance evidence.
 
 Each entry below is a cold readonly count after the move, then a cold
 readonly count after the snapshot-deletion lifecycle. The first two
-columns are the redirect author's 29 October
-report (three true-release runs per case); the third is the virtual/backing
+columns are the redirect author's 1 November feature-aligned rerun
+(three true-release runs per case); their entry counts match the
+29 October report in every case. The third is the virtual/backing
 author's 31 October true-release result (three runs per case). The shared
 generator is unchanged at `6319a29f86a9771c62a4c59b029c9c18a839998b`:
 five 256 MiB file vdevs, 12.5 MiB logical payload, compression off, copies=1.
 
 Virtual/backing completed 48/48 conversions: all eight cases, three repeats
 in debug and three in true release. All 384 native commands succeeded;
-192 readonly operations preserved all five member hashes, and a separate
-author-side audit replayed 768 process logs and independently checked 792
-payload-verification records. Every post-conversion/deletion state had
+192 readonly operations preserved all five member hashes. A separate
+author-side audit rehashed and parsed 768 saved native process streams,
+regenerated the expected payload hashes, and compared 792 saved VERIFY
+records against them. It did not re-execute the native commands or
+reread the raw members. Every post-conversion/deletion state had
 certified parity 2 and zero legacy/weak backing. The
 [full report, raw JSON and logs](https://github.com/rdmitry0911/zfs/blob/c3e59b5d3cb1a9656274aa6c12976b56e85ad343/contrib/raidz-virtual-backing/common-fixture/results-20261031/RESULTS.md)
 give medians, ranges, source/build identities and verification limits.
@@ -203,8 +206,11 @@ give medians, ranges, source/build identities and verification limits.
 | 16 KiB, 30% retained | 256 → 0 | 832 → 576 | 991 → 747 |
 | 16 KiB, 100% retained | 830 → 14 | 830 → 14 | 989 → 185 |
 
-The counts have different coverage: virtual/backing includes MOS and new
-paired metadata allocations, while the redirect table excludes MOS. Its
+The counts have different coverage: virtual/backing includes data, MOS
+and other metadata, including new allocations paired by this prototype.
+The redirect table counts only redirected DVAs; it excludes MOS and head
+blocks that the hybrid rewrote through the normal write path.
+Virtual/backing's
 `current_versions` counts active bindings; `owners` additionally includes
 retired owners and is not used as the live count here. A writable no-op
 drop at 0% retention increases the virtual/backing current count by nine
@@ -219,14 +225,34 @@ is an observed 1 ms glibc `uordblks` sample including ARC/dbufs, with RSS
 separate; complete incremental allocator/kernel charge remains open.
 
 Starting virtual/backing inputs have `physical_rewrite` enabled before
-the mover. The redirect author's feature-state-alignment rerun is pending.
+the mover. The redirect author's 1 November rerun enables
+`physical_rewrite` and its `extensible_dataset` dependency before either
+mover on a fresh copy of an input from the unchanged common generator;
+the hybrid adapter enables nothing. All 96 debug/true-release runs passed
+the reported payload, census and cold-table checks. The move, cold-import
+and post-deletion entry counts match 29 October across all 32
+tree/case/mover cells. Three kept-sector cells vary by two 4 KiB sectors;
+allocated table bytes vary by a roughly 28.5-29 KiB step within the
+reported ranges. The per-copy raw member hashes around readonly imports
+were not collected: the unchanged before/after hashes cover the 16
+original input sets, not the readonly operations on their run copies.
+
 VM hardware, ARC limits, mover boundaries and sampler intervals differ
 between authors; the times in the reports do not prove a three-way speedup.
-Standalone BP-walk/scrub timing, flush counts, ENOSPC/churn and the full
-resource and extended failure matrices above remain separate obligations.
+Redirect reports standalone census-walk/scrub timing on the 12.5 MiB
+fixture and 48 debug post-deletion fills to ENOSPC, without pool suspension
+and with zero gang blocks. Those fills use the five 256 MiB members after
+the retained snapshot has been dropped; they do not
+establish initially-too-full or snapshot-retained admission safety.
+Virtual/backing has neither a standalone walk/scrub measurement nor an
+ENOSPC/gang fill in this core publication. Flush counts, post-move churn,
+complete resource charge and the extended failure matrices above remain
+separate obligations. The redirect true-release build still lacks zdb;
+that report's successful library/adapter runs do not qualify release zdb.
 
-Sources: [redirect report at 98dc0fa](https://github.com/tigerblue77/zfs/blob/98dc0fa/contrib/raidz-redirect-spike/fixture-results-20261029.txt),
-[virtual/backing source and reproduction commands](https://github.com/rdmitry0911/zfs/tree/comparison/vb-common-fixtures-20261031/contrib/raidz-virtual-backing/common-fixture).
+Sources: [feature-aligned redirect rerun at `55420b5de`](https://github.com/tigerblue77/zfs/blob/55420b5dea97a59365dab285625941c9eece760c/contrib/raidz-redirect-spike/fixture-results-20261101.txt),
+[historical redirect report at `98dc0fa7f`](https://github.com/tigerblue77/zfs/blob/98dc0fa7f4d6a73c598f8b37b4d59e1b81f5b30d/contrib/raidz-redirect-spike/fixture-results-20261029.txt),
+[virtual/backing source and reproduction commands at `c3e59b5d3`](https://github.com/rdmitry0911/zfs/tree/c3e59b5d3cb1a9656274aa6c12976b56e85ad343/contrib/raidz-virtual-backing/common-fixture).
 
 Historical author-run observations, on different fixtures:
 
@@ -242,11 +268,11 @@ The comparison source includes a small native conversion/cold-import
 script, `contrib/raidz-virtual-backing/smoke.py`, and its 46-file source
 manifest, published for review in [prototype PR #4](https://github.com/tigerblue77/zfs/pull/4).
 The neutral head/snapshot generator is published separately on
-[the common-fixtures branch](https://github.com/rdmitry0911/zfs/tree/fixtures/raidz-parity-common-20261026/contrib/raidz-parity-fixtures).
+[the common generator at `6319a29f8`](https://github.com/rdmitry0911/zfs/tree/6319a29f86a9771c62a4c59b029c9c18a839998b/contrib/raidz-parity-fixtures).
 It creates equivalent logical inputs without invoking either mover; its
 baseline creation/read verification does not establish a migration result.
 The core adapter and measurement reports are published on the separate
-[virtual/backing comparison branch](https://github.com/rdmitry0911/zfs/tree/comparison/vb-common-fixtures-20261031/contrib/raidz-virtual-backing/common-fixture).
+[virtual/backing comparison source at `c3e59b5d3`](https://github.com/rdmitry0911/zfs/tree/c3e59b5d3cb1a9656274aa6c12976b56e85ad343/contrib/raidz-virtual-backing/common-fixture).
 The mixed shared extensions and complete resource/failure collectors
 remain open. Large author-local raw fixtures are not embedded in this
 document.
