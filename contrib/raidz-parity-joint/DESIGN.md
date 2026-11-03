@@ -4,23 +4,6 @@ Working document for one design, written jointly by @rdmitry0911 and
 @tigerblue77, before anything is proposed upstream. Discussion:
 https://github.com/tigerblue77/zfs/issues/2
 
-**Consolidated discussion draft, 3 November 2026.** This version combines
-sections 2 and 4 from [PR #5 at `375edc250`](https://github.com/tigerblue77/zfs/commit/375edc250f22557c80fee347b62315415f643856)
-with sections 1, 3 and 5 from [PR #6 at `0e1e92f07`](https://github.com/tigerblue77/zfs/commit/0e1e92f07e54d44c26f9d3604fa41c311e9a8cf6).
-It incorporates the accepted measurement corrections and rdmitry0911's
-[2 November AnyRAID source-review qualifications](https://github.com/tigerblue77/zfs/pull/6#issuecomment-6571685872).
-The consolidated edits are prepared by rdmitry0911 for the other author's
-review; their inclusion does not imply that tigerblue77 has approved them.
-
-Section 3 points 1-6 are proposals by both authors for maintainer
-confirmation, including the stated conditions on the hybrid default and
-memory budget. Points 7-16 remain open between the authors. The D1-D8
-cross-reference at the end of that section identifies the outstanding
-decisions. This draft selects no public disk ABI, feature GUID or command
-interface, and changes neither OpenZFS #19262 nor its review status.
-The core measurements in section 4 are author-run evidence; the full
-qualification protocol there remains incomplete.
-
 How this branch works:
 
 - This file is changed only through pull requests into `parity-joint`,
