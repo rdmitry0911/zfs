@@ -37,7 +37,7 @@ def main():
                         default=Path(__file__).resolve().parents[2])
     parser.add_argument('--manifest', type=Path,
                         default=Path(__file__).with_name(
-                            'source46-sha256.json'))
+                            'source56-sha256-20261113.json'))
     parser.add_argument('--output', type=Path, required=True,
                         help='new directory; images and logs are retained')
     parser.add_argument('--timeout', type=int, default=300,
@@ -84,9 +84,9 @@ def main():
 
     try:
         manifest = json.loads(args.manifest.read_text())
-        require(len(manifest) == 46 and all(
+        require(len(manifest) == 56 and all(
             sha(source / name) == digest for name, digest in manifest.items()),
-            'tested source46 differs')
+            'tested source manifest differs')
         report['source_manifest_sha256'] = sha(args.manifest)
         report['binaries'] = {name: sha(source / name) for name in
                               ('.libs/ztest', '.libs/libzpool.so.7.0.0')}

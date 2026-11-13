@@ -16,6 +16,58 @@ parameters and test hooks are experimental. There is no supported
 administration interface or agreed integrated feature/format. The existing
 private-label refusal guard does not establish compatibility qualification.
 
+## Snapshot of 13 November 2026
+
+This update brings the comparison source to the engine tree behind the
+[results of 13 November](https://github.com/rdmitry0911/zfs/blob/0da2dbfcbf43cbc1ff90c0e377760a82b2464403/contrib/raidz-private-engine/results-20261107/RESULTS.md).
+It is the 26 October snapshot below plus the fix layers L9-L24, in-place
+replacement of an engine member enabled by default with a narrow scope (B3),
+and its follow-up fixes (B3G). The prerequisite is unchanged:
+`b0de7972fbfd318d3e320345b786b776fe68b9ff`.
+
+The source comes in two commits:
+
+- "update the comparison source to the 13 November engine tree" is the
+  production side exactly: the tree that was built for the kernel and given
+  the true-release proof in the results (43 files, +15,415/-668 lines since
+  the 26 October snapshot).
+- "add the userspace-only witness drivers" adds the test drivers and hooks
+  that the userspace lab cells use: `ztest` runtime and fixture drivers,
+  `zhack` test actions, and engine hooks under `#ifndef _KERNEL` (7 files,
+  +3,070/-20). Every addition outside `cmd/` is guarded by
+  `#ifndef _KERNEL`, so kernel code is unchanged by this commit. It also
+  carries the repaired built-in runtime test; the earlier one was stale.
+
+All 56 changed source and test files against the prerequisite are listed in
+[`source56-sha256-20261113.json`](source56-sha256-20261113.json). The
+SHA-256 of that file is
+`d6ad0064f3d185cf18aaf69b62af7163c6e1cebe4a9c5110c4e1231e757fda64`.
+To isolate the implementation:
+
+```sh
+git diff b0de7972fbfd318d3e320345b786b776fe68b9ff..HEAD -- \
+    cmd include lib module tests
+```
+
+- `smoke.py` now checks this manifest. It passed on this snapshot on
+  13 November (userspace debug build of `libzpool.la` and `ztest` on the
+  author's host): conversion 11.0 s, cold read-only import 1.7 s, certified
+  parity 2, raw members unchanged by the read-only import.
+- The sections below describe the 26 October snapshot (candidate05), and so
+  does `verification-summary.json`. Current evidence, limits and decisions
+  are on the results page.
+
+Where to read the changes since 26 October:
+
+| Concern | Source |
+| --- | --- |
+| Paced checkpoint discard and bulk retire (async destroy, long frees, livelists) | `spa_checkpoint.c`, `vdev_reloc_convert.c`, `dsl_scan.c`, `dsl_destroy.c`, `dsl_dataset.c`, `dmu.c` |
+| Conversion reserve, client admission and reserves under a checkpoint | `vdev_reloc_admit.c`, `vdev_reloc_convert.c`, `vdev_reloc_pages.c` |
+| Journal bind group commit | `vdev_reloc_journal.c` |
+| Disk replacement reseed and member readmit | `vdev_reloc_journal.c`, `vdev_reloc_store.c`, `vdev_label.c`, `spa.c`, `spa_misc.c` |
+| Fixed engine vdev size | `vdev.c`, `spa.c`, `libzfs_pool.c` |
+| Child selection for engine reads in a replacing vdev | `vdev_mirror.c` |
+
 ## Source and review boundary
 
 The prerequisite snapshot is
@@ -32,7 +84,7 @@ git diff b0de7972fbfd318d3e320345b786b776fe68b9ff..HEAD -- \
     cmd include module tests
 ```
 
-All 46 changed source/test files are listed in
+For the 26 October snapshot, all 46 changed source/test files are listed in
 [`source46-sha256.json`](source46-sha256.json). The SHA-256 of that file is
 `9d0ba115675bffc9e23c8f9a28d6c6ef54aa32d7622d1293b2f964bb84f59e4f`.
 This is the exact production-side source manifest used for the latest
