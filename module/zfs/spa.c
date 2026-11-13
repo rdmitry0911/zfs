@@ -2319,6 +2319,15 @@ spa_unload(spa_t *spa)
 	/* A scheduled fence may still dirty TXGs; drain it before final_txg. */
 	pr19262_engine_quiesce(spa);
 
+#ifdef _KERNEL
+	/*
+	 * Resume and wait the detached natural scan root while sync, vdev, and
+	 * DSL-pool state are still live.  This also serializes a running public
+	 * converter before spa_unload stops sync or frees either dependency.
+	 */
+	pr19262_engine_unload_prepare(spa);
+#endif
+
 	spa_import_progress_remove(spa_guid(spa));
 	spa_load_note(spa, "UNLOADING");
 
@@ -3315,6 +3324,14 @@ delete_blkptr_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
 	return (0);
 }
 
+/* PR19262 L13: queue a livelist block for the async destroy's free. */
+static int
+enqueue_blkptr_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
+{
+	bpobj_enqueue(arg, bp, B_FALSE, tx);
+	return (0);
+}
+
 static int
 dsl_get_next_livelist_obj(objset_t *os, uint64_t zap_obj, uint64_t *llp)
 {
@@ -3351,7 +3368,22 @@ sublist_delete_sync(void *arg, dmu_tx_t *tx)
 	uint64_t key = sda->key;
 	bplist_t *to_free = sda->to_free;
 
-	bplist_iterate(to_free, delete_blkptr_cb, spa, tx);
+	/*
+	 * PR19262 L13: a sublist holds up to zfs_livelist_max_entries blocks
+	 * and this one sync task would free them all, past what the
+	 * relocation catalog's store can absorb in a txg.  Hand them to the
+	 * pool's free bpobj in the same txg instead (the sublist entry goes
+	 * with them, so a crash frees each once): the async destroy frees
+	 * them within the catalog budget, and dp_free_dir keeps accounting
+	 * them as freeing until then.
+	 */
+	if (pr19262_engine_persistent(spa)) {
+		ASSERT3U(spa_version(spa), >=, SPA_VERSION_DEADLISTS);
+		bplist_iterate(to_free, enqueue_blkptr_cb,
+		    &tx->tx_pool->dp_free_bpobj, tx);
+	} else {
+		bplist_iterate(to_free, delete_blkptr_cb, spa, tx);
+	}
 	dsl_deadlist_remove_entry(ll, key, tx);
 }
 
@@ -3775,6 +3807,14 @@ spa_load(spa_t *spa, spa_load_state_t state, spa_import_type_t type)
 	const char *ereport = FM_EREPORT_ZFS_POOL;
 	int error;
 
+	/*
+	 * B3G (A33): every load attempt opens its vdevs with autoexpand off,
+	 * as a first attempt does (spa_add zeroes it); spa_ld_get_props reads
+	 * the property again.  A retried load (rewind, or a clear after a
+	 * failed load) kept the last attempt's value and could grow an engine
+	 * vdev before its store, which records the size, was loaded.
+	 */
+	spa->spa_autoexpand = 0;
 	spa->spa_load_state = state;
 	(void) spa_import_progress_set_state(spa_guid(spa),
 	    spa_load_state(spa));
@@ -4337,10 +4377,12 @@ spa_activity_check_claim(spa_t *spa)
 	vdev_t *rvd = spa->spa_root_vdev;
 	nvlist_t *mmp_label;
 	uberblock_t spa_ub;
+	uberblock_t *claim_ubs;
 	kcondvar_t cv;
 	kmutex_t mtx;
 	int error = 0;
 
+	claim_ubs = kmem_alloc(2 * sizeof (*claim_ubs), KM_SLEEP);
 	cv_init(&cv, NULL, CV_DEFAULT, NULL);
 	mutex_init(&mtx, NULL, MUTEX_DEFAULT, NULL);
 	mutex_enter(&mtx);
@@ -4394,19 +4436,20 @@ spa_activity_check_claim(spa_t *spa)
 	 * pool is attempting to import the pool.
 	 */
 	for (int i = MMP_IMPORT_VERIFY_ITERS; i > 0; i--) {
-		uberblock_t set_ub, mmp_ub;
+		uberblock_t *set_ub = &claim_ubs[0];
+		uberblock_t *mmp_ub = &claim_ubs[1];
 		uint16_t mmp_seq;
 
 		(void) spa_import_progress_set_mmp_check(spa_guid(spa),
 		    NSEC2SEC(i * MSEC2NSEC(spa_ub_interval)));
 
-		set_ub = spa_ub;
+		*set_ub = spa_ub;
 		mmp_seq = spa_ub_seq + 1 +
 		    random_in_range(MMP_SEQ_MAX - spa_ub_seq);
-		MMP_SEQ_CLEAR(&set_ub);
-		set_ub.ub_mmp_config |= MMP_SEQ_SET(mmp_seq);
+		MMP_SEQ_CLEAR(set_ub);
+		set_ub->ub_mmp_config |= MMP_SEQ_SET(mmp_seq);
 
-		error = mmp_claim_uberblock(spa, rvd, &set_ub);
+		error = mmp_claim_uberblock(spa, rvd, set_ub);
 		if (error) {
 			spa_load_failed(spa, "mmp: uberblock claim "
 			    "failed, error=%d", error);
@@ -4427,24 +4470,24 @@ spa_activity_check_claim(spa_t *spa)
 			break;
 		}
 
-		vdev_uberblock_load(rvd, &mmp_ub, &mmp_label);
+		vdev_uberblock_load(rvd, mmp_ub, &mmp_label);
 
-		if (vdev_uberblock_compare(&set_ub, &mmp_ub)) {
+		if (vdev_uberblock_compare(set_ub, mmp_ub)) {
 			spa_load_failed(spa, "mmp: activity detected during "
 			    "claim, set_ub_txg=%llu mmp_ub_txg=%llu "
 			    "set_ub_seq=%llu mmp_ub_seq=%llu "
 			    "set_ub_timestamp=%llu mmp_ub_timestamp=%llu "
 			    "set_ub_config=%#llx mmp_ub_config=%#llx",
-			    (u_longlong_t)set_ub.ub_txg,
-			    (u_longlong_t)mmp_ub.ub_txg,
-			    (u_longlong_t)(MMP_SEQ_VALID(&set_ub) ?
-			    MMP_SEQ(&set_ub) : 0),
-			    (u_longlong_t)(MMP_SEQ_VALID(&mmp_ub) ?
-			    MMP_SEQ(&mmp_ub) : 0),
-			    (u_longlong_t)set_ub.ub_timestamp,
-			    (u_longlong_t)mmp_ub.ub_timestamp,
-			    (u_longlong_t)set_ub.ub_mmp_config,
-			    (u_longlong_t)mmp_ub.ub_mmp_config);
+			    (u_longlong_t)set_ub->ub_txg,
+			    (u_longlong_t)mmp_ub->ub_txg,
+			    (u_longlong_t)(MMP_SEQ_VALID(set_ub) ?
+			    MMP_SEQ(set_ub) : 0),
+			    (u_longlong_t)(MMP_SEQ_VALID(mmp_ub) ?
+			    MMP_SEQ(mmp_ub) : 0),
+			    (u_longlong_t)set_ub->ub_timestamp,
+			    (u_longlong_t)mmp_ub->ub_timestamp,
+			    (u_longlong_t)set_ub->ub_mmp_config,
+			    (u_longlong_t)mmp_ub->ub_mmp_config);
 			error = SET_ERROR(EREMOTEIO);
 			break;
 		}
@@ -4491,6 +4534,7 @@ out:
 	mutex_exit(&mtx);
 	mutex_destroy(&mtx);
 	cv_destroy(&cv);
+	kmem_free(claim_ubs, 2 * sizeof (*claim_ubs));
 
 	return (error);
 }
@@ -8122,6 +8166,12 @@ spa_export_common(const char *pool, int new_state, nvlist_t **oldconfig,
 #ifdef ZFS_DEBUG
 	spa_condense_debug_cancel(spa);
 #endif
+	/*
+	 * R-01 may have parked its natural scan in the async thread.  Cancel it
+	 * while that thread can still finish; the helper also closes R-01
+	 * admission until this export has either failed or unloaded the SPA.
+	 */
+	pr19262_engine_export_prepare(spa);
 	spa_async_suspend(spa);
 
 	spa_namespace_enter(FTAG);
@@ -8278,6 +8328,7 @@ export_spa:
 		 * there is any possibility that it can be reused,
 		 * we make sure to reset the exporting flag.
 		 */
+		pr19262_engine_export_abort(spa);
 		spa->spa_is_exporting = B_FALSE;
 		spa->spa_export_thread = NULL;
 	}
@@ -8290,6 +8341,7 @@ export_spa:
 	return (0);
 
 fail:
+	pr19262_engine_export_abort(spa);
 	spa->spa_is_exporting = B_FALSE;
 	spa->spa_export_thread = NULL;
 
@@ -8635,11 +8687,12 @@ spa_vdev_new_spare_would_cause_double_spares(vdev_t *newvd, vdev_t *pvd)
  * should be performed instead of traditional healing reconstruction.  From
  * an administrators perspective these are both resilver operations.
  */
-int
-spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
-    int rebuild)
+static int
+spa_vdev_attach_impl(spa_t *spa, uint64_t guid, nvlist_t *nvroot,
+    int replacing, int rebuild, boolean_t r02_gate)
 {
 	uint64_t txg, dtl_max_txg;
+	boolean_t r02_seed = B_FALSE;
 	vdev_t *rvd = spa->spa_root_vdev;
 	vdev_t *oldvd, *newvd, *newrootvd, *pvd, *tvd;
 	vdev_ops_t *pvops;
@@ -8682,6 +8735,33 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
 
 	if (oldvd == NULL)
 		return (spa_vdev_exit(spa, NULL, txg, ENODEV));
+
+	/*
+	 * A persistent relocation engine stores private metadata on every
+	 * direct leaf of its vdev.  Replacement would insert a non-leaf
+	 * `replacing` vdev in that member slot, but the raw store is not yet
+	 * topology-aware and has no live reseed protocol for the new leaf.
+	 * Refuse before any configuration mutation rather than panic or strand
+	 * the persistent store after a later detach.
+	 */
+	if (replacing && pr19262_engine_persistent(spa) &&
+	    oldvd->vdev_parent == pr19262_engine_vdev(spa)) {
+		/*
+		 * R02 candidate: only the fully covered staged exact-new-leaf
+		 * protocol may proceed; everything else keeps D64.
+		 */
+		if (pr19262_engine_r02_attach_admit(spa, oldvd, r02_gate) != 0)
+			return (spa_vdev_exit(spa, NULL, txg, ENOTSUP));
+		r02_seed = B_TRUE;
+	}
+
+	/* Never nest any attach below an engine member slot. */
+	if (pr19262_engine_persistent(spa) &&
+	    pr19262_engine_vdev(spa) != NULL &&
+	    oldvd->vdev_top == pr19262_engine_vdev(spa) &&
+	    oldvd != pr19262_engine_vdev(spa) &&
+	    oldvd->vdev_parent != pr19262_engine_vdev(spa))
+		return (spa_vdev_exit(spa, NULL, txg, ENOTSUP));
 
 	boolean_t raidz = oldvd->vdev_ops == &vdev_raidz_ops;
 
@@ -8726,6 +8806,17 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
 
 	if (!newvd->vdev_ops->vdev_op_leaf)
 		return (spa_vdev_exit(spa, newrootvd, txg, EINVAL));
+
+	/*
+	 * R02: shapes the candidate does not cover never touch the disk.  A
+	 * hot spare is only recognised inside vdev_create() (its label sets
+	 * vdev_isspare), so a spare's labels are rewritten as for any native
+	 * spare attach and it is then refused at the seed seam below.
+	 */
+	if (r02_seed && (newvd->vdev_isspare || rebuild ||
+	    oldvd->vdev_path == NULL || newvd->vdev_path == NULL ||
+	    strcmp(oldvd->vdev_path, newvd->vdev_path) == 0))
+		return (spa_vdev_exit(spa, newrootvd, txg, ENOTSUP));
 
 	if ((error = vdev_create(newrootvd, txg, replacing)) != 0)
 		return (spa_vdev_exit(spa, newrootvd, txg, error));
@@ -8838,6 +8929,23 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
 	}
 
 	/*
+	 * R02 seed seam: the candidate leaf is created, labelled and
+	 * geometry-checked; the topology is still direct and nothing is dirty.
+	 * Seed, flush and read back the full raw closure on the exact new leaf
+	 * now.  A failure leaves an orphan candidate and the old config.
+	 */
+	if (r02_seed) {
+		if (pvops != &vdev_replacing_ops || newvd->vdev_isspare ||
+		    rebuild || oldvd->vdev_path == NULL ||
+		    newvd->vdev_path == NULL ||
+		    strcmp(oldvd->vdev_path, newvd->vdev_path) == 0)
+			return (spa_vdev_exit(spa, newrootvd, txg, ENOTSUP));
+		error = pr19262_engine_r02_attach_seed(spa, oldvd, newvd);
+		if (error != 0)
+			return (spa_vdev_exit(spa, newrootvd, txg, error));
+	}
+
+	/*
 	 * RAIDZ-expansion-specific checks.
 	 */
 	if (raidz) {
@@ -8919,6 +9027,10 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
 	 * Reevaluate the parent vdev state.
 	 */
 	vdev_propagate_state(pvd);
+
+	/* R02: admit the seeded pair for exact-endpoint raw publication. */
+	if (r02_seed)
+		pr19262_engine_r02_attach_commit(spa, pvd);
 
 	tvd = newvd->vdev_top;
 	ASSERT(pvd->vdev_top == tvd);
@@ -9019,14 +9131,28 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
 	return (0);
 }
 
+int
+spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing,
+    int rebuild)
+{
+	/* R02: the raw-topology writer precedes spa_vdev_enter()'s SCL_ALL. */
+	boolean_t gate = pr19262_engine_r02_topology_enter(spa);
+	int error = spa_vdev_attach_impl(spa, guid, nvroot, replacing,
+	    rebuild, gate);
+	if (gate)
+		pr19262_engine_r02_topology_exit(spa);
+	return (error);
+}
+
 /*
  * Detach a device from a mirror or replacing vdev.
  *
  * If 'replace_done' is specified, only detach if the parent
  * is a replacing or a spare vdev.
  */
-int
-spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
+static int
+spa_vdev_detach_impl(spa_t *spa, uint64_t guid, uint64_t pguid,
+    int replace_done, boolean_t *r02_gate)
 {
 	uint64_t txg;
 	int error;
@@ -9112,6 +9238,15 @@ spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
 	if (vdev_dtl_required(vd))
 		return (spa_vdev_exit(spa, NULL, txg, EBUSY));
 
+	/*
+	 * R02 final gate (D0-D2): before the old leaf's labels are erased the
+	 * exact new leaf must pass a complete raw-closure audit (a faulted
+	 * pair is reseeded first); any other engine-member detach is refused.
+	 */
+	error = pr19262_engine_r02_detach_check(spa, vd, *r02_gate);
+	if (error != 0)
+		return (spa_vdev_exit(spa, NULL, txg, error));
+
 	ASSERT(pvd->vdev_children >= 2);
 
 	/*
@@ -9163,6 +9298,7 @@ spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
 	 * it's being detached!
 	 */
 	(void) vdev_label_init(vd, 0, VDEV_LABEL_REMOVE);
+	pr19262_engine_r02_test_cut(13);
 
 	/*
 	 * Remove vd from its parent and compact the parent's children.
@@ -9199,6 +9335,9 @@ spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
 	if (pvd->vdev_children == 1) {
 		if (pvd->vdev_ops == &vdev_spare_ops)
 			cvd->vdev_unspare = B_FALSE;
+		/* R02: the engine pair collapses with its replacing parent. */
+		if (pvd->vdev_parent == pr19262_engine_vdev(spa))
+			pr19262_engine_r02_detach_commit(spa);
 		vdev_remove_parent(cvd);
 	}
 
@@ -9248,6 +9387,15 @@ spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
 
 	error = spa_vdev_exit(spa, vd, txg, 0);
 
+	/*
+	 * R02: the collapse is committed; drop the raw-topology writer before
+	 * the unspare path below can recurse into spa_vdev_detach().
+	 */
+	if (*r02_gate) {
+		pr19262_engine_r02_topology_exit(spa);
+		*r02_gate = B_FALSE;
+	}
+
 	spa_history_log_internal(spa, "detach", NULL,
 	    "vdev=%s", vdpath);
 	spa_strfree(vdpath);
@@ -9283,6 +9431,17 @@ spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
 	spa_close(spa, FTAG);
 	spa_namespace_exit(FTAG);
 
+	return (error);
+}
+
+int
+spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid, int replace_done)
+{
+	boolean_t gate = pr19262_engine_r02_topology_enter(spa);
+	int error = spa_vdev_detach_impl(spa, guid, pguid, replace_done,
+	    &gate);
+	if (gate)
+		pr19262_engine_r02_topology_exit(spa);
 	return (error);
 }
 
@@ -10389,6 +10548,16 @@ spa_async_thread(void *arg)
 		if (suspend)
 			zio_suspend(spa, NULL, ZIO_SUSPEND_IOERR);
 	}
+
+	/*
+	 * R02: retry a runtime readmit that a state exit skipped on a busy
+	 * lock (bounded; see pr19262_engine_r02_readmit()).
+	 */
+	if (tasks & SPA_ASYNC_R02_READMIT)
+		pr19262_engine_r02_readmit(spa, NULL);
+	/* L23: likewise the member readmit (pr19262_engine_member_readmit). */
+	if (tasks & SPA_ASYNC_MEMBER_READMIT)
+		pr19262_engine_member_readmit(spa, NULL);
 
 	/*
 	 * If any devices are done replacing, detach them.

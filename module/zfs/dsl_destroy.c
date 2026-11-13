@@ -393,6 +393,18 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 	old_unique = dsl_dataset_phys(ds_next)->ds_unique_bytes;
 
 	dmu_buf_will_dirty(ds_next->ds_dbuf, tx);
+	/* PR19262 L13: see ds_pr19262_prev_lowered (dsl_dataset.h). */
+	if (!ds_next->ds_is_snapshot) {
+		uint64_t old = dsl_dataset_phys(ds_next)->ds_prev_snap_txg;
+		if (ds_next->ds_pr19262_prev_lowered == 0 ||
+		    ds_next->ds_pr19262_prev_lowered + TXG_CONCURRENT_STATES <
+		    tx->tx_txg)
+			ds_next->ds_pr19262_prev_old = old;
+		else
+			ds_next->ds_pr19262_prev_old =
+			    MAX(ds_next->ds_pr19262_prev_old, old);
+		ds_next->ds_pr19262_prev_lowered = tx->tx_txg;
+	}
 	dsl_dataset_phys(ds_next)->ds_prev_snap_obj =
 	    dsl_dataset_phys(ds)->ds_prev_snap_obj;
 	dsl_dataset_phys(ds_next)->ds_prev_snap_txg =

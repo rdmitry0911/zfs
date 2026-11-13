@@ -52,6 +52,7 @@
 #include <sys/objlist.h>
 #include <sys/zfeature.h>
 #include <sys/zpl.h>
+#include <sys/vdev_reloc_engine.h>
 #include <linux/vfs_compat.h>
 #include <linux/fs.h>
 #include "zfs_comutil.h"
@@ -1245,7 +1246,12 @@ static int
 zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 {
 	znode_t	*zp;
+	spa_t	*reloc_spa;
 
+	/* Keep a test R-01 root from blocking this ZIL close's sync wait. */
+	reloc_spa = zfsvfs->z_os != NULL ? dmu_objset_spa(zfsvfs->z_os) : NULL;
+	if (reloc_spa != NULL)
+		pr19262_engine_zil_prepare(reloc_spa);
 	zfs_unlinked_drain_stop_wait(zfsvfs);
 
 	/*
@@ -1307,6 +1313,8 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	if (!unmounting && (zfsvfs->z_unmounted || zfsvfs->z_os == NULL)) {
 		rw_exit(&zfsvfs->z_teardown_inactive_lock);
 		ZFS_TEARDOWN_EXIT(zfsvfs, FTAG);
+		if (reloc_spa != NULL)
+			pr19262_engine_zil_finish(reloc_spa);
 		return (SET_ERROR(EIO));
 	}
 
@@ -1352,8 +1360,11 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	 *
 	 * unregistered and cached data had been evicted before.
 	 */
-	if (zfsvfs->z_os == NULL)
+	if (zfsvfs->z_os == NULL) {
+		if (reloc_spa != NULL)
+			pr19262_engine_zil_finish(reloc_spa);
 		return (0);
+	}
 
 	/*
 	 * Unregister properties.
@@ -1379,6 +1390,8 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	dsl_dir_t *dd = os->os_dsl_dataset->ds_dir;
 	dsl_dir_cancel_waiters(dd);
 
+	if (reloc_spa != NULL)
+		pr19262_engine_zil_finish(reloc_spa);
 	return (0);
 }
 

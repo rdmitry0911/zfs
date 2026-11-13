@@ -505,12 +505,20 @@ struct zio {
 	void		*io_pr19262_hold;
 	boolean_t	io_pr19262_physical;
 	void		*io_pr19262_owner_hold;
+	/* Queue credit returned while unstarted R01 scan ZIO was parked. */
+	boolean_t	io_pr19262_r01_scan_credit_released;
 	blkptr_t	io_pr19262_owner_bp;
 	uint64_t	io_pr19262_owner_v;
 	boolean_t	io_pr19262_owner_mapped;
 	void		*io_pr19262_owner_version;
 	boolean_t	io_pr19262_owner_copy;
 	uint64_t	io_pr19262_backing_birth;
+	/*
+	 * Immutable original-BP birth retained only as a translated
+	 * resilver repair-selection input.  It must not replace the
+	 * current physical backing birth, which owns P layout/recovery.
+	 */
+	uint64_t	io_pr19262_repair_source_birth;
 	uint64_t	io_pr19262_backing_width;
 	uint64_t	io_pr19262_backing_parity;
 	void		*io_pr19262_metadata_authority;

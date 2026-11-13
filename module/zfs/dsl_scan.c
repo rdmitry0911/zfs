@@ -47,6 +47,7 @@
 #include <sys/abd.h>
 #include <sys/range_tree.h>
 #include <sys/dbuf.h>
+#include <sys/vdev_reloc_engine.h>
 
 /*
  * Grand theory statement on scan queue sorting
@@ -244,6 +245,9 @@ static scan_cb_t *scan_funcs[POOL_SCAN_FUNCS] = {
 	dsl_scan_scrub_cb,	/* POOL_SCAN_SCRUB */
 	dsl_scan_scrub_cb,	/* POOL_SCAN_RESILVER */
 };
+
+static boolean_t dsl_scan_visit_mapped(spa_t *, const blkptr_t *,
+    uint64_t);
 
 /* In core node for the scn->scn_queue. Represents a dataset to be scanned */
 typedef struct {
@@ -1464,6 +1468,11 @@ dsl_scan_cancel_check(void *arg, dmu_tx_t *tx)
 
 	if (!dsl_scan_is_running(scn))
 		return (SET_ERROR(ENOENT));
+#ifdef _KERNEL
+	/* The R-01 reset in dsl_scan_cancel_sync() must not wait for a txg. */
+	if (pr19262_engine_r01_scan_reset_busy(scn->scn_dp->dp_spa))
+		return (SET_ERROR(EBUSY));
+#endif
 	return (0);
 }
 
@@ -1473,6 +1482,13 @@ dsl_scan_cancel_sync(void *arg, dmu_tx_t *tx)
 	(void) arg;
 	dsl_scan_t *scn = dmu_tx_pool(tx)->dp_scan;
 
+#ifdef _KERNEL
+	/*
+	 * The detached child still completes through dsl_scan_scrub_done().
+	 * A released R-01 whose root completed is left to its final fence.
+	 */
+	pr19262_engine_r01_scan_reset_cancel(scn->scn_dp->dp_spa);
+#endif
 	dsl_scan_done(scn, B_FALSE, tx);
 	dsl_scan_sync_state(scn, tx, SYNC_MANDATORY);
 	spa_event_notify(scn->scn_dp->dp_spa, NULL, NULL, ESC_ZFS_SCRUB_ABORT);
@@ -1488,6 +1504,32 @@ dsl_scan_cancel(dsl_pool_t *dp)
 	}
 	return (dsl_sync_task(spa_name(dp->dp_spa), dsl_scan_cancel_check,
 	    dsl_scan_cancel_sync, NULL, 3, ZFS_SPACE_CHECK_RESERVED));
+}
+
+/*
+ * Private diagnostic cancellation for a suspended resilver only.  The
+ * predicate is checked again by dsl_sync_task() under the DSL config writer
+ * lock, so this cannot turn a separate scrub into the cancellation target.
+ */
+static int
+dsl_scan_cancel_resilver_suspended_check(void *arg, dmu_tx_t *tx)
+{
+	(void) arg;
+	dsl_pool_t *dp = dmu_tx_pool(tx);
+
+	if (!zfs_scan_suspend_progress || !dsl_scan_resilvering(dp))
+		return (SET_ERROR(EBUSY));
+	return (0);
+}
+
+int
+dsl_scan_cancel_resilver_suspended(dsl_pool_t *dp)
+{
+	if (dp == NULL)
+		return (SET_ERROR(EINVAL));
+	return (dsl_sync_task(spa_name(dp->dp_spa),
+	    dsl_scan_cancel_resilver_suspended_check, dsl_scan_cancel_sync,
+	    NULL, 3, ZFS_SPACE_CHECK_RESERVED));
 }
 
 static int
@@ -2527,7 +2569,8 @@ dsl_scan_visitbp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 	 * at or after cur_min_txg.  About logical birth we care for traversal,
 	 * looking for any changes, while about physical for the actual scan.
 	 */
-	if (BP_GET_BIRTH(bp) <= scn->scn_phys.scn_cur_min_txg) {
+	if (!dsl_scan_visit_mapped(dp->dp_spa, bp,
+	    scn->scn_phys.scn_cur_min_txg)) {
 		scn->scn_lt_min_this_txg++;
 		return;
 	}
@@ -2558,6 +2601,10 @@ dsl_scan_visitbp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 		return;
 	}
 
+#ifdef _KERNEL
+	pr19262_engine_r02_worker(dp->dp_spa, bp,
+	    ds != NULL && ds->ds_is_snapshot);
+#endif
 	scan_funcs[scn->scn_phys.scn_func](dp, bp, zb);
 }
 
@@ -2917,7 +2964,8 @@ dsl_scan_visitds(dsl_scan_t *scn, uint64_t dsobj, dmu_tx_t *tx)
 	VERIFY3U(0, ==, dsl_dataset_hold_obj(dp, dsobj, FTAG, &ds));
 
 	if (scn->scn_phys.scn_cur_min_txg >=
-	    scn->scn_phys.scn_max_txg) {
+	    scn->scn_phys.scn_max_txg &&
+	    !pr19262_engine_active(dp->dp_spa)) {
 		/*
 		 * This can happen if this snapshot was created after the
 		 * scan started, and we already completed a previous snapshot
@@ -3748,12 +3796,19 @@ static int
 dsl_scan_free_block_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
 {
 	dsl_scan_t *scn = arg;
+	boolean_t pausable = !scn->scn_is_bptree ||
+	    (BP_GET_LEVEL(bp) == 0 && BP_GET_TYPE(bp) != DMU_OT_OBJSET);
 
-	if (!scn->scn_is_bptree ||
-	    (BP_GET_LEVEL(bp) == 0 && BP_GET_TYPE(bp) != DMU_OT_OBJSET)) {
-		if (dsl_scan_async_block_should_pause(scn))
-			return (SET_ERROR(ERESTART));
-	}
+	if (pausable && dsl_scan_async_block_should_pause(scn))
+		return (SET_ERROR(ERESTART));
+	/*
+	 * PR19262 L13: the catalog rows this free retires must fit this
+	 * txg's store; one that does not waits for the next txg, like the
+	 * pause above.  A block the traversal cannot stop at (a bptree
+	 * parent after its children, an objset) is charged past the budget.
+	 */
+	if (!pr19262_engine_free_bulk(scn->scn_dp->dp_spa, bp, !pausable))
+		return (SET_ERROR(ERESTART));
 
 	zio_t *zio = zio_free_sync(scn->scn_zio_root, scn->scn_dp->dp_spa,
 	    dmu_tx_get_txg(tx), bp, 0);
@@ -3870,8 +3925,14 @@ dsl_scan_active(dsl_scan_t *scn)
 		return (B_FALSE);
 	if (spa_shutting_down(spa))
 		return (B_FALSE);
+	/*
+	 * PR19262 L13: an async destroy whose frees wait for catalog room
+	 * (free bpobj or bptree; a free bpobj that waits skips the bptree,
+	 * so scn_async_stalled is not set) forces no txg of its own.
+	 */
+	boolean_t waiting = pr19262_engine_free_stalled(spa);
 	if ((dsl_scan_is_running(scn) && !dsl_scan_is_paused_scrub(scn)) ||
-	    (scn->scn_async_destroying && !scn->scn_async_stalled))
+	    (scn->scn_async_destroying && !scn->scn_async_stalled && !waiting))
 		return (B_TRUE);
 
 	if (spa_version(scn->scn_dp->dp_spa) >= SPA_VERSION_DEADLISTS) {
@@ -3879,6 +3940,8 @@ dsl_scan_active(dsl_scan_t *scn)
 		    &used, &comp, &uncomp);
 	}
 	clones_left = spa_livelist_delete_check(spa);
+	if (used != 0 && waiting)
+		used = 0;
 	return ((used != 0) || (clones_left));
 }
 
@@ -3913,6 +3976,41 @@ dsl_scan_check_deferred(vdev_t *vd)
 		need_resilver = B_TRUE;
 
 	return (need_resilver);
+}
+
+static boolean_t
+dsl_scan_backing(spa_t *spa, const blkptr_t *bp, int d, dva_t *dva,
+    uint64_t *birth)
+{
+	*dva = bp->blk_dva[d];
+	*birth = BP_GET_PHYSICAL_BIRTH(bp);
+	boolean_t mapped = pr19262_engine_scan_backing(spa, bp, d, dva, birth);
+#ifdef _KERNEL
+	pr19262_engine_r02_backing(spa, bp, d, dva, *birth, mapped);
+#endif
+	return (mapped);
+}
+
+static boolean_t
+dsl_scan_visit_mapped(spa_t *spa, const blkptr_t *bp, uint64_t min)
+{
+	if (BP_GET_BIRTH(bp) > min)
+		return (B_TRUE);
+	/*
+	 * An old objset root can itself be level zero, while still containing
+	 * metadata that leads to a later mapped data leaf.  Its B cannot prune
+	 * that descent when the engine may supply a newer backing P below it.
+	 */
+	if (pr19262_engine_active(spa) &&
+	    (BP_GET_LEVEL(bp) != 0 || DMU_OT_IS_METADATA(BP_GET_TYPE(bp))))
+		return (B_TRUE);
+	for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
+		dva_t dva;
+		uint64_t birth;
+		if (dsl_scan_backing(spa, bp, d, &dva, &birth) && birth > min)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
 }
 
 static boolean_t
@@ -4553,7 +4651,20 @@ dsl_scan_sync(dsl_pool_t *dp, dmu_tx_t *tx)
 	 * deferred resilvers via zfs_resilver_disable_defer, or if the
 	 * current scan progress is below zfs_resilver_defer_percent.
 	 */
-	if (dsl_scan_restarting(scn, tx) || restart_early) {
+	boolean_t restart = dsl_scan_restarting(scn, tx) || restart_early;
+#ifdef _KERNEL
+	/*
+	 * A parked R-01 is cancelled first; a released, drained or cancelled
+	 * one is left alone.  The restart is postponed to a later txg while
+	 * that would wait here for work that needs a txg.
+	 */
+	if (restart && !pr19262_engine_r01_scan_restart(spa)) {
+		zfs_dbgmsg("postponing scan restart on %s txg=%llu: R-01 "
+		    "busy", spa->spa_name, (u_longlong_t)tx->tx_txg);
+		restart = B_FALSE;
+	}
+#endif
+	if (restart) {
 		setup_sync_arg_t setup_sync_arg = {
 			.func = POOL_SCAN_SCRUB,
 			.txgstart = 0,
@@ -4819,6 +4930,16 @@ dsl_scan_sync(dsl_pool_t *dp, dmu_tx_t *tx)
 		    (longlong_t)tx->tx_txg,
 		    spa->spa_name);
 		ASSERT3U(scn->scn_done_txg, !=, 0);
+		/*
+		 * The detached child's callback needs this scan state.
+		 * Keep it until release/cancel waits the root.
+		 */
+#ifdef _KERNEL
+		if (pr19262_engine_r01_scan_pending(spa)) {
+			dsl_scan_sync_state(scn, tx, SYNC_MANDATORY);
+			return;
+		}
+#endif
 		ASSERT0(spa->spa_scrub_inflight);
 		ASSERT0(scn->scn_queues_pending);
 		dsl_scan_done(scn, B_TRUE, tx);
@@ -5001,8 +5122,8 @@ dsl_scan_scrub_cb(dsl_pool_t *dp,
 {
 	dsl_scan_t *scn = dp->dp_scan;
 	spa_t *spa = dp->dp_spa;
-	uint64_t phys_birth = BP_GET_PHYSICAL_BIRTH(bp);
 	size_t psize = BP_GET_PSIZE(bp);
+	boolean_t in_window = B_FALSE;
 	boolean_t needs_io = B_FALSE;
 	int zio_flags = ZIO_FLAG_SCAN_THREAD | ZIO_FLAG_CANFAIL;
 
@@ -5011,8 +5132,22 @@ dsl_scan_scrub_cb(dsl_pool_t *dp,
 		zio_flags |= ZIO_FLAG_RAW;
 
 	count_block(dp->dp_blkstats, bp);
-	if (phys_birth <= scn->scn_phys.scn_min_txg ||
-	    phys_birth >= scn->scn_phys.scn_max_txg) {
+	for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
+		dva_t dva;
+		uint64_t birth;
+		boolean_t mapped = dsl_scan_backing(spa, bp, d, &dva, &birth);
+		uint64_t original_birth = BP_GET_PHYSICAL_BIRTH(bp);
+
+		in_window |= birth > scn->scn_phys.scn_min_txg &&
+		    birth < scn->scn_phys.scn_max_txg;
+		if (scn->scn_phys.scn_func == POOL_SCAN_RESILVER &&
+		    mapped && original_birth != 0 && original_birth != birth) {
+			in_window |= original_birth >
+			    scn->scn_phys.scn_min_txg &&
+			    original_birth < scn->scn_phys.scn_max_txg;
+		}
+	}
+	if (!in_window) {
 		/* Traversed but not scrubbed; both counters must see it. */
 		uint64_t asize = BP_GET_ASIZE(bp);
 		scn->scn_phys.scn_examined += asize;
@@ -5039,21 +5174,44 @@ dsl_scan_scrub_cb(dsl_pool_t *dp,
 		zio_flags |= ZIO_FLAG_SPECULATIVE;
 
 	for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
-		const dva_t *dva = &bp->blk_dva[d];
+		dva_t dva;
+		uint64_t birth;
+		boolean_t mapped = dsl_scan_backing(spa, bp, d, &dva, &birth);
+		uint64_t original_birth = BP_GET_PHYSICAL_BIRTH(bp);
 
 		/*
 		 * Keep track of how much data we've examined so that
 		 * zpool(8) status can make useful progress reports.
 		 */
-		uint64_t asize = DVA_GET_ASIZE(dva);
+		uint64_t asize = DVA_GET_ASIZE(&dva);
 		scn->scn_phys.scn_examined += asize;
 		spa->spa_scan_pass_exam += asize;
 
-		/* if it's a resilver, this may not be in the target range */
-		if (!needs_io)
-			needs_io = dsl_scan_need_resilver(spa, dva, psize,
-			    phys_birth);
+		/* Test mapped P before original B. */
+		if (!needs_io &&
+		    birth > scn->scn_phys.scn_min_txg &&
+		    birth < scn->scn_phys.scn_max_txg)
+			needs_io = dsl_scan_need_resilver(spa, &dva, psize,
+			    birth);
+
+		/*
+		 * An engine-mapped BP may inherit the missing range of its
+		 * original B allocation.  Test B with its original DVA, not the
+		 * P DVA.
+		 */
+		if (!needs_io && scn->scn_phys.scn_func == POOL_SCAN_RESILVER &&
+		    mapped && original_birth != 0 && original_birth != birth &&
+		    original_birth > scn->scn_phys.scn_min_txg &&
+		    original_birth < scn->scn_phys.scn_max_txg)
+			needs_io = dsl_scan_need_resilver(spa, &bp->blk_dva[d],
+			    psize, original_birth);
 	}
+
+#ifdef _KERNEL
+	pr19262_engine_r02_decision(spa, bp, scn->scn_phys.scn_func,
+	    scn->scn_phys.scn_min_txg, scn->scn_phys.scn_max_txg, needs_io,
+	    needs_io && !zfs_no_scrub_io);
+#endif
 
 	if (needs_io && !zfs_no_scrub_io) {
 		dsl_scan_enqueue(dp, bp, zio_flags, zb);
@@ -5079,7 +5237,7 @@ dsl_scan_scrub_done(zio_t *zio)
 		spa->spa_scrub_inflight -= zio->io_size;
 		cv_broadcast(&spa->spa_scrub_io_cv);
 		mutex_exit(&spa->spa_scrub_lock);
-	} else {
+	} else if (!zio->io_pr19262_r01_scan_credit_released) {
 		mutex_enter(&queue->q_vd->vdev_scan_io_queue_lock);
 		ASSERT3U(queue->q_inflight_bytes, >=, zio->io_size);
 		queue->q_inflight_bytes -= zio->io_size;
@@ -5115,6 +5273,27 @@ dsl_scan_scrub_done(zio_t *zio)
 	}
 }
 
+#ifdef _KERNEL
+/*
+ * PREBINDING keeps the logical ZIO unstarted and non-releasable, so this is
+ * the sole return of its queued credit before it becomes observable as
+ * PARKED.  The done callback skips this exact debit after the native root
+ * later completes.
+ */
+static void
+dsl_scan_r01_queue_credit_release(zio_t *zio, dsl_scan_io_queue_t *queue)
+{
+	ASSERT3P(queue, !=, NULL);
+	ASSERT(!zio->io_pr19262_r01_scan_credit_released);
+	mutex_enter(&queue->q_vd->vdev_scan_io_queue_lock);
+	ASSERT3U(queue->q_inflight_bytes, >=, zio->io_size);
+	queue->q_inflight_bytes -= zio->io_size;
+	zio->io_pr19262_r01_scan_credit_released = B_TRUE;
+	cv_broadcast(&queue->q_zio_cv);
+	mutex_exit(&queue->q_vd->vdev_scan_io_queue_lock);
+}
+#endif
+
 /*
  * Given a scanning zio's information, executes the zio. The zio need
  * not necessarily be only sortable, this function simply executes the
@@ -5126,7 +5305,6 @@ static void
 scan_exec_io(dsl_pool_t *dp, const blkptr_t *bp, int zio_flags,
     const zbookmark_phys_t *zb, dsl_scan_io_queue_t *queue, scan_io_t *sio)
 {
-	(void) sio;
 	spa_t *spa = dp->dp_spa;
 	dsl_scan_t *scn = dp->dp_scan;
 	/*
@@ -5136,6 +5314,10 @@ scan_exec_io(dsl_pool_t *dp, const blkptr_t *bp, int zio_flags,
 	    BP_GET_PSIZE(bp) : BP_GET_LSIZE(bp);
 	abd_t *data = abd_alloc_for_io(size, B_FALSE);
 	zio_t *pio;
+	zio_t *zio;
+#ifdef _KERNEL
+	zio_t *r01_root = NULL;
+#endif
 
 	if (queue == NULL) {
 		ASSERT3U(scn->scn_maxinflight_bytes, >, 0);
@@ -5157,22 +5339,49 @@ scan_exec_io(dsl_pool_t *dp, const blkptr_t *bp, int zio_flags,
 		mutex_exit(q_lock);
 	}
 
+	/*
+	 * The detached root is valid only for the non-gang bound-read path
+	 * below.  Other scan paths use an ordinary zio_read() and must remain
+	 * attached to their scan root, or an armed observer would have no
+	 * dispatch to consume/release its routed root.
+	 */
+#ifdef _KERNEL
+	if (sio != NULL && sio->sio_pr19262_owner_hold != NULL &&
+	    !BP_IS_GANG(bp)) {
+		r01_root = pr19262_engine_r01_scan_parent(spa, bp, zio_flags,
+		    sio->sio_pr19262_owner_hold);
+		if (r01_root != NULL)
+			pio = r01_root;
+	}
+#endif
 	ASSERT(pio != NULL);
 	count_block_issued(spa, bp, queue == NULL);
 	if (sio != NULL && sio->sio_pr19262_owner_hold != NULL) {
-		zio_nowait(pr19262_engine_read_bound(pio, spa, bp, data,
+		zio = pr19262_engine_read_bound(pio, spa, bp, data,
 		    size, dsl_scan_scrub_done, queue, ZIO_PRIORITY_SCRUB,
-		    zio_flags, zb, &sio->sio_pr19262_owner_hold));
-		return;
-	}
-	if (sio != NULL && sio->sio_pr19262_hold != NULL) {
-		zio_nowait(pr19262_reloc_read_bound(pio, spa, bp, data,
+		    zio_flags, zb, &sio->sio_pr19262_owner_hold);
+	} else if (sio != NULL && sio->sio_pr19262_hold != NULL) {
+		zio = pr19262_reloc_read_bound(pio, spa, bp, data,
 		    size, dsl_scan_scrub_done, queue, ZIO_PRIORITY_SCRUB,
-		    zio_flags, zb, &sio->sio_pr19262_hold));
-		return;
+		    zio_flags, zb, &sio->sio_pr19262_hold);
+	} else {
+		zio = zio_read(pio, spa, bp, data, size, dsl_scan_scrub_done,
+		    queue, ZIO_PRIORITY_SCRUB, zio_flags, zb);
 	}
-	zio_nowait(zio_read(pio, spa, bp, data, size, dsl_scan_scrub_done,
-	    queue, ZIO_PRIORITY_SCRUB, zio_flags, zb));
+#ifdef _KERNEL
+	int r01_error = r01_root != NULL ? pr19262_engine_r01_prebind(zio) :
+	    0;
+	if (r01_error == EINPROGRESS) {
+		dsl_scan_r01_queue_credit_release(zio, queue);
+		pr19262_engine_r01_prebind_publish(zio);
+	} else {
+		zio_nowait(zio);
+	}
+	if (r01_root != NULL)
+		pr19262_engine_r01_scan_submit_done(spa, r01_root);
+#else
+	zio_nowait(zio);
+#endif
 }
 
 /*

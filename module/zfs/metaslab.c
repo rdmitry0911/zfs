@@ -6144,7 +6144,7 @@ metaslab_claim_dva(spa_t *spa, const dva_t *dva, uint64_t birth, uint64_t txg)
 	if (DVA_GET_GANG(dva))
 		size = vdev_gang_header_asize(vd, birth);
 
-	if (txg != 0 && pr19262_engine_journal_claimed(spa, vd,
+	if (txg != 0 && pr19262_engine_journal_reference(spa, vd,
 	    offset, size, birth, txg))
 		return (0);
 	return (metaslab_claim_impl(vd, offset, size, txg));

@@ -193,7 +193,23 @@ typedef struct spa_checkpoint_discard_sync_callback_arg {
 	vdev_t *sdc_vd;
 	uint64_t sdc_txg;
 	uint64_t sdc_entry_limit;
+	/*
+	 * The relocation engine retires what an entry names only as far as
+	 * the catalog store of this txg has room: the rest of a cut entry
+	 * goes back to the space map, and the step stops (PR19262 L11).
+	 */
+	uint64_t sdc_rest_offset;
+	uint64_t sdc_rest_size;
+	uint64_t sdc_done;
+	boolean_t sdc_deferred;
 } spa_checkpoint_discard_sync_callback_arg_t;
+
+/* One discard step of the discard thread, and what it achieved. */
+typedef struct spa_checkpoint_discard_step {
+	vdev_t *sds_vd;
+	uint64_t sds_done;
+	boolean_t sds_deferred;
+} spa_checkpoint_discard_step_t;
 
 static int
 spa_checkpoint_discard_sync_callback(space_map_entry_t *sme, void *arg)
@@ -227,10 +243,19 @@ spa_checkpoint_discard_sync_callback(space_map_entry_t *sme, void *arg)
 	 * potentially save ourselves from future headaches.
 	 */
 	boolean_t retained = B_FALSE;
+	uint64_t done = sme->sme_run;
 	int error = pr19262_engine_checkpoint_discard(vd, sme->sme_offset,
-	    sme->sme_run, &retained);
+	    sme->sme_run, &retained, &done);
 	if (error != 0)
 		return (error);
+	if (done == 0) {
+		/* No catalog room left in this txg: the entry stays. */
+		sdc->sdc_deferred = B_TRUE;
+		return (SET_ERROR(EINTR));
+	}
+	VERIFY3U(done, <=, sme->sme_run);
+	VERIFY(retained || done == sme->sme_run);
+	VERIFY0(P2PHASE(done, 1ULL << vd->vdev_checkpoint_sm->sm_shift));
 	if (!retained) {
 		mutex_enter(&ms->ms_lock);
 		if (zfs_range_tree_is_empty(ms->ms_freeing))
@@ -240,13 +265,23 @@ spa_checkpoint_discard_sync_callback(space_map_entry_t *sme, void *arg)
 		mutex_exit(&ms->ms_lock);
 	}
 
-	ASSERT3U(vd->vdev_spa->spa_checkpoint_info.sci_dspace, >=,
-	    sme->sme_run);
-	ASSERT3U(vd->vdev_stat.vs_checkpoint_space, >=, sme->sme_run);
+	ASSERT3U(vd->vdev_spa->spa_checkpoint_info.sci_dspace, >=, done);
+	ASSERT3U(vd->vdev_stat.vs_checkpoint_space, >=, done);
 
-	vd->vdev_spa->spa_checkpoint_info.sci_dspace -= sme->sme_run;
-	vd->vdev_stat.vs_checkpoint_space -= sme->sme_run;
+	vd->vdev_spa->spa_checkpoint_info.sci_dspace -= done;
+	vd->vdev_stat.vs_checkpoint_space -= done;
+	sdc->sdc_done += done;
 	sdc->sdc_entry_limit--;
+	if (done < sme->sme_run) {
+		/*
+		 * Cut: this entry leaves the space map, its rest goes back
+		 * in after the iteration, and the next callback stops it.
+		 */
+		sdc->sdc_rest_offset = sme->sme_offset + done;
+		sdc->sdc_rest_size = sme->sme_run - done;
+		sdc->sdc_deferred = B_TRUE;
+		sdc->sdc_entry_limit = 0;
+	}
 
 	return (0);
 }
@@ -280,7 +315,8 @@ spa_checkpoint_accounting_verify(spa_t *spa)
 static void
 spa_checkpoint_discard_thread_sync(void *arg, dmu_tx_t *tx)
 {
-	vdev_t *vd = arg;
+	spa_checkpoint_discard_step_t *sds = arg;
+	vdev_t *vd = sds->sds_vd;
 	int error;
 
 	/*
@@ -319,7 +355,7 @@ spa_checkpoint_discard_thread_sync(void *arg, dmu_tx_t *tx)
 	 *    in the space map that will be cleared in a future invocation
 	 *    of this function by spa_checkpoint_discard_thread().
 	 */
-	spa_checkpoint_discard_sync_callback_arg_t sdc;
+	spa_checkpoint_discard_sync_callback_arg_t sdc = { 0 };
 	sdc.sdc_vd = vd;
 	sdc.sdc_txg = tx->tx_txg;
 	sdc.sdc_entry_limit = max_entry_limit;
@@ -330,6 +366,36 @@ spa_checkpoint_discard_thread_sync(void *arg, dmu_tx_t *tx)
 	error = space_map_incremental_destroy(vd->vdev_checkpoint_sm,
 	    spa_checkpoint_discard_sync_callback, &sdc, tx);
 
+	if (sdc.sdc_rest_size != 0) {
+		/*
+		 * The rest of a cut entry, still checkpointed, becomes the
+		 * last entry again: in this txg, so the space map and the
+		 * engine's catalog name each range exactly once.  The cut
+		 * stops the iteration at its next entry, but reading that
+		 * entry's block may fail first: the step still ends as a
+		 * partial one, and the next step reads the block again and
+		 * meets the error on the stock path below (L14).
+		 */
+		if (error != 0 && error != EINTR) {
+			zfs_dbgmsg("discarding checkpoint: txg %llu, vdev id "
+			    "%lld, error %d reading the space map after a "
+			    "cut; the next step retries",
+			    (u_longlong_t)tx->tx_txg, (longlong_t)vd->vdev_id,
+			    error);
+		}
+		zfs_range_tree_t *rest = zfs_range_tree_create(NULL,
+		    ZFS_RANGE_SEG64, NULL, 0, 0);
+		zfs_range_tree_add(rest, sdc.sdc_rest_offset,
+		    sdc.sdc_rest_size);
+		space_map_write(vd->vdev_checkpoint_sm, rest, SM_FREE,
+		    SM_NO_VDEVID, tx);
+		zfs_range_tree_vacate(rest, NULL, NULL);
+		zfs_range_tree_destroy(rest);
+		error = SET_ERROR(EINTR);
+	}
+	sds->sds_done = sdc.sdc_done;
+	sds->sds_deferred = sdc.sdc_deferred;
+
 	uint64_t words_after =
 	    space_map_length(vd->vdev_checkpoint_sm) / sizeof (uint64_t);
 
@@ -338,9 +404,9 @@ spa_checkpoint_discard_thread_sync(void *arg, dmu_tx_t *tx)
 #endif
 
 	zfs_dbgmsg("discarding checkpoint: txg %llu, vdev id %lld, "
-	    "deleted %llu words - %llu words are left",
+	    "deleted %lld words - %llu words are left",
 	    (u_longlong_t)tx->tx_txg, (longlong_t)vd->vdev_id,
-	    (u_longlong_t)(words_before - words_after),
+	    (longlong_t)(words_before - words_after),
 	    (u_longlong_t)words_after);
 
 	if (error != EINTR) {
@@ -434,11 +500,21 @@ spa_checkpoint_discard_thread(void *arg, zthr_t *zthr)
 				    error, vd->vdev_id);
 			}
 
+			spa_checkpoint_discard_step_t sds = { .sds_vd = vd };
 			VERIFY0(dsl_sync_task(spa->spa_name, NULL,
-			    spa_checkpoint_discard_thread_sync, vd,
+			    spa_checkpoint_discard_thread_sync, &sds,
 			    0, ZFS_SPACE_CHECK_NONE));
 
 			dmu_buf_rele_array(dbp, numbufs, FTAG);
+
+			/*
+			 * A step that retired nothing for lack of catalog room
+			 * waits for room, outside syncing context, instead of
+			 * syncing empty steps (PR19262 L11).
+			 */
+			if (sds.sds_deferred && sds.sds_done == 0)
+				pr19262_engine_checkpoint_discard_wait(spa,
+				    zthr);
 		}
 	}
 
@@ -474,7 +550,7 @@ spa_checkpoint_check(void *arg, dmu_tx_t *tx)
 	if (spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT))
 		return (SET_ERROR(ZFS_ERR_DISCARDING_CHECKPOINT));
 
-	return (0);
+	return (pr19262_engine_checkpoint_admit(spa));
 }
 
 static void

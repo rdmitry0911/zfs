@@ -13733,6 +13733,507 @@ pr19262_mgrowth_retry_witness(spa_t *spa)
 	_exit(0);
 }
 
+typedef struct pr19262_r02_manifest_witness {
+	pr19262_r02_manifest_t summary;
+	zio_cksum_t hash;
+	uint64_t entries;
+} pr19262_r02_manifest_witness_t;
+
+static int
+pr19262_r02_manifest_visit(void *arg,
+    const pr19262_r02_manifest_entry_t *entry)
+{
+	pr19262_r02_manifest_witness_t *witness = arg;
+	if (entry == NULL || entry->kind < PR19262_R02_MANIFEST_ROOT ||
+	    entry->kind > PR19262_R02_MANIFEST_JOURNAL_PENDING)
+		return (EINVAL);
+	uint64_t words[8] = { entry->kind, entry->physical, entry->pages,
+	    entry->generation, entry->hash.zc_word[0], entry->hash.zc_word[1],
+	    entry->hash.zc_word[2], entry->hash.zc_word[3] };
+	(void) fletcher_4_incremental_native(words, sizeof (words),
+	    &witness->hash);
+	switch (entry->kind) {
+	case PR19262_R02_MANIFEST_ROOT:
+		witness->summary.roots++;
+		break;
+	case PR19262_R02_MANIFEST_CATALOG:
+		witness->summary.catalog_pages += entry->pages;
+		break;
+	case PR19262_R02_MANIFEST_TREE:
+		witness->summary.tree_pages += entry->pages;
+		break;
+	case PR19262_R02_MANIFEST_CONTROL:
+		witness->summary.control_pages += entry->pages;
+		break;
+	case PR19262_R02_MANIFEST_DIRECTORY:
+		witness->summary.directory_pages += entry->pages;
+		break;
+	case PR19262_R02_MANIFEST_ACTIVE_ARENA:
+		witness->summary.active_arenas++;
+		break;
+	case PR19262_R02_MANIFEST_PENDING_ARENA:
+		witness->summary.pending_arenas++;
+		break;
+	case PR19262_R02_MANIFEST_JOURNAL_HEAD:
+		witness->summary.journal_heads++;
+		break;
+	case PR19262_R02_MANIFEST_JOURNAL_BIND:
+		witness->summary.journal_binds += entry->pages;
+		break;
+	case PR19262_R02_MANIFEST_JOURNAL_FORWARD:
+		witness->summary.journal_forwards += entry->pages;
+		break;
+	case PR19262_R02_MANIFEST_JOURNAL_PENDING:
+		witness->summary.journal_pending++;
+		break;
+	default:
+		return (EINVAL);
+	}
+	witness->entries++;
+	return (0);
+}
+
+/*
+ * Cold, read-only R02 witness.  The two synthetic negative calls use the
+ * collector's shared eligibility gate; they do not alter a vdev or an
+ * uberblock, and so prove refusal happens before manifest raw I/O.
+ */
+static int
+pr19262_r02_manifest_observer(spa_t *spa)
+{
+	pr19262_r02_manifest_state_t before, after_negative, after;
+	pr19262_r02_manifest_t summary, first_summary, second_summary;
+	pr19262_r02_manifest_witness_t first = { 0 }, second = { 0 };
+	VERIFY0(pr19262_engine_r02_manifest_test_state(spa, &before));
+	VERIFY(before.persistent && before.direct && !before.replacing);
+	VERIFY3U(before.codec, >=, 6);
+	VERIFY3U(before.codec, <=, 7);
+	VERIFY3S(pr19262_engine_r02_manifest_test_reject(spa, B_TRUE,
+	    before.codec), ==, ENOTSUP);
+	VERIFY3S(pr19262_engine_r02_manifest_test_reject(spa, B_FALSE, 5),
+	    ==, ENOTSUP);
+	VERIFY0(pr19262_engine_r02_manifest_test_state(spa, &after_negative));
+	VERIFY0(memcmp(&before, &after_negative, sizeof (before)));
+	VERIFY0(pr19262_engine_r02_manifest(spa, &summary));
+	VERIFY0(pr19262_engine_r02_manifest_walk(spa,
+	    pr19262_r02_manifest_visit, &first, &first_summary));
+	VERIFY0(pr19262_engine_r02_manifest_walk(spa,
+	    pr19262_r02_manifest_visit, &second, &second_summary));
+	VERIFY3U(summary.roots, >, 0);
+	VERIFY3U(summary.journal_heads, >, 0);
+	if (getenv("PR19262_R02_DIRECT_MANIFEST_REQUIRE_JOURNAL_BIND") != NULL)
+		VERIFY3U(summary.journal_binds, >, 0);
+	VERIFY3U(first.entries, >, 0);
+	VERIFY0(memcmp(&summary, &first_summary, sizeof (summary)));
+	VERIFY0(memcmp(&summary, &second_summary, sizeof (summary)));
+	VERIFY3U(first.entries, ==, second.entries);
+	VERIFY0(memcmp(&first.summary, &second.summary,
+	    sizeof (first.summary)));
+	VERIFY0(memcmp(&first.hash, &second.hash, sizeof (first.hash)));
+	VERIFY0(pr19262_engine_r02_manifest_test_state(spa, &after));
+	VERIFY0(memcmp(&before, &after, sizeof (before)));
+	(void) printf("PR19262_R02_MANIFEST_PASS direct=1 replacing=ENOTSUP "
+	    "codec5=ENOTSUP io_errors=%llu entries=%llu roots=%llu "
+	    "journal_heads=%llu journal_binds=%llu journal_forwards=%llu "
+	    "journal_pending=%llu "
+	    "hash=%llx,%llx,%llx,%llx state_stable=1 visitor=1\n",
+	    (u_longlong_t)after.io_errors, (u_longlong_t)first.entries,
+	    (u_longlong_t)summary.roots,
+	    (u_longlong_t)summary.journal_heads,
+	    (u_longlong_t)summary.journal_binds,
+	    (u_longlong_t)summary.journal_forwards,
+	    (u_longlong_t)summary.journal_pending,
+	    (u_longlong_t)first.hash.zc_word[0],
+	    (u_longlong_t)first.hash.zc_word[1],
+	    (u_longlong_t)first.hash.zc_word[2],
+	    (u_longlong_t)first.hash.zc_word[3]);
+	(void) fflush(NULL);
+	return (0);
+}
+
+
+/*
+ * R02 exact-new-leaf reseed witness (D70 candidate).  Modes, selected by
+ * PR19262_R02_RESEED on a writable cold import of a durable fixture:
+ * replace, tunable0, cancel, fault and verify.  PR19262_R02_RESEED_CUT
+ * names one crash cut stage (1-3 A1-A3, 5 A4, 11-14 D1-D4).
+ */
+static vdev_t *
+pr19262_r02_slot(spa_t *spa, uint64_t c)
+{
+	vdev_t *vd = pr19262_engine_vdev(spa);
+	VERIFY3P(vd, !=, NULL);
+	VERIFY3U(c, <, vd->vdev_children);
+	return (vd->vdev_child[c]);
+}
+
+static void
+pr19262_r02_shape(spa_t *spa, const char *label)
+{
+	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+	vdev_t *slot = pr19262_r02_slot(spa, 0);
+	boolean_t pair = slot->vdev_ops == &vdev_replacing_ops;
+	(void) printf("PR19262_R02_SHAPE at=%s slot0=%s children=%llu "
+	    "path=%s\n", label, pair ? "replacing" : "leaf",
+	    (u_longlong_t)slot->vdev_children,
+	    pair ? slot->vdev_child[1]->vdev_path : slot->vdev_path);
+	spa_config_exit(spa, SCL_VDEV, FTAG);
+}
+
+static boolean_t
+pr19262_r02_is_pair(spa_t *spa)
+{
+	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+	boolean_t pair = pr19262_r02_slot(spa, 0)->vdev_ops ==
+	    &vdev_replacing_ops;
+	spa_config_exit(spa, SCL_VDEV, FTAG);
+	return (pair);
+}
+
+static int
+pr19262_r02_manifest_line(spa_t *spa, const char *label)
+{
+	pr19262_r02_manifest_t s;
+	int error = pr19262_engine_r02_manifest(spa, &s);
+	(void) printf("PR19262_R02_RESEED_MANIFEST at=%s error=%d roots=%llu "
+	    "catalog=%llu tree=%llu control=%llu journal_heads=%llu "
+	    "journal_binds=%llu journal_forwards=%llu journal_pending=%llu\n",
+	    label, error, (u_longlong_t)s.roots,
+	    (u_longlong_t)s.catalog_pages, (u_longlong_t)s.tree_pages,
+	    (u_longlong_t)s.control_pages, (u_longlong_t)s.journal_heads,
+	    (u_longlong_t)s.journal_binds, (u_longlong_t)s.journal_forwards,
+	    (u_longlong_t)s.journal_pending);
+	return (error);
+}
+
+static int
+pr19262_r02_audit_line(spa_t *spa, const char *label, uint64_t *state)
+{
+	uint64_t faults, seeds, audits;
+	int error = pr19262_engine_r02_pair_audit(spa, state, &faults, &seeds,
+	    &audits);
+	(void) printf("PR19262_R02_RESEED_AUDIT at=%s error=%d state=%llu "
+	    "faults=%llu seeds=%llu audits=%llu\n", label, error,
+	    (u_longlong_t)*state, (u_longlong_t)faults, (u_longlong_t)seeds,
+	    (u_longlong_t)audits);
+	return (error);
+}
+
+static int
+pr19262_r02_attach(spa_t *spa, const char *directory, char **pathp)
+{
+	char *path, *old;
+	VERIFY3S(asprintf(&path, "%s/n0", directory), >, 0);
+	VERIFY3S(asprintf(&old, "%s/v0", directory), >, 0);
+	struct stat st;
+	VERIFY0(stat(old, &st));
+	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	VERIFY3S(fd, >=, 0);
+	VERIFY0(ftruncate(fd, st.st_size));
+	VERIFY0(close(fd));
+	nvlist_t *leaf = fnvlist_alloc();
+	fnvlist_add_string(leaf, ZPOOL_CONFIG_TYPE, VDEV_TYPE_FILE);
+	fnvlist_add_string(leaf, ZPOOL_CONFIG_PATH, path);
+	fnvlist_add_uint64(leaf, ZPOOL_CONFIG_ASHIFT,
+	    pr19262_env_u64("PR19262_ENGINE_ASHIFT", 12));
+	nvlist_t *root = fnvlist_alloc();
+	fnvlist_add_string(root, ZPOOL_CONFIG_TYPE, VDEV_TYPE_ROOT);
+	fnvlist_add_nvlist_array(root, ZPOOL_CONFIG_CHILDREN,
+	    (const nvlist_t * const *)&leaf, 1);
+	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+	uint64_t guid = pr19262_r02_slot(spa, 0)->vdev_guid;
+	spa_config_exit(spa, SCL_VDEV, FTAG);
+	int error = spa_vdev_attach(spa, guid, root, B_TRUE, B_FALSE);
+	(void) printf("PR19262_R02_ATTACH error=%d tunable=%d\n", error,
+	    zfs_pr19262_r02_reseed);
+	fnvlist_free(root);
+	fnvlist_free(leaf);
+	free(old);
+	*pathp = path;
+	return (error);
+}
+
+/*
+ * Release the held resilver and wait for its automatic detach.  A pair
+ * imported after resilver completion has no automatic trigger; then the
+ * explicit detach path of the old leaf is exercised instead.
+ */
+static int
+pr19262_r02_finish(spa_t *spa)
+{
+	zfs_scan_suspend_progress = 0;
+	for (int i = 0; i < 400; i++) {
+		if (!pr19262_r02_is_pair(spa)) {
+			(void) printf("PR19262_R02_DETACH path=automatic\n");
+			return (0);
+		}
+		txg_wait_synced(spa_get_dsl(spa), 0);
+		(void) poll(NULL, 0, 50);
+	}
+	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+	vdev_t *pvd = pr19262_r02_slot(spa, 0);
+	uint64_t oguid = pvd->vdev_child[0]->vdev_guid;
+	uint64_t pguid = pvd->vdev_guid;
+	spa_config_exit(spa, SCL_VDEV, FTAG);
+	int error = spa_vdev_detach(spa, oguid, pguid, B_FALSE);
+	(void) printf("PR19262_R02_DETACH path=explicit error=%d\n", error);
+	if (error == 0 && pr19262_r02_is_pair(spa))
+		error = EAGAIN;
+	return (error);
+}
+
+/*
+ * v3.2 runtime readmit (review v3 item 2).  The old leaf v0 was moved
+ * aside before this import (PR19262_R02_RESEED_OLD_ASIDE), so import
+ * recovery could not audit it and it is stale.  Modes:
+ *   suspend: new-leaf fault while v0 is absent (no eligible endpoint), then
+ *            v0 returns (vdev_online) and a zpool-clear sequence runs;
+ *   early:   v0 returns before the new-leaf fault;
+ *   new:     v0 stays absent; the faulted new leaf is readmitted by the
+ *            zpool-clear sequence.
+ * Afterwards three rolls and syncs must succeed without suspension.
+ */
+static void
+pr19262_r02_clear(spa_t *spa, const char *label)
+{
+	boolean_t was = spa_suspended(spa);
+	spa_vdev_state_enter(spa, SCL_NONE);
+	vdev_clear(spa, NULL);
+	(void) spa_vdev_state_exit(spa, spa_suspended(spa) ? NULL :
+	    spa->spa_root_vdev, 0);
+	int error = zio_resume(spa);
+	(void) printf("PR19262_R02_READMIT_CLEAR at=%s was_suspended=%d "
+	    "resume=%d suspended=%d\n", label, was, error,
+	    spa_suspended(spa));
+}
+
+static void
+pr19262_r02_return_old(spa_t *spa, const char *directory, const char *aside)
+{
+	char *path;
+	VERIFY3S(asprintf(&path, "%s/v0", directory), >, 0);
+	VERIFY0(rename(aside, path));
+	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+	uint64_t guid = pr19262_r02_slot(spa, 0)->vdev_child[0]->vdev_guid;
+	spa_config_exit(spa, SCL_VDEV, FTAG);
+	vdev_state_t ns = VDEV_STATE_UNKNOWN;
+	int error = vdev_online(spa, guid, 0, &ns);
+	(void) printf("PR19262_R02_READMIT_ONLINE error=%d newstate=%d "
+	    "suspended=%d\n", error, (int)ns, spa_suspended(spa));
+	free(path);
+}
+
+static void
+pr19262_r02_fault_unheld(spa_t *spa)
+{
+	/*
+	 * No journal roll here: a failed roll fences the journal until the
+	 * next import (journal_error), which is not what this cell tests.
+	 * A dirty vdev state makes the next txg sync the config and the
+	 * engine store, whose exact-new-endpoint write then fails.
+	 */
+	zfs_pr19262_r02_new_endpoint_faults = 1;
+	spa_vdev_state_enter(spa, SCL_NONE);
+	int werr = spa_vdev_state_exit(spa, pr19262_engine_vdev(spa), 0);
+	(void) printf("PR19262_R02_READMIT_FAULT state_exit=%d "
+	    "suspended=%d\n", werr, spa_suspended(spa));
+}
+
+static void
+pr19262_r02_readmit_witness(spa_t *spa, const char *directory,
+    const char *mode, uint64_t *state)
+{
+	const char *aside = getenv("PR19262_R02_RESEED_OLD_ASIDE");
+	VERIFY(aside != NULL);
+	/* Keep the pair until pr19262_r02_finish() releases the scan. */
+	zfs_scan_suspend_progress = 1;
+	if (strcmp(mode, "early") == 0) {
+		pr19262_r02_return_old(spa, directory, aside);
+		zfs_pr19262_r02_new_endpoint_faults = 1;
+	} else {
+		VERIFY(strcmp(mode, "suspend") == 0 ||
+		    strcmp(mode, "new") == 0);
+		/*
+		 * Host artefact: the non-root ztest import cannot write the
+		 * cachefile, so the async thread retries a config update
+		 * (spa_config_update(), an unbounded txg wait under the
+		 * namespace lock).  If one is in flight when the pool
+		 * suspends, every later state exit blocks on the namespace
+		 * lock.  Hold async tasks across the suspended window.
+		 */
+		spa_async_suspend(spa);
+		pr19262_r02_fault_unheld(spa);
+		if (strcmp(mode, "suspend") == 0)
+			pr19262_r02_return_old(spa, directory, aside);
+		pr19262_r02_clear(spa, mode);
+		VERIFY(!spa_suspended(spa));
+		spa_async_resume(spa);
+	}
+	for (int i = 0; i < 3; i++) {
+		int e = pr19262_engine_journal_roll(spa);
+		(void) printf("PR19262_R02_READMIT_ROLL error=%d\n", e);
+		VERIFY0(e);
+		int w = txg_wait_synced_flags(spa_get_dsl(spa), 0,
+		    TXG_WAIT_SUSPEND);
+		(void) printf("PR19262_R02_READMIT_SYNC wait=%d suspended=%d\n",
+		    w, spa_suspended(spa));
+		VERIFY0(w);
+	}
+	(void) pr19262_r02_audit_line(spa, "readmitted", state);
+	VERIFY3U(*state, ==, strcmp(mode, "new") == 0 ? 1 : 2);
+}
+
+/* B3: the compiled default, read before any R02 cell overrides it. */
+static int pr19262_r02_reseed_default = -1;
+
+static int
+pr19262_r02_reseed_witness(spa_t *spa, const char *directory,
+    const char *mode)
+{
+	uint64_t state = 0;
+	char *path = NULL;
+	zfs_pr19262_r02_reseed = strcmp(mode, "tunable0") == 0 ? 0 :
+	    pr19262_r02_reseed_default;
+	zfs_pr19262_r02_reseed_cut = (int)pr19262_env_u64(
+	    "PR19262_R02_RESEED_CUT", 0);
+	pr19262_r02_shape(spa, "import");
+	if (strcmp(mode, "verify") == 0) {
+		boolean_t pair = pr19262_r02_is_pair(spa);
+		VERIFY0(pr19262_r02_manifest_line(spa, "import"));
+		if (pair) {
+			VERIFY0(pr19262_r02_audit_line(spa, "import",
+			    &state));
+			VERIFY3U(state, ==, 1);
+			const char *readmit =
+			    getenv("PR19262_R02_RESEED_VERIFY_READMIT");
+			if (readmit != NULL)
+				pr19262_r02_readmit_witness(spa, directory,
+				    readmit, &state);
+			if (getenv("PR19262_R02_RESEED_VERIFY_FAULT") != NULL) {
+				/*
+				 * Fault after import (tolerance 0): the
+				 * audited old leaf must carry the slot.
+				 */
+				zfs_pr19262_r02_new_endpoint_faults = 1;
+				for (int i = 0; i < 3; i++) {
+					int e =
+					    pr19262_engine_journal_roll(spa);
+					(void) printf("PR19262_R02_IMPORT_FAULT"
+					    "_ROLL error=%d\n", e);
+					VERIFY0(e);
+					txg_wait_synced(spa_get_dsl(spa), 0);
+				}
+				(void) pr19262_r02_audit_line(spa, "faulted",
+				    &state);
+				VERIFY3U(state, ==, 2);
+			}
+			const char *cancel =
+			    getenv("PR19262_R02_RESEED_VERIFY_CANCEL");
+			if (cancel != NULL) {
+				/* After import the old leaf is stale. */
+				spa_config_enter(spa, SCL_VDEV, FTAG,
+				    RW_READER);
+				vdev_t *p = pr19262_r02_slot(spa, 0);
+				uint64_t ng = p->vdev_child[1]->vdev_guid;
+				uint64_t pg = p->vdev_guid;
+				spa_config_exit(spa, SCL_VDEV, FTAG);
+				int error = spa_vdev_detach(spa, ng, pg,
+				    B_FALSE);
+				(void) printf("PR19262_R02_CANCEL error=%d\n",
+				    error);
+				VERIFY0(error);
+			} else {
+				VERIFY0(pr19262_r02_finish(spa));
+			}
+		}
+	} else {
+		VERIFY(!pr19262_r02_is_pair(spa));
+		VERIFY0(pr19262_r02_manifest_line(spa, "before"));
+		/* Hold the native resilver so the pair lifetime is ours. */
+		zfs_scan_suspend_progress = 1;
+		int error = pr19262_r02_attach(spa, directory, &path);
+		if (strcmp(mode, "tunable0") == 0) {
+			VERIFY3S(error, ==, ENOTSUP);
+			VERIFY(!pr19262_r02_is_pair(spa));
+			zfs_scan_suspend_progress = 0;
+			VERIFY0(pr19262_r02_manifest_line(spa, "refused"));
+			goto out;
+		}
+		VERIFY0(error);
+		VERIFY(pr19262_r02_is_pair(spa));
+		pr19262_r02_shape(spa, "attached");
+		VERIFY0(pr19262_r02_audit_line(spa, "attached", &state));
+		VERIFY3U(state, ==, 1);
+		VERIFY0(pr19262_r02_manifest_line(spa, "attached"));
+		boolean_t faulted = strncmp(mode, "fault", 5) == 0;
+		if (faulted) {
+			/*
+			 * One exact-new-endpoint failure: the pair freezes
+			 * the new leaf and the current old leaf carries the
+			 * slot, so publication continues (tolerance 0).
+			 */
+			zfs_pr19262_r02_new_endpoint_faults = 1;
+			error = pr19262_engine_journal_roll(spa);
+			(void) printf("PR19262_R02_FAULT roll_error=%d\n",
+			    error);
+			VERIFY0(error);
+			(void) pr19262_r02_audit_line(spa, "faulted", &state);
+			VERIFY3U(state, ==, 2);
+		}
+		if (strcmp(mode, "fault") == 0) {
+			(void) fflush(NULL);
+			/* Simulated crash with the pair faulted. */
+			_exit(0);
+		}
+		/* Raw publication during the replacing lifetime. */
+		int rolls = faulted ? 3 : 1;
+		for (int i = 0; i < rolls; i++) {
+			error = pr19262_engine_journal_roll(spa);
+			(void) printf("PR19262_R02_LIFETIME_ROLL error=%d\n",
+			    error);
+			VERIFY0(error);
+			txg_wait_synced(spa_get_dsl(spa), 0);
+		}
+		if (faulted) {
+			/* The frozen new leaf missed writes; still faulted. */
+			error = pr19262_r02_audit_line(spa, "lifetime",
+			    &state);
+			VERIFY(error != 0);
+			VERIFY3U(state, ==, 2);
+		} else {
+			VERIFY0(pr19262_r02_audit_line(spa, "lifetime",
+			    &state));
+			VERIFY3U(state, ==, 1);
+		}
+		VERIFY0(pr19262_r02_manifest_line(spa, "lifetime"));
+		if (strcmp(mode, "cancel") == 0 ||
+		    strcmp(mode, "faultcancel") == 0) {
+			spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+			vdev_t *pvd = pr19262_r02_slot(spa, 0);
+			uint64_t nguid = pvd->vdev_child[1]->vdev_guid;
+			uint64_t pguid = pvd->vdev_guid;
+			spa_config_exit(spa, SCL_VDEV, FTAG);
+			error = spa_vdev_detach(spa, nguid, pguid, B_FALSE);
+			(void) printf("PR19262_R02_CANCEL error=%d\n", error);
+			VERIFY0(error);
+			zfs_scan_suspend_progress = 0;
+		} else {
+			VERIFY0(pr19262_r02_finish(spa));
+		}
+	}
+	VERIFY(!pr19262_r02_is_pair(spa));
+	pr19262_r02_shape(spa, "final");
+	VERIFY0(pr19262_r02_manifest_line(spa, "final"));
+out:
+	(void) printf("PR19262_R02_RESEED_PASS mode=%s\n", mode);
+	(void) fflush(NULL);
+	spa_close(spa, FTAG);
+	VERIFY0(spa_export("pr19262_tx", NULL, B_FALSE, B_FALSE));
+	kernel_fini();
+	free(path);
+	return (0);
+}
+
 static int
 pr19262_journal_cold(const char *directory)
 {
@@ -13740,6 +14241,7 @@ pr19262_journal_cold(const char *directory)
 	    getenv("PR19262_ENGINE_GROW_BLOCKS") != NULL ||
 	    getenv("PR19262_JOURNAL_INTENT_CHECK") != NULL;
 	boolean_t write = getenv("PR19262_JOURNAL_REPLAY") != NULL ||
+	    getenv("PR19262_R02_RESEED") != NULL ||
 	    getenv("PR19262_ENGINE_STORE_LOCK_WITNESS") != NULL ||
 	    getenv("PR19262_ENGINE_M_ACTIVE_RETRY") != NULL ||
 	    getenv("PR19262_ENGINE_M_ACTIVE_RESUME") != NULL ||
@@ -13761,6 +14263,20 @@ pr19262_journal_cold(const char *directory)
 	char pool[] = "pr19262_tx";
 	nvlist_t *props = fnvlist_alloc();
 	fnvlist_add_string(props, "cachefile", "none");
+	/*
+	 * The R02 tunable must hold before import recovery runs.  B3: the
+	 * cells run on the compiled default, which must be 1; only
+	 * PR19262_R02_RESEED_TUNABLE0 lowers it for the import.
+	 */
+	pr19262_r02_reseed_default = zfs_pr19262_r02_reseed;
+	if (getenv("PR19262_R02_RESEED") != NULL ||
+	    getenv("PR19262_R02_RESEED_RO") != NULL) {
+		(void) printf("PR19262_R02_RESEED_DEFAULT value=%d\n",
+		    pr19262_r02_reseed_default);
+		VERIFY3S(pr19262_r02_reseed_default, ==, 1);
+		if (getenv("PR19262_R02_RESEED_TUNABLE0") != NULL)
+			zfs_pr19262_r02_reseed = 0;
+	}
 	int error = zpool_find_config(&handle, pool, &config, &args);
 	if (error == 0)
 		error = spa_import(pool, config, props,
@@ -13779,6 +14295,33 @@ pr19262_journal_cold(const char *directory)
 	spa_t *spa;
 	VERIFY0(spa_open(pool, &spa, FTAG));
 	VERIFY(pr19262_engine_persistent(spa));
+	if (getenv("PR19262_R02_RESEED") != NULL)
+		return (pr19262_r02_reseed_witness(spa, directory,
+		    getenv("PR19262_R02_RESEED")));
+	if (getenv("PR19262_R02_RESEED_RO") != NULL) {
+		/* Read-only and pair-aware: shape and manifest only. */
+		pr19262_r02_shape(spa, "readonly");
+		error = pr19262_r02_manifest_line(spa, "readonly");
+		if (error == 0 && getenv("PR19262_R02_RESEED_EXTENTS") != NULL)
+			error = pr19262_engine_r02_raw_extents(spa);
+		if (error == 0 &&
+		    getenv("PR19262_R02_RESEED_MEMBER_AUDIT") != NULL) {
+			uint64_t missing, checked;
+			error = pr19262_engine_r02_member_audit(spa, &missing,
+			    &checked);
+			(void) printf("PR19262_R02_MEMBER_AUDIT_TOTAL error=%d "
+			    "checked=%llu missing=%llu\n", error,
+			    (u_longlong_t)checked, (u_longlong_t)missing);
+			if (error == 0 && (missing != 0 || checked == 0))
+				error = EIO;
+		}
+		(void) printf("PR19262_R02_RESEED_RO %s error=%d\n",
+		    error == 0 ? "PASS" : "FAIL", error);
+		(void) fflush(NULL);
+		spa_close(spa, FTAG);
+		kernel_fini();
+		return (error != 0);
+	}
 	if (getenv("PR19262_ENGINE_STORE_LOCK_READBACK") != NULL)
 		return (pr19262_store_lock_readback(spa));
 	if (getenv("PR19262_ENGINE_UNALLOC_ZIO_WITNESS") != NULL)
@@ -13808,6 +14351,12 @@ pr19262_journal_cold(const char *directory)
 			kernel_fini();
 			return (1);
 		}
+	}
+	if (getenv("PR19262_R02_DIRECT_MANIFEST_OBSERVER") != NULL) {
+		error = pr19262_r02_manifest_observer(spa);
+		spa_close(spa, FTAG);
+		kernel_fini();
+		return (error != 0);
 	}
 	if (getenv("PR19262_JOURNAL_ROOT_INVENTORY") != NULL) {
 		uint64_t count = 0;
@@ -14590,18 +15139,26 @@ pr19262_convert_test(spa_t *spa)
 	pr19262_engine_admit_report(spa, "before", &admit);
 	VERIFY3U(admit.free, >=, admit.protected);
 	if (getenv("PR19262_ENGINE_CONVERT_CHECKPOINT") != NULL) {
-		/* A pool checkpoint pins retired backing until discarded. */
+		/*
+		 * A pool checkpoint keeps the backing born before it until it
+		 * is discarded; fences still run (checkpoint-exempt floor) but
+		 * reclaim none of it.
+		 */
 		VERIFY0(spa_checkpoint("pr19262_tx"));
 		txg_wait_synced(spa->spa_dsl_pool, 0);
 		uint64_t floor, reclaimed, released;
-		VERIFY3S(pr19262_engine_fence(spa, &floor, &reclaimed,
-		    &released, NULL), ==, EBUSY);
+		VERIFY0(pr19262_engine_fence(spa, &floor, &reclaimed,
+		    &released, NULL));
+		VERIFY0(reclaimed);
 		pr19262_engine_convert_stats_t pinned;
 		VERIFY0(pr19262_convert_sweep(spa, parity, 64, &pinned));
 		VERIFY3U(pinned.copied, >, 0);
-		VERIFY0(pinned.fences);
+		VERIFY3U(pinned.fences, >, 0);
 		pr19262_census_report(spa, parity, "checkpoint-pinned", &c);
 		VERIFY3U(c.weak_retired, >, 0);
+		(void) printf("PR19262_CHECKPOINT_PIN_FENCES fences=%llu "
+		    "reclaimed=%llu\n", (u_longlong_t)pinned.fences,
+		    (u_longlong_t)pinned.reclaimed_bytes);
 		VERIFY0(spa_checkpoint_discard("pr19262_tx"));
 		hrtime_t deadline = gethrtime() + SEC2NSEC(60);
 		while (spa_feature_is_active(spa,
@@ -16357,6 +16914,11 @@ pr19262_classes_verify(spa_t *spa, boolean_t readonly, boolean_t live)
 	}
 }
 
+static void pr19262_ckpt_floor_manifest(spa_t *, const uberblock_t *);
+static void pr19262_ckpt_payload_check(spa_t *, boolean_t);
+static void pr19262_ckpt_floor_churn(spa_t *, const uberblock_t *,
+    uint64_t);
+
 static int
 pr19262_engine_cold_import(const char *directory, boolean_t write,
     boolean_t crash)
@@ -16414,6 +16976,7 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 	    "certified=%llu\n", (u_longlong_t)spa->spa_uberblock.ub_txg,
 	    (u_longlong_t)spa->spa_uberblock.ub_pr19262[6],
 	    (u_longlong_t)census.floor, (u_longlong_t)census.certified);
+	pr19262_ckpt_payload_check(spa, write);
 	if (getenv("PR19262_ENGINE_COLD_EXPECT_STRONG") != NULL) {
 		VERIFY0(census.legacy_bytes);
 		VERIFY0(census.weak_current);
@@ -16448,6 +17011,32 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 		VERIFY0(pr19262_engine_fence(spa, &floor, &reclaimed,
 		    &released, NULL));
 		pr19262_census_report(spa, parity, "cold-fenced", &census);
+		(void) printf("PR19262_COLD_FENCED floor=%llu cp=%llu "
+		    "released=%llu checkpoint_feature=%u\n",
+		    (u_longlong_t)floor, (u_longlong_t)spa->spa_checkpoint_txg,
+		    (u_longlong_t)released, spa_feature_is_active(spa,
+		    SPA_FEATURE_POOL_CHECKPOINT));
+		/* A draining checkpoint SM releases no V. */
+		if (spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT) &&
+		    spa->spa_checkpoint_txg == 0)
+			VERIFY0(released);
+		if (getenv("PR19262_ENGINE_CKPT_FLOOR") != NULL &&
+		    spa->spa_checkpoint_txg != 0) {
+			uberblock_t checkpoint;
+			VERIFY0(zap_lookup(spa->spa_meta_objset,
+			    DMU_POOL_DIRECTORY_OBJECT,
+			    DMU_POOL_ZPOOL_CHECKPOINT, sizeof (uint64_t),
+			    sizeof (checkpoint) / sizeof (uint64_t),
+			    &checkpoint));
+			VERIFY3U(floor, >, checkpoint.ub_txg);
+			pr19262_ckpt_floor_manifest(spa, &checkpoint);
+			/* More churn after the import (cross-import case). */
+			uint64_t rounds = pr19262_env_u64(
+			    "PR19262_ENGINE_CKPT_COLD_CHURN", 0);
+			if (rounds != 0)
+				pr19262_ckpt_floor_churn(spa, &checkpoint,
+				    rounds);
+		}
 		const char *v = getenv("PR19262_ENGINE_COLD_SCRATCH_V");
 		const char *size = getenv("PR19262_ENGINE_COLD_SCRATCH_SIZE");
 		const char *old = getenv("PR19262_ENGINE_COLD_SCRATCH_INC");
@@ -16553,6 +17142,15 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 		(void) printf("PR19262_CP_DISCARD_BEFORE bytes=%llu\n",
 		    (u_longlong_t)stats.pcs_space);
 		VERIFY0(spa_checkpoint_discard("pr19262_tx"));
+		if (getenv("PR19262_ENGINE_CKPT_DISCARD_CUT") != NULL) {
+			/* Die with the discard started, its drain running. */
+			(void) printf("PR19262_CKPT_DISCARD_CUT active=%u "
+			    "txg=%llu\n", spa_feature_is_active(spa,
+			    SPA_FEATURE_POOL_CHECKPOINT),
+			    (u_longlong_t)spa_last_synced_txg(spa));
+			(void) fflush(NULL);
+			_exit(0);
+		}
 		hrtime_t deadline = gethrtime() + SEC2NSEC(30);
 		while (spa_feature_is_active(spa,
 		    SPA_FEATURE_POOL_CHECKPOINT) &&
@@ -16567,6 +17165,32 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 		    spa_last_synced_txg(spa) + TXG_CONCURRENT_STATES);
 		pr19262_engine_check(spa, "checkpoint-discard-retains-V-P");
 		(void) printf("PR19262_CP_DISCARD_PASS\n");
+	}
+	if (getenv("PR19262_ENGINE_CKPT_DRAIN") != NULL) {
+		/* An interrupted discard resumes on import; then fence. */
+		VERIFY(write);
+		hrtime_t deadline = gethrtime() + SEC2NSEC(60);
+		while (spa_feature_is_active(spa,
+		    SPA_FEATURE_POOL_CHECKPOINT) && gethrtime() < deadline) {
+			txg_wait_synced(spa->spa_dsl_pool, 0);
+			usleep(1000);
+		}
+		VERIFY(!spa_feature_is_active(spa,
+		    SPA_FEATURE_POOL_CHECKPOINT));
+		VERIFY0(spa->spa_checkpoint_info.sci_dspace);
+	}
+	if (getenv("PR19262_ENGINE_CKPT_FLOOR") != NULL && write &&
+	    !spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT)) {
+		/* With C gone, a fence past the discard drops the pins. */
+		txg_wait_synced(spa->spa_dsl_pool,
+		    spa_last_synced_txg(spa) + TXG_CONCURRENT_STATES);
+		uint64_t floor, reclaimed, released;
+		VERIFY0(pr19262_engine_fence(spa, &floor, &reclaimed,
+		    &released, NULL));
+		pr19262_engine_check(spa, "checkpoint-floor-unpinned");
+		(void) printf("PR19262_CKPT_FLOOR_UNPINNED floor=%llu "
+		    "reclaimed=%llu released=%llu\n", (u_longlong_t)floor,
+		    (u_longlong_t)reclaimed, (u_longlong_t)released);
 	}
 	(void) printf("PR19262_STORE_COLD_PASS write=%u new_objects=%u "
 	    "txg=%llu\n", write, new_objects,
@@ -16909,6 +17533,240 @@ pr19262_pair_driver(const char *first, const char *second, boolean_t cold)
 	return (0);
 }
 
+/*
+ * Checkpoint-exempt floor (2026-11-04).  Payload A, checkpoint C, payload
+ * B over it, then churn objects born after C (write, free the previous
+ * one, fence) and require every fence to succeed with the floor past C.
+ * The R-02 manifest must still walk C's catalog root.
+ * PR19262_ENGINE_CKPT_FLOOR=<rounds>; PR19262_ENGINE_CKPT_FLOOR_CUT=create
+ * dies right after C is created, =fence in the last fence after its floor
+ * is durable.  Cold imports check the payload with
+ * PR19262_ENGINE_CKPT_PAYLOAD=A|B.
+ */
+#define	PR19262_CKPT_DS "pr19262_tx/ckpt"
+#define	PR19262_CKPT_BLOCKS 8
+
+static void
+pr19262_ckpt_payload(objset_t *os, uint64_t object, char pattern,
+    boolean_t write)
+{
+	void *data = kmem_alloc(131072, KM_SLEEP);
+	if (write) {
+		dmu_tx_t *tx = dmu_tx_create(os);
+		dmu_tx_hold_write(tx, object, 0,
+		    PR19262_CKPT_BLOCKS * 131072);
+		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+		memset(data, pattern, 131072);
+		for (uint64_t i = 0; i < PR19262_CKPT_BLOCKS; i++)
+			dmu_write(os, object, i * 131072, 131072, data, tx,
+			    0);
+		dmu_tx_commit(tx);
+	} else {
+		for (uint64_t i = 0; i < PR19262_CKPT_BLOCKS; i++) {
+			VERIFY0(dmu_read(os, object, i * 131072, 131072,
+			    data, DMU_READ_NO_PREFETCH));
+			for (uint64_t b = 0; b < 131072; b++)
+				VERIFY3U(((uint8_t *)data)[b], ==,
+				    (uint8_t)pattern);
+		}
+	}
+	kmem_free(data, 131072);
+}
+
+/* The payload is the dataset's only object with 128 KiB blocks. */
+static uint64_t
+pr19262_ckpt_payload_object(objset_t *os)
+{
+	uint64_t object = 0, found = 0;
+	uint_t count = 0;
+	while (dmu_object_next(os, &object, B_FALSE, 0) == 0) {
+		dmu_object_info_t info;
+		VERIFY0(dmu_object_info(os, object, &info));
+		if (info.doi_type == DMU_OT_UINT64_OTHER &&
+		    info.doi_data_block_size == 131072) {
+			found = object;
+			count++;
+		}
+	}
+	VERIFY3U(count, ==, 1);
+	return (found);
+}
+
+static void
+pr19262_ckpt_payload_check(spa_t *spa, boolean_t write)
+{
+	const char *expect = getenv("PR19262_ENGINE_CKPT_PAYLOAD");
+	if (expect == NULL)
+		return;
+	objset_t *os;
+	VERIFY0(dmu_objset_own(PR19262_CKPT_DS, DMU_OST_OTHER, !write,
+	    B_TRUE, FTAG, &os));
+	pr19262_ckpt_payload(os, pr19262_ckpt_payload_object(os), expect[0],
+	    B_FALSE);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	(void) printf("PR19262_CKPT_PAYLOAD_OK pattern=%c ub=%llu "
+	    "catalog=%llu\n", expect[0],
+	    (u_longlong_t)spa->spa_uberblock.ub_txg,
+	    (u_longlong_t)spa->spa_uberblock.ub_pr19262[6]);
+}
+
+static int
+pr19262_ckpt_root_visit(void *arg, const pr19262_r02_manifest_entry_t *e)
+{
+	uint64_t *want = arg;
+	if (e->kind == PR19262_R02_MANIFEST_ROOT && e->generation == want[0] &&
+	    e->physical == want[1])
+		want[2]++;
+	return (0);
+}
+
+static void
+pr19262_ckpt_floor_manifest(spa_t *spa, const uberblock_t *cp)
+{
+	uint64_t want[3] = { cp->ub_pr19262[6], cp->ub_pr19262[4], 0 };
+	pr19262_r02_manifest_t m;
+	VERIFY0(pr19262_engine_r02_manifest_walk(spa,
+	    pr19262_ckpt_root_visit, want, &m));
+	uint64_t roots, pages;
+	VERIFY0(pr19262_engine_store_inventory(spa, &roots, &pages));
+	(void) printf("PR19262_CKPT_FLOOR_MANIFEST cp=%llu cp_catalog=%llu "
+	    "cp_root_entries=%llu roots=%llu catalog_pages=%llu "
+	    "tree_pages=%llu inventory_roots=%llu inventory_pages=%llu "
+	    "floor=%llu\n", (u_longlong_t)cp->ub_txg,
+	    (u_longlong_t)cp->ub_pr19262[6], (u_longlong_t)want[2],
+	    (u_longlong_t)m.roots, (u_longlong_t)m.catalog_pages,
+	    (u_longlong_t)m.tree_pages, (u_longlong_t)roots,
+	    (u_longlong_t)pages, (u_longlong_t)pr19262_engine_floor(spa));
+	VERIFY3U(want[2], ==, 1);
+}
+
+static void
+pr19262_ckpt_floor_churn(spa_t *spa, const uberblock_t *cp, uint64_t rounds)
+{
+	objset_t *os;
+	VERIFY0(dmu_objset_own(PR19262_CKPT_DS, DMU_OST_OTHER, B_FALSE,
+	    B_TRUE, FTAG, &os));
+	const char *cut = getenv("PR19262_ENGINE_CKPT_FLOOR_CUT");
+	/* Journaled ZIL blocks born after C: C's journal chain names them. */
+	zilog_t *zilog = NULL;
+	uint64_t jobject = 0;
+	if (getenv("PR19262_ENGINE_CKPT_FLOOR_ZIL") != NULL) {
+		dmu_tx_t *tx = dmu_tx_create(os);
+		dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+		jobject = dmu_object_alloc(os, DMU_OT_UINT64_OTHER, 32768,
+		    DMU_OT_NONE, 0, tx);
+		dmu_tx_commit(tx);
+		zilog = zil_open(os, pr19262_journal_get_data, NULL);
+		/* A cold import claimed the old log: drop it, no replay. */
+		if (zilog->zl_header->zh_claim_txg != 0) {
+			zil_destroy(zilog, B_FALSE);
+			txg_wait_synced(spa->spa_dsl_pool, 0);
+		}
+	}
+	void *data = kmem_alloc(32768, KM_SLEEP);
+	uint64_t previous = 0, floor = 0, released = 0, reclaimed = 0;
+	uint64_t total_released = 0;
+	for (uint64_t r = 0; r < rounds; r++) {
+		for (uint64_t k = 0; zilog != NULL && k < 4; k++)
+			pr19262_journal_write(os, zilog, jobject,
+			    ((r * 4 + k) % 16) * 8192, (uint8_t)(0x60 + r),
+			    B_FALSE);
+		/* 32 KiB objects; the payload is the only 128 KiB one. */
+		dmu_tx_t *tx = dmu_tx_create(os);
+		dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+		dmu_tx_hold_write(tx, DMU_NEW_OBJECT, 0, 8 * 32768);
+		if (previous != 0)
+			dmu_tx_hold_free(tx, previous, 0, DMU_OBJECT_END);
+		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+		uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
+		    32768, DMU_OT_NONE, 0, tx);
+		for (uint64_t i = 0; i < 8; i++) {
+			memset(data, (int)(0x30 + r), 32768);
+			dmu_write(os, object, i * 32768, 32768, data, tx, 0);
+		}
+		if (previous != 0)
+			VERIFY0(dmu_object_free(os, previous, tx));
+		dmu_tx_commit(tx);
+		previous = object;
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		if (r + 1 == rounds && cut != NULL &&
+		    strcmp(cut, "fence") == 0) {
+			if (zilog != NULL)
+				zil_close(zilog);
+			dmu_objset_disown(os, B_TRUE, FTAG);
+			(void) printf("PR19262_CKPT_FLOOR_CUT fence armed "
+			    "cp=%llu\n", (u_longlong_t)cp->ub_txg);
+			(void) fflush(NULL);
+			VERIFY0(setenv("PR19262_ENGINE_FENCE_CUT", "1", 1));
+		}
+		VERIFY0(pr19262_engine_fence(spa, &floor, &reclaimed,
+		    &released, NULL));
+		total_released += released;
+	}
+	kmem_free(data, 32768);
+	(void) printf("PR19262_CKPT_FLOOR_CHURN rounds=%llu cp=%llu "
+	    "cp_catalog=%llu floor=%llu released_owners=%llu\n",
+	    (u_longlong_t)rounds, (u_longlong_t)cp->ub_txg,
+	    (u_longlong_t)cp->ub_pr19262[6], (u_longlong_t)floor,
+	    (u_longlong_t)total_released);
+	VERIFY3U(floor, >, cp->ub_txg);
+	VERIFY3U(total_released, >, 0);
+	if (zilog != NULL)
+		zil_close(zilog);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	pr19262_ckpt_floor_manifest(spa, cp);
+	pr19262_engine_check(spa, "checkpoint-floor-churn");
+}
+
+static void
+pr19262_ckpt_floor_test(spa_t *spa)
+{
+	char name[] = PR19262_CKPT_DS;
+	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+	    ZIO_COMPRESS_OFF, B_FALSE));
+	objset_t *os;
+	VERIFY0(dmu_objset_own(PR19262_CKPT_DS, DMU_OST_OTHER, B_FALSE,
+	    B_TRUE, FTAG, &os));
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
+	    131072, DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	pr19262_ckpt_payload(os, object, 'A', B_TRUE);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	/* The fence before C: whatever the floor, C is above it. */
+	uint64_t floor, reclaimed, released;
+	VERIFY0(pr19262_engine_fence(spa, &floor, &reclaimed, &released,
+	    NULL));
+	VERIFY0(spa_checkpoint("pr19262_tx"));
+	uberblock_t checkpoint;
+	VERIFY0(zap_lookup(spa->spa_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_ZPOOL_CHECKPOINT, sizeof (uint64_t),
+	    sizeof (checkpoint) / sizeof (uint64_t), &checkpoint));
+	(void) printf("PR19262_CP_CREATED ub=%llu catalog=%llu floor=%llu\n",
+	    (u_longlong_t)checkpoint.ub_txg,
+	    (u_longlong_t)checkpoint.ub_pr19262[6], (u_longlong_t)floor);
+	const char *cut = getenv("PR19262_ENGINE_CKPT_FLOOR_CUT");
+	if (cut != NULL && strcmp(cut, "create") == 0) {
+		(void) printf("PR19262_CKPT_FLOOR_CUT create\n");
+		(void) fflush(NULL);
+		_exit(0);
+	}
+	VERIFY0(dmu_objset_own(PR19262_CKPT_DS, DMU_OST_OTHER, B_FALSE,
+	    B_TRUE, FTAG, &os));
+	pr19262_ckpt_payload(os, object, 'B', B_TRUE);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	pr19262_ckpt_payload(os, object, 'B', B_FALSE);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	pr19262_ckpt_floor_churn(spa, &checkpoint,
+	    pr19262_env_u64("PR19262_ENGINE_CKPT_FLOOR", 8));
+}
+
 static void
 pr19262_tx_probe_thread(void *arg)
 {
@@ -16944,7 +17802,8 @@ pr19262_tx_driver(const char *directory)
 	if (getenv("PR19262_JOURNAL_INTENT_FIXTURE") != NULL)
 		fnvlist_add_uint64(props, "feature@large_blocks", 0);
 	if (getenv("PR19262_ENGINE_CHECKPOINT") != NULL ||
-	    getenv("PR19262_ENGINE_CONVERT_CHECKPOINT") != NULL)
+	    getenv("PR19262_ENGINE_CONVERT_CHECKPOINT") != NULL ||
+	    getenv("PR19262_ENGINE_CKPT_FLOOR") != NULL)
 		fnvlist_add_uint64(props, "feature@zpool_checkpoint", 0);
 	VERIFY0(spa_create("pr19262_tx", root, props, NULL, NULL, NULL));
 	spa_t *spa;
@@ -17019,6 +17878,8 @@ pr19262_tx_driver(const char *directory)
 			kmem_free(data, 16384);
 			pr19262_engine_check(spa, "checkpoint-and-new-head");
 		}
+		if (getenv("PR19262_ENGINE_CKPT_FLOOR") != NULL)
+			pr19262_ckpt_floor_test(spa);
 		(void) fflush(NULL);
 		/* Persistent images need the private importer. */
 		_exit(0);

@@ -1,4 +1,14 @@
 /* SPDX-License-Identifier: CDDL-1.0 */
+/*
+ * This file and its contents are supplied under the terms of the
+ * Common Development and Distribution License ("CDDL"), version 1.0.
+ * You may only use this file in accordance with the terms of version
+ * 1.0 of the CDDL.
+ *
+ * A full copy of the text of the CDDL should have accompanied this
+ * source.  A copy of the CDDL is also available via the Internet at
+ * https://opensource.org/license/CDDL-1.0.
+ */
 #ifndef _VDEV_RELOC_ENGINE_H
 #define	_VDEV_RELOC_ENGINE_H
 
@@ -49,7 +59,7 @@ extern void libspl_backtrace(int);
 /* Private userspace experiment; no supported persistent/public ABI. */
 #define	PR19262_ENGINE_LABEL_FEATURE "org.openzfs:pr19262_private_vp"
 boolean_t pr19262_engine_persistent(spa_t *);
-boolean_t pr19262_engine_store_dirty(spa_t *);
+boolean_t pr19262_engine_store_dirty(spa_t *, uint64_t);
 int pr19262_engine_store_enable(spa_t *);
 int pr19262_engine_store_sync(spa_t *, uberblock_t *);
 int pr19262_engine_store_load(spa_t *, const uberblock_t *);
@@ -57,14 +67,132 @@ int pr19262_engine_store_recover(spa_t *);
 void pr19262_engine_store_rebind(spa_t *);
 void pr19262_engine_store_unload(spa_t *);
 void pr19262_engine_checkpoint(spa_t *, const uberblock_t *);
+int pr19262_engine_checkpoint_admit(spa_t *);
+uint64_t pr19262_engine_free_chunk_rows(spa_t *);
+#define	PR19262_FREE_DEFER	0
+#define	PR19262_FREE_ADMIT	1
+#define	PR19262_FREE_AGED	2
+/* L13: defer without forcing a txg (under a pool checkpoint). */
+#define	PR19262_FREE_WAIT	3
+#define	PR19262_FREE_AGE_TXGS	64
+#define	PR19262_FREE_REAGE_TXGS	4
+/* L13: the rows a long-free piece always may retire (reserve-funded). */
+#define	PR19262_FREE_PIECE_ROWS	40
+int pr19262_engine_free_pace(spa_t *, uint64_t, uint64_t, uint64_t,
+    uint64_t);
 int pr19262_engine_checkpoint_validate(spa_t *, const uberblock_t *);
 int pr19262_engine_checkpoint_discard(vdev_t *, uint64_t, uint64_t,
-    boolean_t *);
+    boolean_t *, uint64_t *);
+struct zthr;
+void pr19262_engine_checkpoint_discard_wait(spa_t *, struct zthr *);
 boolean_t pr19262_engine_store_ub(const uberblock_t *);
 /* Caller holds SCL_STATE; callbacks run after all reads complete. */
 int pr19262_vdev_uberblocks(spa_t *, void *,
     int (*)(void *, const uberblock_t *));
+int pr19262_vdev_uberblocks_r02(spa_t *, void *,
+    int (*)(void *, const uberblock_t *), vdev_t *);
 int pr19262_engine_store_inventory(spa_t *, uint64_t *, uint64_t *);
+/*
+ * A private, read-only exact-leaf closure for a later R02 reseed design.
+ * It neither establishes replacement support nor authorizes any write.  The
+ * entries are valid only for the duration of a visitor callback.  The
+ * callback runs after all SPA and engine locks have been released, and gets
+ * no engine-owned pointer or mutable allocator state.
+ */
+typedef enum pr19262_r02_manifest_kind {
+	PR19262_R02_MANIFEST_ROOT,
+	PR19262_R02_MANIFEST_CATALOG,
+	PR19262_R02_MANIFEST_TREE,
+	PR19262_R02_MANIFEST_CONTROL,
+	PR19262_R02_MANIFEST_DIRECTORY,
+	PR19262_R02_MANIFEST_ACTIVE_ARENA,
+	PR19262_R02_MANIFEST_PENDING_ARENA,
+	PR19262_R02_MANIFEST_JOURNAL_HEAD,
+	PR19262_R02_MANIFEST_JOURNAL_BIND,
+	PR19262_R02_MANIFEST_JOURNAL_FORWARD,
+	PR19262_R02_MANIFEST_JOURNAL_PENDING
+} pr19262_r02_manifest_kind_t;
+typedef struct pr19262_r02_manifest_entry {
+	pr19262_r02_manifest_kind_t kind;
+	uint64_t physical;
+	uint64_t pages;
+	uint64_t generation;
+	zio_cksum_t hash;
+} pr19262_r02_manifest_entry_t;
+typedef int (*pr19262_r02_manifest_visit_t)(void *,
+    const pr19262_r02_manifest_entry_t *);
+typedef struct pr19262_r02_manifest {
+	uint64_t roots;
+	uint64_t catalog_pages;
+	uint64_t tree_pages;
+	uint64_t control_pages;
+	uint64_t directory_pages;
+	uint64_t active_arenas;
+	uint64_t pending_arenas;
+	uint64_t journal_heads;
+	uint64_t journal_binds;
+	uint64_t journal_forwards;
+	uint64_t journal_pending;
+} pr19262_r02_manifest_t;
+int pr19262_engine_r02_manifest(spa_t *, pr19262_r02_manifest_t *);
+int pr19262_engine_r02_manifest_walk(spa_t *, pr19262_r02_manifest_visit_t,
+    void *, pr19262_r02_manifest_t *);
+/*
+ * R02 exact-new-leaf reseed (D70).  zfs_pr19262_r02_reseed = 1 (default)
+ * admits one strict exact-new-leaf replacement; 0 retains the D64 refusal of
+ * every new persistent-member replacement.
+ */
+extern int zfs_pr19262_r02_reseed;
+boolean_t pr19262_engine_r02_topology_enter(spa_t *);
+void pr19262_engine_r02_topology_exit(spa_t *);
+int pr19262_engine_r02_attach_admit(spa_t *, vdev_t *, boolean_t);
+int pr19262_engine_r02_attach_seed(spa_t *, vdev_t *, vdev_t *);
+void pr19262_engine_r02_attach_commit(spa_t *, vdev_t *);
+int pr19262_engine_r02_detach_check(spa_t *, vdev_t *, boolean_t);
+void pr19262_engine_r02_detach_commit(spa_t *);
+void pr19262_engine_r02_readmit(spa_t *, vdev_t *);
+void pr19262_engine_member_readmit(spa_t *, vdev_t *);
+void pr19262_engine_r02_test_cut(uint_t);
+#ifndef _KERNEL
+extern int zfs_pr19262_r02_reseed_cut;
+extern uint_t zfs_pr19262_r02_new_endpoint_faults;
+int pr19262_engine_r02_pair_audit(spa_t *, uint64_t *, uint64_t *,
+    uint64_t *, uint64_t *);
+int pr19262_engine_r02_member_audit(spa_t *, uint64_t *, uint64_t *);
+int pr19262_engine_r02_raw_extents(spa_t *);
+#endif
+#ifndef _KERNEL
+/*
+ * ztest-only observer witnesses.  They take the same read gates as the
+ * collector and only report whether the current topology is direct; the
+ * reject probe exercises the shared no-I/O eligibility gates with synthetic
+ * replacing/legacy-codec inputs.  Neither API changes the SPA or engine.
+ */
+typedef struct pr19262_r02_manifest_state {
+	uint64_t codec;
+	uint64_t io_errors;
+	uint64_t revision;
+	uint64_t stored_revision;
+	uint64_t durable_ub_txg;
+	uint64_t durable_catalog_txg;
+	uint64_t arena;
+	uint64_t arena_bytes;
+	uint64_t journal_root;
+	uint64_t journal_root_epoch[2];
+	uint64_t journal_arena;
+	uint64_t journal_epoch[2];
+	uint64_t journal_bytes;
+	uint64_t journal_seq;
+	uint64_t journal_serial;
+	zio_cksum_t journal_hash;
+	boolean_t persistent;
+	boolean_t direct;
+	boolean_t replacing;
+} pr19262_r02_manifest_state_t;
+int pr19262_engine_r02_manifest_test_state(spa_t *,
+    pr19262_r02_manifest_state_t *);
+int pr19262_engine_r02_manifest_test_reject(spa_t *, boolean_t, uint64_t);
+#endif
 void pr19262_engine_store_test_hook(spa_t *, void (*)(spa_t *, int));
 typedef struct pr19262_mgrowth_probe {
 	uint64_t p;
@@ -89,10 +217,12 @@ typedef struct pr19262_mgrowth_probe {
 int pr19262_engine_mgrowth_probe(spa_t *, boolean_t,
     pr19262_mgrowth_probe_t *);
 int pr19262_engine_metadata_flush(vdev_t *);
+int pr19262_engine_metadata_flush_config_writer(vdev_t *);
 void pr19262_engine_metadata_flush_nowait(zio_t *, vdev_t *);
 void pr19262_engine_store_crash(spa_t *, uint64_t);
 int pr19262_engine_journal_bind(spa_t *, const blkptr_t *);
 void pr19262_engine_journal_gate(zio_t *, spa_t *, const blkptr_t *);
+void pr19262_zio_resume(zio_t *);
 void pr19262_engine_journal_test_hook(spa_t *, void (*)(spa_t *,
     const blkptr_t *,
     int));
@@ -100,7 +230,9 @@ int pr19262_zio_walk_gang(spa_t *, const blkptr_t *, void *,
     int (*)(spa_t *, const blkptr_t *, void *), void *);
 int pr19262_engine_journal_claim(spa_t *, uint64_t);
 boolean_t pr19262_engine_journal_claimed(spa_t *, vdev_t *, uint64_t,
-    uint64_t, uint64_t, uint64_t);
+	uint64_t, uint64_t, uint64_t);
+boolean_t pr19262_engine_journal_reference(spa_t *, vdev_t *, uint64_t,
+	uint64_t, uint64_t, uint64_t);
 void pr19262_engine_journal_ub_committed(spa_t *, const uberblock_t *);
 void pr19262_engine_journal_fault(spa_t *, uint_t);
 int pr19262_engine_journal_roll(spa_t *);
@@ -116,6 +248,8 @@ int pr19262_engine_start_persistent(spa_t *);
 int pr19262_engine_legacy_recover(spa_t *);
 boolean_t pr19262_engine_active(spa_t *);
 vdev_t *pr19262_engine_vdev(spa_t *);
+boolean_t pr19262_engine_size_fixed(vdev_t *);
+void pr19262_engine_size_refused(vdev_t *, uint64_t, const char *);
 boolean_t pr19262_engine_bp_foreign(spa_t *, const blkptr_t *);
 uint64_t pr19262_engine_limit(spa_t *, boolean_t);
 void pr19262_engine_block_new(spa_t *, boolean_t);
@@ -139,10 +273,18 @@ pr19262_engine_alloc_result_t pr19262_engine_alloc(spa_t *, vdev_t *,
 boolean_t pr19262_engine_abort(spa_t *, vdev_t *, uint64_t, uint64_t,
     uint64_t);
 boolean_t pr19262_engine_retire(vdev_t *, uint64_t, uint64_t, boolean_t);
+/* Syncing context: the catalog rows an async-destroy free retires fit. */
+boolean_t pr19262_engine_free_bulk(spa_t *, const blkptr_t *, boolean_t);
+/* The last synced txg's async destroy waited for catalog room. */
+boolean_t pr19262_engine_free_stalled(spa_t *);
 void *pr19262_engine_hold(spa_t *, const blkptr_t *, void *, boolean_t,
     boolean_t);
 void pr19262_engine_rele(void *);
 int pr19262_engine_dispatch(zio_t *);
+int pr19262_engine_defer_logical(zio_t *);
+void pr19262_engine_repair_skipped(zio_t *);
+boolean_t pr19262_engine_scan_backing(spa_t *, const blkptr_t *,
+    int, dva_t *, uint64_t *);
 void pr19262_engine_io_rele(zio_t *);
 int pr19262_engine_copy_begin(spa_t *, const blkptr_t *, int, uint64_t,
     void **);
@@ -154,6 +296,60 @@ zio_t *pr19262_engine_physical_io(spa_t *, blkptr_t *, vdev_t *,
 void pr19262_engine_park_next(spa_t *);
 uint64_t pr19262_engine_waiting(spa_t *, boolean_t);
 void pr19262_engine_unpark(spa_t *);
+#ifdef _KERNEL
+/* Private R-01 test control: no synthetic I/O lives in this API. */
+#define	PR19262_R01_SELECTED	0
+#define	PR19262_R01_COPYING	1
+#define	PR19262_R01_PUBLISHED	2
+#define	PR19262_R01_FINAL_FREE	3
+#define	PR19262_R01_BOUNDARIES	4
+#define	PR19262_R01_TEST_NONE	0
+#define	PR19262_R01_TEST_EPOCH_STALE	1
+#define	PR19262_R01_TEST_CONVERT_EIO	2
+int pr19262_engine_r01_arm(spa_t *, uint_t);
+int pr19262_engine_r01_release(spa_t *);
+int pr19262_engine_r01_cancel(spa_t *);
+boolean_t pr19262_engine_r01_scan_restart(spa_t *);
+void pr19262_engine_r01_scan_reset_cancel(spa_t *);
+boolean_t pr19262_engine_r01_scan_reset_busy(spa_t *);
+int pr19262_engine_r01_test_arm(spa_t *, uint_t);
+int pr19262_engine_r01_test_fire(spa_t *);
+int pr19262_engine_r01_prebind(zio_t *);
+void pr19262_engine_r01_prebind_publish(zio_t *);
+int pr19262_engine_r01_scan_cancel_begin(spa_t *);
+void pr19262_engine_r01_scan_cancel_finish(spa_t *, int);
+int pr19262_engine_r01_advance(spa_t *);
+int pr19262_engine_r01_prepare(spa_t *, uint64_t);
+int pr19262_engine_r01_copy(spa_t *);
+int pr19262_engine_r01_epoch_wait(spa_t *, uint64_t);
+int pr19262_engine_r01_epoch_check(spa_t *, uint64_t, uint64_t);
+int pr19262_engine_r01_convert_test_wait(spa_t *, uint64_t);
+void pr19262_engine_r01_epoch_abort(spa_t *);
+void pr19262_engine_r01_epoch_finish(spa_t *);
+boolean_t pr19262_engine_r01_terminal(spa_t *);
+zio_t *pr19262_engine_r01_scan_parent(spa_t *, const blkptr_t *, zio_flag_t,
+    void *);
+void pr19262_engine_r01_scan_submit_done(spa_t *, zio_t *);
+boolean_t pr19262_engine_r01_scan_pending(spa_t *);
+int pr19262_engine_r01_final_free_wait(spa_t *);
+int pr19262_engine_r01_final_free_second_fence(spa_t *, uint64_t *,
+    uint64_t *, uint64_t *, uint64_t *, boolean_t *);
+void pr19262_engine_r01_final_free_finish(spa_t *, int, uint64_t);
+boolean_t pr19262_engine_r01_watch(zio_t *, uint64_t *, uint64_t *);
+void pr19262_engine_r01_repair_created(zio_t *, vdev_t *, uint64_t,
+    uint64_t, uint64_t, zio_flag_t);
+void pr19262_engine_r01_repair_decision(zio_t *, vdev_t *, boolean_t,
+    boolean_t, boolean_t, boolean_t);
+int pr19262_engine_r01_status(spa_t *, char *, size_t);
+/* Private R-02 observer: records a real scan mapping and its decision. */
+int pr19262_engine_r02_arm(spa_t *);
+void pr19262_engine_r02_backing(spa_t *, const blkptr_t *, int,
+    const dva_t *, uint64_t, boolean_t);
+void pr19262_engine_r02_worker(spa_t *, const blkptr_t *, boolean_t);
+void pr19262_engine_r02_decision(spa_t *, const blkptr_t *, uint64_t,
+    uint64_t, uint64_t, boolean_t, boolean_t);
+int pr19262_engine_r02_status(spa_t *, char *, size_t);
+#endif
 typedef struct pr19262_engine_info {
 	uint64_t p;
 	uint64_t vsize;
@@ -255,6 +451,11 @@ int pr19262_engine_fence(spa_t *, uint64_t *, uint64_t *, uint64_t *,
     uint64_t *);
 int pr19262_engine_certify(spa_t *, uint64_t);
 void pr19262_engine_fence_schedule(spa_t *);
+void pr19262_engine_zil_prepare(spa_t *);
+void pr19262_engine_zil_finish(spa_t *);
+void pr19262_engine_export_prepare(spa_t *);
+void pr19262_engine_export_abort(spa_t *);
+void pr19262_engine_unload_prepare(spa_t *);
 void pr19262_engine_describe(spa_t *, const blkptr_t *, const char *,
     uint64_t, uint64_t);
 void pr19262_engine_quiesce(spa_t *);
@@ -329,10 +530,40 @@ int pr19262_engine_admit(spa_t *, uint_t, uint64_t, uint64_t, uint64_t,
 void pr19262_engine_admit_release(spa_t *, uint_t, uint64_t, uint64_t,
     uint64_t);
 uint64_t pr19262_engine_admit_row_pages(spa_t *);
+uint64_t pr19262_engine_admit_txg_pages(spa_t *, uint64_t, uint64_t,
+    uint64_t, uint64_t *);
 void pr19262_engine_plan(spa_t *, uint64_t, uint64_t);
 void pr19262_engine_admit_report(spa_t *, const char *,
     pr19262_engine_admit_report_t *);
 uint64_t pr19262_engine_hidden_dspace(spa_t *);
+/* L18: the room a conversion has on top of the native slop. */
+typedef struct pr19262_engine_room {
+	int64_t room;		/* avail - delta, deflated bytes */
+	int64_t avail;		/* native AVAIL unclamped, deflated */
+	int64_t delta;		/* hidden increase: plan, legacy on top */
+	uint64_t space;		/* dspace - checkpoint - deferred frees */
+	uint64_t used;
+	uint64_t slop;
+	uint64_t growth;	/* planned weak growth (raw) */
+	uint64_t legacy;	/* legacy worst case (raw) */
+	uint64_t transient;	/* sync + log + legacy + batch + growth term */
+	uint64_t free;		/* engine free (raw) */
+	uint64_t store;		/* catalog extents (raw) */
+	uint64_t journal;	/* journal extents (raw) */
+	uint64_t protected;	/* client-protected amount (raw) */
+	uint64_t growth_term;	/* its arena/segment growth forecast */
+	uint64_t retired;	/* retired backing, back at a fence (raw) */
+	uint64_t ratio;		/* the engine vdev's deflate ratio */
+	uint64_t runs;		/* one catalog arena + one journal segment */
+	uint64_t weak;
+	uint64_t parity;
+	uint64_t planned;	/* the plan in place is this parity and batch */
+} pr19262_engine_room_t;
+void pr19262_engine_convert_room(spa_t *, uint64_t, uint64_t,
+    pr19262_engine_room_t *);
+void pr19262_engine_admit_priority(spa_t *, boolean_t);
+boolean_t pr19262_engine_admit_conv_alone(spa_t *, uint64_t);
+void pr19262_engine_admit_converting(spa_t *, boolean_t);
 /* Per-member count of valid live raw pages (arrays of vdev_children). */
 int pr19262_engine_raw_audit(spa_t *, const char *, uint64_t *, uint64_t *);
 #endif

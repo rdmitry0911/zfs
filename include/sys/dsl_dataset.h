@@ -185,6 +185,15 @@ typedef struct dsl_dataset {
 
 	/* only used in syncing context, only valid for non-snapshots: */
 	struct dsl_dataset *ds_prev;
+	/*
+	 * PR19262 L13: the txg whose snapshot destroy last lowered this
+	 * head's ds_prev_snap_txg, and the highest value it had before.
+	 * Long frees priced in open context with the old value counted the
+	 * blocks born in between as kept; for TXG_CONCURRENT_STATES txgs
+	 * their frees go to the paced free bpobj instead.
+	 */
+	uint64_t ds_pr19262_prev_lowered;
+	uint64_t ds_pr19262_prev_old;
 	uint64_t ds_bookmarks_obj;  /* DMU_OTN_ZAP_METADATA */
 	avl_tree_t ds_bookmarks; /* dsl_bookmark_node_t */
 

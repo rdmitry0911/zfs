@@ -1,4 +1,14 @@
 /* SPDX-License-Identifier: CDDL-1.0 */
+/*
+ * This file and its contents are supplied under the terms of the
+ * Common Development and Distribution License ("CDDL"), version 1.0.
+ * You may only use this file in accordance with the terms of version
+ * 1.0 of the CDDL.
+ *
+ * A full copy of the text of the CDDL should have accompanied this
+ * source.  A copy of the CDDL is also available via the Internet at
+ * https://opensource.org/license/CDDL-1.0.
+ */
 /* Private raw COW pages, included after the store's physical I/O helpers. */
 #define	ENGINE_M_MAGIC 0x3139323632503036ULL
 #define	ENGINE_M_ALLOC_MAGIC 0x3139323632413037ULL
@@ -140,6 +150,11 @@ typedef struct engine_pages {
 	uint_t count;
 	/* Rows in the stored tree, tombstones not counted. */
 	uint64_t live;
+	/*
+	 * Legacy version tombstones (key[3] != 0) found at load: never
+	 * deleted, they keep leaf slots (counted by the admission bound).
+	 */
+	uint64_t legacy_dead;
 	/* Tree height: one leaf level plus the branch levels above it. */
 	uint64_t levels;
 	/* Highest control serial each member holds; stale ones resilver. */
@@ -147,6 +162,8 @@ typedef struct engine_pages {
 } engine_pages_t;
 
 static int engine_pages_grow(engine_mbatch_t *);
+static int engine_pages_read(spa_t *, const uberblock_t *, nvlist_t **,
+    zfs_range_tree_t *, boolean_t);
 static int engine_pages_reconcile(spa_t *, boolean_t);
 static int engine_pages_control_repair(spa_t *, const engine_mcontrol_t *);
 static boolean_t engine_store_extent(engine_t *, uint64_t, uint64_t);
@@ -1224,7 +1241,7 @@ engine_pages_reserve_arena(spa_t *spa, engine_marena_t *a,
 			    "flush", serial))
 				e = EIO;
 			else
-				e = pr19262_engine_metadata_flush(
+				e = engine_store_flush(
 				    engine->vd->vdev_child[c]);
 		}
 		engine_quorum_add(engine, &q, e);
@@ -1546,9 +1563,10 @@ engine_pages_reservations_arena(spa_t *spa, engine_marena_t *a,
 	uint_t missing = 0;
 	for (uint_t c = 0; c < children; c++)
 		missing += absent[c];
-	uint_t tolerated = control != NULL ?
-	    MIN(control->certified, VDEV_RAIDZ_MAXPARITY) :
-	    engine_store_tolerated(engine);
+	uint_t certified = control != NULL ?
+	    MIN(control->certified, VDEV_RAIDZ_MAXPARITY) : 0;
+	/* Runtime tolerance is never reconstructed from an old control slot. */
+	uint_t tolerated = MAX(certified, engine_store_tolerated(engine));
 	/* A writable import needs every member beyond the certified loss. */
 	if (strict && spa_writeable(spa) && missing > tolerated)
 		error = EIO;
@@ -1848,14 +1866,162 @@ engine_pages_mark_range(void *arg, uint64_t p, uint64_t size)
 }
 
 /*
- * Free every page that neither the last durable catalog nor the current
- * RAM tree, the control slots or a directory node reaches.  Only valid
- * once every root below the latest one is refused by the floor, so the
- * caller publishes the shrunken masks together with that floor in both
- * control slots.  The caller holds store_lock.
+ * Checkpoint-exempt floor.  The importable roots are those at or above
+ * the floor plus the checkpoint root C.  C is guarded while the pool has
+ * it and, after a discard, until the floor reaches the first root that no
+ * longer names it (engine.ckpt_until).  Returns the guarded C, valid while
+ * the caller holds engine.lock, or NULL.
+ */
+static const uberblock_t *
+engine_ckpt_guard_locked(engine_t *engine, uint64_t floor)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	if (engine->checkpoint.ub_txg != 0)
+		return (&engine->checkpoint);
+	if (engine->ckpt_until != 0 && floor < engine->ckpt_until)
+		return (&engine->ckpt_ub);
+	return (NULL);
+}
+
+/*
+ * The guarded paged C is exempt from the floor in the root graphs.  A
+ * catalog names C as a pin uberblock (ub_checkpoint_txg == ub_txg).  The
+ * graphs dedup roots by trailer and MOS root, so a label ring root with
+ * C's trailer and MOS root (C itself as written, or an earlier txg whose
+ * root C repeats unchanged) stands for C: it reaches exactly C's pages.
+ */
+static boolean_t
+engine_ckpt_same_root(const uberblock_t *ub, const uberblock_t *c)
+{
+	return (c->ub_txg != 0 &&
+	    memcmp(ub->ub_pr19262, c->ub_pr19262,
+	    sizeof (ub->ub_pr19262)) == 0 &&
+	    memcmp(&ub->ub_rootbp, &c->ub_rootbp,
+	    sizeof (ub->ub_rootbp)) == 0);
+}
+
+static boolean_t
+engine_ckpt_exempt(engine_t *engine, const uberblock_t *ub)
+{
+	if (!pr19262_engine_store_ub(ub))
+		return (B_FALSE);
+	mutex_enter(&engine->lock);
+	boolean_t exempt = engine_ckpt_same_root(ub, &engine->checkpoint) ||
+	    (engine->ckpt_until != 0 &&
+	    engine_ckpt_same_root(ub, &engine->ckpt_ub));
+	mutex_exit(&engine->lock);
+	return (exempt);
+}
+
+/*
+ * L19: release the catalog reserve under a checkpoint (convert.c): the
+ * pages C pinned come back with its pins, or the engine unloads.
+ */
+static void
+engine_ckres_release_locked(engine_t *engine, const char *why)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	if (engine->ckres_pages == 0)
+		return;
+	pr19262_printf("PR19262_CKRES op=release why=%s pages=%llu disc=%llu "
+	    "disc_left=%llu available=%llu capacity=%llu min_available=%llu "
+	    "churn_x16=%lld rel_pages=%llu\n", why,
+	    (u_longlong_t)engine->ckres_pages,
+	    (u_longlong_t)engine->ckres_disc,
+	    (u_longlong_t)engine->ckres_disc_left,
+	    (u_longlong_t)engine->pages->available,
+	    (u_longlong_t)engine->pages->capacity,
+	    (u_longlong_t)engine->ckres_min_available,
+	    (longlong_t)engine->ckres_churn_x16,
+	    (u_longlong_t)engine->ckres_rel_pages);
+	engine->ckres_pages = engine->ckres_disc = engine->ckres_disc_left = 0;
+	engine->ckres_used_valid = B_FALSE;
+	engine->ckres_warned = B_FALSE;
+	engine->ckres_wait_gen = engine->ckres_wait_deficit = 0;
+	engine->ckres_rel_txg = engine->ckres_rel_left = 0;
+	engine->ckres_releases++;
+}
+
+/* Drop the pins and the post-discard guard.  Caller holds engine.lock. */
+static void
+engine_ckpt_unpin_locked(engine_t *engine)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	/* L19: no C, no guard: the reserve goes with the pins. */
+	if (engine->checkpoint.ub_txg == 0)
+		engine_ckres_release_locked(engine, "unpin");
+	if (engine->ckpt_pins != NULL) {
+		zfs_range_tree_vacate(engine->ckpt_pins, NULL, NULL);
+		zfs_range_tree_destroy(engine->ckpt_pins);
+		engine->ckpt_pins = NULL;
+		engine->ckpt_unpins++;
+	}
+	memset(&engine->ckpt_pins_ub, 0, sizeof (engine->ckpt_pins_ub));
+	memset(&engine->ckpt_ub, 0, sizeof (engine->ckpt_ub));
+	engine->ckpt_until = 0;
+	engine->ckpt_pinned_pages = 0;
+}
+
+/*
+ * Collect the catalog pages the paged checkpoint root reaches: its blob
+ * chain and page tree.  A read without the allocator walks and checks
+ * both (it adds the control slots and directory nodes, which GC keeps
+ * anyway).  The set is RAM only and built here, by the first fence that
+ * needs it after the checkpoint, an import or a rebuild failure: page GC
+ * is the only path that frees a durable page.  A codec 5 root keeps its
+ * catalog in the bootstrap bitmap, which is not pinned: refuse.  A failed
+ * walk refuses the fence (EBUSY) as before rather than collect without
+ * pins.  The caller holds store_lock.
  */
 static int
-engine_pages_gc(spa_t *spa, uint64_t *freed)
+engine_ckpt_pins_build(spa_t *spa, const uberblock_t *cp)
+{
+	engine_t *engine = spa->spa_reloc;
+	ASSERT(MUTEX_HELD(&engine->store_lock));
+	if (engine->ckpt_pins != NULL &&
+	    memcmp(&engine->ckpt_pins_ub, cp, sizeof (*cp)) == 0)
+		return (0);
+	zfs_range_tree_t *pins = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	    NULL, 0, 0);
+	nvlist_t *nv = NULL;
+	int error = cp->ub_pr19262[15] >= 6 ?
+	    engine_pages_read(spa, cp, &nv, pins, B_FALSE) : ENOTSUP;
+	nvlist_free(nv);
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	uint64_t pinned = zfs_range_tree_space(pins) / stripe;
+	zfs_range_tree_t *old = pins;
+	mutex_enter(&engine->lock);
+	if (error == 0) {
+		old = engine->ckpt_pins;
+		engine->ckpt_pins = pins;
+		engine->ckpt_pins_ub = *cp;
+		engine->ckpt_pinned_pages = pinned;
+		engine->ckpt_builds++;
+	} else {
+		engine->ckpt_build_errors++;
+	}
+	mutex_exit(&engine->lock);
+	if (old != NULL) {
+		zfs_range_tree_vacate(old, NULL, NULL);
+		zfs_range_tree_destroy(old);
+	}
+	pr19262_printf("PR19262_CKPT_PINS ub=%llu catalog=%llu pages=%llu "
+	    "error=%d\n", (u_longlong_t)cp->ub_txg,
+	    (u_longlong_t)cp->ub_pr19262[6],
+	    (u_longlong_t)(error == 0 ? pinned : 0), error);
+	return (error == 0 ? 0 : SET_ERROR(EBUSY));
+}
+
+/*
+ * Free every page that neither the last durable catalog nor the current
+ * RAM tree, the control slots, a directory node or the checkpoint pins
+ * (when non-NULL) reach.  Only valid once every other root below the
+ * latest one is refused by the floor, so the caller publishes the
+ * shrunken masks together with that floor in both control slots.  The
+ * caller holds store_lock.
+ */
+static int
+engine_pages_gc(spa_t *spa, uint64_t *freed, zfs_range_tree_t *pins)
 {
 	engine_t *engine = spa->spa_reloc;
 	ASSERT(MUTEX_HELD(&engine->store_lock));
@@ -1876,6 +2042,8 @@ engine_pages_gc(spa_t *spa, uint64_t *freed)
 	if (engine->pages->directory_pages != NULL)
 		zfs_range_tree_walk(engine->pages->directory_pages,
 		    engine_pages_mark_range, &m);
+	if (pins != NULL)
+		zfs_range_tree_walk(pins, engine_pages_mark_range, &m);
 	engine_mref_t blob = { .p = engine->stored_desc[4] };
 	memcpy(&blob.hash, engine->stored_desc + 8, sizeof (blob.hash));
 	int error = engine_pages_mark_ref(&m, &blob);
@@ -1893,7 +2061,10 @@ engine_pages_gc(spa_t *spa, uint64_t *freed)
 			if (i < ENGINE_STORE_PAGES)
 				engine->bitmap[i] = 0;
 			if (engine->pages->cache[i] != NULL) {
-				VERIFY(!engine->pages->cache[i]->dirty);
+				/*
+				 * Failed stores leave dirty orphans.
+				 * No writer can reattach them here.
+				 */
 				engine_mnode_free(engine->pages->cache[i]);
 				engine->pages->cache[i] = NULL;
 			}
@@ -2015,8 +2186,7 @@ engine_pages_resilver(spa_t *spa, uint_t child, uint64_t *pages)
 	int error = engine_pages_members(spa, child, NULL, NULL, pages);
 	if (error == 0) {
 		spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
-		error = pr19262_engine_metadata_flush(
-		    engine->vd->vdev_child[child]);
+		error = engine_store_flush(engine->vd->vdev_child[child]);
 		spa_config_exit(spa, SCL_ZIO, FTAG);
 	}
 	if (error == 0)
@@ -2057,6 +2227,8 @@ engine_pages_resilver_members(spa_t *spa)
 	for (uint_t c = 0; error == 0 && c < children; c++) {
 		if (!stale[c])
 			continue;
+		/* L23: this repairs the stored root only; the pass the rest. */
+		engine_member_missed(engine, engine->vd->vdev_child[c], ESTALE);
 		uint64_t pages = 0;
 		error = engine_pages_resilver(spa, c, &pages);
 		pr19262_printf("PR19262_RAW_RESILVER child=%u pages=%llu "
@@ -2243,8 +2415,7 @@ engine_pages_directory_write(spa_t *spa, engine_marena_t *a,
 		int e = engine_store_io_at(engine->vd->vdev_child[c],
 		    candidate.p, 0, 1, abd, B_TRUE);
 		if (e == 0)
-			e = pr19262_engine_metadata_flush(
-			    engine->vd->vdev_child[c]);
+			e = engine_store_flush(engine->vd->vdev_child[c]);
 		engine_quorum_add(engine, &q, e);
 		if (e == 0 && c == 0)
 			engine_pages_fault(13, generation, c, candidate.p);
@@ -2312,6 +2483,260 @@ engine_pages_finish(spa_t *spa, engine_marena_t *a, uint64_t generation)
 	return (0);
 }
 
+/* Count disjoint stripe-aligned arena runs, as engine_pages_pick fits. */
+static void
+engine_pages_runs_count(void *arg, uint64_t p, uint64_t size)
+{
+	engine_t *engine = ((engine_walk_arg_t *)arg)->engine;
+	uint64_t *runs = ((engine_walk_arg_t *)arg)->arg;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
+	uint64_t start = roundup(p, stripe);
+	if (start < p || start - p >= size)
+		return;
+	*runs += (size - (start - p)) / bytes;
+}
+
+/*
+ * Arena runs in the free tree, counting stops at limit: the walk ends at
+ * the first runs when there are some, and is whole only when there are
+ * fewer than limit.
+ */
+static uint64_t
+engine_pages_runs_bounded_locked(engine_t *engine, uint64_t limit)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	uint64_t runs = 0;
+	engine_walk_arg_t walk = { engine, &runs };
+	if (engine->free == NULL || engine->vd == NULL)
+		return (0);
+	zfs_range_tree_t *rt = engine->free;
+	zfs_btree_index_t where;
+	for (zfs_range_seg_t *rs = zfs_btree_first(&rt->rt_root, &where);
+	    rs != NULL && runs < limit;
+	    rs = zfs_btree_next(&rt->rt_root, &where, &where)) {
+		uint64_t start = zfs_rs_get_start(rs, rt);
+		engine_pages_runs_count(&walk, start,
+		    zfs_rs_get_end(rs, rt) - start);
+	}
+	return (runs);
+}
+
+static uint64_t
+engine_pages_runs_locked(engine_t *engine)
+{
+	return (engine_pages_runs_bounded_locked(engine, 2));
+}
+
+/*
+ * Hold one arena-sized run back from the physical free tree for the
+ * syncing store.  Called after a successful store, in syncing context: a
+ * RAM-only range move under engine->lock, no I/O.  The run is in
+ * store_extents, so no allocator or admission sees it; an import rebuilds
+ * the free tree from the catalog and the run simply returns to it.
+ */
+static void
+engine_pages_standby_fill_locked(engine_t *engine)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	if (engine->store_standby_valid || !engine->persistent ||
+	    engine->free == NULL || engine->store_extents == NULL ||
+	    engine->pages->capacity == 0)
+		return;
+	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
+	uint64_t range[2] = { UINT64_MAX, bytes };
+	engine_walk_arg_t walk = { engine, range };
+	zfs_range_tree_walk(engine->free, engine_pages_pick, &walk);
+	if (range[0] == UINT64_MAX) {
+		engine->store_headroom_low = B_TRUE;
+		return;
+	}
+	zfs_range_tree_remove(engine->free, range[0], bytes);
+	zfs_range_tree_add(engine->store_extents, range[0], bytes);
+	engine->store_standby = range[0];
+	engine->store_standby_valid = B_TRUE;
+	engine->store_standby_fills++;
+	engine->store_headroom_low = B_FALSE;
+	engine->store_headroom_warned = B_FALSE;
+}
+
+/*
+ * Return the standby run to the free tree (a journal roll needs a run and
+ * finds none).  The next store refills it if a run is left; otherwise
+ * headroom is low.  Caller holds engine->lock.
+ */
+static boolean_t
+engine_pages_standby_release_locked(engine_t *engine)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	if (!engine->store_standby_valid)
+		return (B_FALSE);
+	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
+	zfs_range_tree_remove(engine->store_extents, engine->store_standby,
+	    bytes);
+	zfs_range_tree_add(engine->free, engine->store_standby, bytes);
+	engine->store_standby_valid = B_FALSE;
+	engine->store_standby_releases++;
+	return (B_TRUE);
+}
+
+/*
+ * Reserved arena runs (store_reserved): the runs admission counted for the
+ * catalog growth of the work it admitted.  Each is a whole stripe-aligned
+ * run moved from free into store_extents, as the standby, so neither data
+ * allocation, a copy stage, a journal roll nor the standby fill can take or
+ * cut it; engine_pages_grow() takes them first.  RAM-only and never listed
+ * by a catalog: a run returns to free directly, and a load rebuilds free
+ * from the catalog with every reserved run in it.  Caller holds
+ * engine->lock.
+ */
+static uint64_t
+engine_pages_reserved_runs_locked(engine_t *engine)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	if (engine->store_reserved == NULL)
+		return (0);
+	return (zfs_range_tree_space(engine->store_reserved) /
+	    (ENGINE_STORE_BYTES * engine->vd->vdev_children));
+}
+
+/* Set aside one more run, the one engine_pages_grow() would pick. */
+static boolean_t
+engine_pages_reserved_fill_locked(engine_t *engine)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	if (!engine->persistent || engine->free == NULL ||
+	    engine->store_extents == NULL)
+		return (B_FALSE);
+	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
+	uint64_t range[2] = { UINT64_MAX, bytes };
+	engine_walk_arg_t walk = { engine, range };
+	zfs_range_tree_walk(engine->free, engine_pages_pick, &walk);
+	if (range[0] == UINT64_MAX)
+		return (B_FALSE);
+	if (engine->store_reserved == NULL)
+		engine->store_reserved = zfs_range_tree_create(NULL,
+		    ZFS_RANGE_SEG64, NULL, 0, 0);
+	zfs_range_tree_remove(engine->free, range[0], bytes);
+	zfs_range_tree_add(engine->store_extents, range[0], bytes);
+	zfs_range_tree_add(engine->store_reserved, range[0], bytes);
+	engine->store_reserve_fills++;
+	/* L13's per-store run count follows: one free run fewer. */
+	if (engine->bulk_runs_cached != 0)
+		engine->bulk_runs_cached--;
+	engine->store_reserve_peak = MAX(engine->store_reserve_peak,
+	    engine_pages_reserved_runs_locked(engine));
+	return (B_TRUE);
+}
+
+/*
+ * Take the highest reserved run out of the set; it stays in store_extents.
+ * Every segment of the set is a union of whole stripe-aligned runs, so its
+ * last run is one too.  UINT64_MAX if none.
+ */
+static uint64_t
+engine_pages_reserved_take_locked(engine_t *engine)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	if (engine->store_reserved == NULL ||
+	    zfs_range_tree_is_empty(engine->store_reserved))
+		return (UINT64_MAX);
+	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
+	uint64_t p = zfs_range_tree_max(engine->store_reserved) - bytes;
+	VERIFY0(p % (ENGINE_STORE_PAGE * engine->vd->vdev_children));
+	VERIFY(zfs_range_tree_contains(engine->store_reserved, p, bytes));
+	zfs_range_tree_remove(engine->store_reserved, p, bytes);
+	return (p);
+}
+
+/*
+ * Return reserved runs past keep to free.  The runs come back whole, so
+ * the standby refills from them and the cached run count sees them, as
+ * when the reuse deferral returns runs.
+ */
+static void
+engine_pages_reserved_return_locked(engine_t *engine, uint64_t keep)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
+	boolean_t returned = B_FALSE;
+	while (engine_pages_reserved_runs_locked(engine) > keep) {
+		uint64_t p = engine_pages_reserved_take_locked(engine);
+		zfs_range_tree_remove(engine->store_extents, p, bytes);
+		zfs_range_tree_add(engine->free, p, bytes);
+		engine->store_reserve_returns++;
+		engine->bulk_runs_cached++;
+		returned = B_TRUE;
+	}
+	if (returned && engine->free_runs_known) {
+		boolean_t standby = engine->store_standby_valid;
+		engine_pages_standby_fill_locked(engine);
+		/* A refilled standby took one of the free runs counted. */
+		if (!standby && engine->store_standby_valid &&
+		    engine->bulk_runs_cached != 0)
+			engine->bulk_runs_cached--;
+		engine->free_runs_cached = engine_pages_runs_locked(engine);
+	}
+}
+
+static uint64_t
+engine_pages_reserved_run_bytes(engine_t *engine)
+{
+	return (ENGINE_STORE_BYTES * engine->vd->vdev_children);
+}
+
+/*
+ * Give the highest held run back to free for a request nothing else in
+ * free can take (a net free or a copy, past its wait): the stores that
+ * counted it fall back to free runs and the standby, as before L15b.  No
+ * standby refill here, but nothing keeps the run for the request either:
+ * a later standby refill may take it whole (as it may any free run).  A
+ * net-free caller refreshes free_runs_cached after its loop; a copy cuts
+ * the run at once, so the cached count stays as it was.  B_FALSE if
+ * nothing is held or one run cannot hold size.
+ */
+static boolean_t
+engine_pages_reserved_take_back_locked(engine_t *engine, uint64_t size)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
+	if (engine_pages_reserved_runs_locked(engine) == 0 || size > bytes)
+		return (B_FALSE);
+	uint64_t p = engine_pages_reserved_take_locked(engine);
+	zfs_range_tree_remove(engine->store_extents, p, bytes);
+	zfs_range_tree_add(engine->free, p, bytes);
+	engine->store_reserve_returns++;
+	engine->bulk_runs_cached++;
+	engine->admit_held_takes++;
+	pr19262_printf("PR19262_ADMIT_HELD_TAKE p=%llu size=%llu held=%llu "
+	    "takes=%llu synced=%llu\n", (u_longlong_t)p, (u_longlong_t)size,
+	    (u_longlong_t)engine_pages_reserved_runs_locked(engine),
+	    (u_longlong_t)engine->admit_held_takes,
+	    (u_longlong_t)spa_last_synced_txg(engine->spa));
+	return (B_TRUE);
+}
+
+static void
+engine_pages_reserved_check_cb(void *arg, uint64_t p, uint64_t size)
+{
+	engine_t *engine = arg;
+	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
+	VERIFY0(p % (ENGINE_STORE_PAGE * engine->vd->vdev_children));
+	VERIFY0(size % bytes);
+	VERIFY(zfs_range_tree_contains(engine->store_extents, p, size));
+	zfs_range_tree_verify_not_present(engine->free, p, size);
+}
+
+/* The reserved runs are whole runs inside store_extents, none in free. */
+static void
+engine_pages_reserved_check_locked(engine_t *engine)
+{
+	ASSERT(MUTEX_HELD(&engine->lock));
+	if (engine->store_reserved != NULL)
+		zfs_range_tree_walk(engine->store_reserved,
+		    engine_pages_reserved_check_cb, engine);
+}
+
 static int
 engine_pages_grow(engine_mbatch_t *b)
 {
@@ -2321,22 +2746,65 @@ engine_pages_grow(engine_mbatch_t *b)
 	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
 	uint64_t range[2] = { UINT64_MAX, bytes };
 	engine_walk_arg_t walk = { engine, range };
+	boolean_t standby = B_FALSE, reserved = B_FALSE;
 	mutex_enter(&engine->lock);
-	zfs_range_tree_walk(engine->free, engine_pages_pick, &walk);
+	/* A run admission counted and set aside comes first. */
+	range[0] = engine_pages_reserved_take_locked(engine);
+	if (range[0] != UINT64_MAX) {
+		reserved = B_TRUE;
+		engine->store_reserve_uses++;
+	} else {
+		zfs_range_tree_walk(engine->free, engine_pages_pick, &walk);
+	}
+	if (range[0] == UINT64_MAX && engine->store_standby_valid) {
+		/* Already in store_extents: the standby run is the arena. */
+		range[0] = engine->store_standby;
+		engine->store_standby_valid = B_FALSE;
+		engine->store_standby_uses++;
+		standby = B_TRUE;
+	}
 	if (range[0] == UINT64_MAX) {
+		engine->store_grow_enospc++;
 		mutex_exit(&engine->lock);
+		pr19262_printf("PR19262_M_GROW_ENOSPC capacity=%llu "
+		    "available=%llu standby_uses=%llu\n",
+		    (u_longlong_t)engine->pages->capacity,
+		    (u_longlong_t)engine->pages->available,
+		    (u_longlong_t)engine->store_standby_uses);
 		return (ENOSPC);
 	}
-	zfs_range_tree_remove(engine->free, range[0], bytes);
-	zfs_range_tree_add(engine->store_extents, range[0], bytes);
+	if (!standby && !reserved) {
+		zfs_range_tree_remove(engine->free, range[0], bytes);
+		zfs_range_tree_add(engine->store_extents, range[0], bytes);
+	}
+	uint64_t held = engine_pages_reserved_runs_locked(engine);
+	uint64_t uses = engine->store_reserve_uses;
 	mutex_exit(&engine->lock);
 	int error = engine_pages_add_arena(engine, range[0], ENGINE_STORE_PAGES,
 	    NULL,
 	    B_TRUE);
+	if (error == 0 && reserved)
+		pr19262_printf("PR19262_M_GROW_RESERVED p=%llu capacity=%llu "
+		    "reserved_left=%llu reserve_uses=%llu\n",
+		    (u_longlong_t)range[0],
+		    (u_longlong_t)engine->pages->capacity, (u_longlong_t)held,
+		    (u_longlong_t)uses);
 	if (error != 0) {
 		mutex_enter(&engine->lock);
-		zfs_range_tree_remove(engine->store_extents, range[0], bytes);
-		zfs_range_tree_add(engine->free, range[0], bytes);
+		if (reserved) {
+			/* Still in store_extents: it stays reserved. */
+			zfs_range_tree_add(engine->store_reserved, range[0],
+			    bytes);
+			engine->store_reserve_uses--;
+		} else if (standby && !engine->store_standby_valid) {
+			/* Still in store_extents: it stays the standby. */
+			engine->store_standby = range[0];
+			engine->store_standby_valid = B_TRUE;
+		} else {
+			zfs_range_tree_remove(engine->store_extents, range[0],
+			    bytes);
+			zfs_range_tree_add(engine->free, range[0], bytes);
+		}
 		mutex_exit(&engine->lock);
 		return (error);
 	}
@@ -2357,7 +2825,8 @@ engine_pages_remove_pending(engine_t *engine, engine_marena_t *a)
 	VERIFY3P(a, ==, engine->pages->arenas);
 	VERIFY3U(a->first + a->pages, ==, engine->pages->capacity);
 	uint64_t count = a->first;
-	engine_mnode_t **cache = kmem_alloc(count * sizeof (*cache), KM_SLEEP);
+	engine_mnode_t **cache = pr19262_alloc(count * sizeof (*cache),
+	    KM_SLEEP);
 	uint8_t *bits = pr19262_alloc(count, KM_SLEEP);
 	memcpy(cache, engine->pages->cache, count * sizeof (*cache));
 	memcpy(bits, engine->pages->bits, count);
@@ -3547,8 +4016,7 @@ engine_pages_store(spa_t *spa, const uberblock_t *ub, nvlist_t *nv,
 					engine_pages_fault(3, b->generation,
 					    c, i);
 			}
-			int e = pr19262_engine_metadata_flush(
-			    engine->vd->vdev_child[c]);
+			int e = engine_store_flush(engine->vd->vdev_child[c]);
 			if (e != 0 && (member == 0 || e != ENXIO))
 				member = e;
 			else if (e == 0 && c == 0)
@@ -3921,6 +4389,8 @@ engine_pages_read_once(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 			error = ENGINE_EINVAL(37);
 	if (error == 0 && (!bitmap[0] || !bitmap[1]))
 		error = ENGINE_EINVAL(38);
+	if (error == 0 && allocator)
+		engine->pages->legacy_dead = r->dead;
 	if (error == 0 && allocator) {
 		uint8_t *reserved = pr19262_zalloc(engine->pages->capacity,
 		    KM_SLEEP);
@@ -3994,6 +4464,823 @@ engine_pages_read(spa_t *spa, const uberblock_t *ub, nvlist_t **out,
 		    attempt + 1);
 	}
 	return (EAGAIN);
+}
+
+/*
+ * Private R02 manifest scratch.  It deliberately does not reuse
+ * engine->pages: recovery's page cache and allocator masks are mutable
+ * engine state.  These objects are discarded before the caller drops its
+ * topology/store locks.
+ */
+typedef struct engine_r02_arena {
+	uint64_t p;
+	uint64_t pages;
+	uint64_t uuid[2];
+	uint8_t *bits;
+} engine_r02_arena_t;
+
+typedef struct engine_r02_entry {
+	list_node_t node;
+	pr19262_r02_manifest_entry_t entry;
+	/* Reseed only: the control serial bound by this entry's hash. */
+	uint64_t serial;
+} engine_r02_entry_t;
+
+typedef struct engine_r02_manifest_private {
+	spa_t *spa;
+	/* Config-writer mode: the reseed caller owns SCL_ALL. */
+	engine_store_leaf_io_mode_t mode;
+	/* The reseed collector also binds pending-arena control slots. */
+	boolean_t reseed;
+	engine_r02_arena_t *arenas;
+	uint_t count;
+	uint_t capacity;
+	uint64_t generation;
+	uint64_t reservation_generation;
+	engine_mcontrol_t control;
+	zfs_range_tree_t *all;
+	zfs_range_tree_t *catalog;
+	zfs_range_tree_t *tree;
+	zfs_range_tree_t *control_pages;
+	zfs_range_tree_t *directory;
+	/* Journal extents are reserved for collision checks, not allocation. */
+	zfs_range_tree_t *journal;
+	list_t entries;
+	uint64_t roots;
+	uint64_t pending;
+	uint64_t journal_heads;
+	uint64_t journal_binds;
+	uint64_t journal_forwards;
+	uint64_t journal_pending;
+} engine_r02_manifest_private_t;
+
+typedef enum engine_r02_page_kind {
+	ENGINE_R02_CATALOG,
+	ENGINE_R02_TREE,
+	ENGINE_R02_CONTROL,
+	ENGINE_R02_DIRECTORY
+} engine_r02_page_kind_t;
+
+static int
+engine_r02_entry_add(engine_r02_manifest_private_t *m,
+    pr19262_r02_manifest_kind_t kind, uint64_t physical, uint64_t pages,
+    uint64_t generation, const zio_cksum_t *hash)
+{
+	for (engine_r02_entry_t *e = list_head(&m->entries); e != NULL;
+	    e = list_next(&m->entries, e)) {
+		if (e->entry.kind == kind && e->entry.physical == physical &&
+		    e->entry.pages == pages)
+			return (0);
+	}
+	engine_r02_entry_t *e = kmem_zalloc(sizeof (*e), KM_SLEEP);
+	e->entry.kind = kind;
+	e->entry.physical = physical;
+	e->entry.pages = pages;
+	e->entry.generation = generation;
+	if (hash != NULL)
+		memcpy(&e->entry.hash, hash, sizeof (e->entry.hash));
+	list_insert_tail(&m->entries, e);
+	return (0);
+}
+
+/*
+ * A reseed copies, for each physical control slot, the highest-serial valid
+ * copy (the observer keeps its first-valid closure).  Equal serials with
+ * different bytes are a conflict.
+ */
+static int
+engine_r02_control_newest(engine_r02_manifest_private_t *m, uint64_t p,
+    uint64_t serial, uint64_t generation, const zio_cksum_t *hash)
+{
+	for (engine_r02_entry_t *e = list_head(&m->entries); e != NULL;
+	    e = list_next(&m->entries, e)) {
+		if (e->entry.kind != PR19262_R02_MANIFEST_CONTROL ||
+		    e->entry.physical != p)
+			continue;
+		if (e->serial == 0 || serial > e->serial) {
+			e->serial = serial;
+			e->entry.generation = generation;
+			memcpy(&e->entry.hash, hash, sizeof (e->entry.hash));
+		} else if (serial == e->serial &&
+		    memcmp(&e->entry.hash, hash, sizeof (*hash)) != 0) {
+			return (SET_ERROR(ECKSUM));
+		}
+		return (0);
+	}
+	return (SET_ERROR(ENOENT));
+}
+
+static pr19262_r02_manifest_kind_t
+engine_r02_entry_kind(engine_r02_page_kind_t kind)
+{
+	switch (kind) {
+	case ENGINE_R02_CATALOG:
+		return (PR19262_R02_MANIFEST_CATALOG);
+	case ENGINE_R02_TREE:
+		return (PR19262_R02_MANIFEST_TREE);
+	case ENGINE_R02_CONTROL:
+		return (PR19262_R02_MANIFEST_CONTROL);
+	default:
+		return (PR19262_R02_MANIFEST_DIRECTORY);
+	}
+}
+
+static int
+engine_r02_extent(engine_t *engine, uint64_t p, uint64_t pages)
+{
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	if (stripe == 0 || pages < 3 || pages > ENGINE_M_PAYLOAD ||
+	    pages > engine->total / stripe || p % stripe != 0 ||
+	    p >= engine->total || pages > (engine->total - p) / stripe)
+		return (ENGINE_EINVAL(70));
+	return (0);
+}
+
+static zfs_range_tree_t *
+engine_r02_kind_tree(engine_r02_manifest_private_t *m,
+    engine_r02_page_kind_t kind)
+{
+	switch (kind) {
+	case ENGINE_R02_CATALOG:
+		return (m->catalog);
+	case ENGINE_R02_TREE:
+		return (m->tree);
+	case ENGINE_R02_CONTROL:
+		return (m->control_pages);
+	default:
+		return (m->directory);
+	}
+}
+
+static int
+engine_r02_mark(engine_r02_manifest_private_t *m,
+    engine_r02_page_kind_t kind, uint64_t p)
+{
+	engine_t *engine = m->spa->spa_reloc;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	zfs_range_tree_t *kind_tree = engine_r02_kind_tree(m, kind);
+	if (zfs_range_tree_contains(kind_tree, p, stripe))
+		return (0);
+	/* A raw page cannot play two typed roles in one validated closure. */
+	if (zfs_range_tree_contains(m->journal, p, stripe))
+		return (ENGINE_EINVAL(99));
+	if (zfs_range_tree_contains(m->all, p, stripe))
+		return (ENGINE_EINVAL(71));
+	zfs_range_tree_add(kind_tree, p, stripe);
+	zfs_range_tree_add(m->all, p, stripe);
+	return (0);
+}
+
+/* Exactly one raw leaf read, with no engine error accounting. */
+static int
+engine_r02_read_member(engine_r02_manifest_private_t *m, vdev_t *vd,
+    uint64_t p, engine_mnode_t *n)
+{
+	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
+	int error = engine_store_manifest_read(vd, p, 0, abd, m->mode);
+	abd_free(abd);
+	return (error);
+}
+
+static int
+engine_r02_read_ref(engine_r02_manifest_private_t *m,
+    const engine_mref_t *ref, engine_r02_page_kind_t kind,
+    engine_mnode_t **result)
+{
+	engine_t *engine = m->spa->spa_reloc;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	if (stripe == 0 || ref->p % stripe != 0 || ref->p >= engine->total ||
+	    stripe > engine->total - ref->p)
+		return (ENGINE_EINVAL(72));
+	engine_mnode_t *n = engine_mnode_alloc();
+	int error = ECKSUM;
+	abd_t *abd = abd_get_from_buf(n->data, ENGINE_STORE_PAGE);
+	for (uint_t c = 0; c < engine->vd->vdev_children; c++) {
+		int e = engine_store_manifest_read(engine->vd->vdev_child[c],
+		    ref->p, 0, abd, m->mode);
+		if (e != 0 || !engine_mpage_accept(m->spa, ref, n))
+			continue;
+		error = 0;
+		break;
+	}
+	abd_free(abd);
+	if (error == 0)
+		error = engine_r02_mark(m, kind, ref->p);
+	if (error == 0) {
+		engine_mheader_t *h = engine_mheader(n);
+		error = engine_r02_entry_add(m, engine_r02_entry_kind(kind),
+		    ref->p, 1, h->generation, &h->hash);
+	}
+	if (error != 0) {
+		engine_mnode_free(n);
+		return (error);
+	}
+	n->sealed = B_TRUE;
+	*result = n;
+	return (0);
+}
+
+static boolean_t
+engine_r02_index(const engine_r02_manifest_private_t *m, uint64_t p,
+    uint_t *which, uint64_t *index)
+{
+	engine_t *engine = m->spa->spa_reloc;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	if (stripe == 0)
+		return (B_FALSE);
+	for (uint_t i = 0; i < m->count; i++) {
+		const engine_r02_arena_t *a = &m->arenas[i];
+		if (p < a->p || (p - a->p) % stripe != 0)
+			continue;
+		uint64_t page = (p - a->p) / stripe;
+		if (page < a->pages) {
+			*which = i;
+			*index = page;
+			return (B_TRUE);
+		}
+	}
+	return (B_FALSE);
+}
+
+static boolean_t
+engine_r02_allocated(const engine_r02_manifest_private_t *m,
+    const uchar_t *initial, uint64_t p)
+{
+	uint_t which;
+	uint64_t index;
+	if (!engine_r02_index(m, p, &which, &index) ||
+	    !m->arenas[which].bits[index])
+		return (B_FALSE);
+	return (which != 0 || initial == NULL || initial[index] == 1);
+}
+
+/*
+ * Decode the two allocation slots into caller-owned bits.  This is a local
+ * clone of the on-disk validator; unlike recovery it updates no member
+ * serial, cache statistic, allocator mask, or error counter.
+ */
+static int
+engine_r02_slots(engine_r02_manifest_private_t *m, uint64_t arena,
+    uint64_t pages, const uint64_t uuid[2], uint8_t *bitmap,
+    uint64_t *generation, uint64_t *serial_high, engine_mcontrol_t *control)
+{
+	engine_t *engine = m->spa->spa_reloc;
+	uint_t children = engine->vd->vdev_children;
+	uint64_t stripe = ENGINE_STORE_PAGE * children;
+	uint64_t slots = 2 * children;
+	if (children == 0 || stripe == 0 || slots > SIZE_MAX / pages ||
+	    slots > SIZE_MAX / sizeof (uint64_t))
+		return (ENGINE_EINVAL(73));
+	uint64_t *serials = pr19262_zalloc(slots * sizeof (*serials), KM_SLEEP);
+	uint8_t *masks = pr19262_zalloc(slots * pages, KM_SLEEP);
+	engine_mnode_t *n = engine_mnode_alloc();
+	boolean_t found = B_FALSE, conflict = B_FALSE;
+	int error = 0;
+	for (uint_t slot = 0; error == 0 && slot < 2; slot++) {
+		for (uint_t c = 0; error == 0 && c < children; c++) {
+			uint64_t p = arena + slot * stripe;
+			if (engine_r02_read_member(m, engine->vd->vdev_child[c],
+			    p, n) != 0)
+				continue;
+			engine_mheader_t *h = engine_mheader(n);
+			boolean_t swap = h->magic ==
+			    BSWAP_64(ENGINE_M_ALLOC_MAGIC) || h->magic ==
+			    BSWAP_64(ENGINE_M_ALLOC_OLD_MAGIC);
+			if (h->magic != ENGINE_M_ALLOC_MAGIC &&
+			    h->magic != ENGINE_M_ALLOC_OLD_MAGIC && !swap)
+				continue;
+			zio_cksum_t hash;
+			engine_mhash(n, &hash);
+			if (swap)
+				byteswap_uint64_array(h, sizeof (*h));
+			uint8_t *bits = engine_mpayload(n);
+			if (memcmp(&h->hash, &hash, sizeof (hash)) != 0 ||
+			    h->pool != spa_guid(m->spa) ||
+			    h->top != engine->vd->vdev_guid ||
+			    h->generation == 0 ||
+			    h->level != 0 || h->type != ENGINE_M_BLOB ||
+			    h->count != pages || h->low[0] != arena ||
+			    h->low[1] != pages * ENGINE_STORE_PAGE ||
+			    h->low[2] != children || h->high[0] != pages ||
+			    h->p != p || (h->magic == ENGINE_M_ALLOC_MAGIC &&
+			    h->high[1] == 0) || !bits[0] || !bits[1])
+				continue;
+			if ((h->reserved[10] != 0 || h->reserved[11] != 0) &&
+			    memcmp(h->reserved + 10, uuid,
+			    sizeof (uint64_t) * 2) != 0) {
+				error = ECKSUM;
+				break;
+			}
+			boolean_t valid = B_TRUE;
+			for (uint_t i = 0; i < pages; i++)
+				valid &= bits[i] <= 1;
+			if (!valid)
+				continue;
+			error = engine_r02_mark(m, ENGINE_R02_CONTROL, p);
+			if (error != 0)
+				break;
+			uint64_t serial = h->high[1] == 0 ? h->generation :
+			    h->high[1];
+			error = engine_r02_entry_add(m,
+			    PR19262_R02_MANIFEST_CONTROL, p, 1, h->generation,
+			    &h->hash);
+			if (error == 0 && m->reseed)
+				error = engine_r02_control_newest(m, p, serial,
+				    h->generation, &h->hash);
+			if (error != 0)
+				break;
+			uint64_t at = slot * children + c;
+			memcpy(masks + at * pages, bits, pages);
+			serials[at] = MAX(serial, 1);
+			if (control != NULL && serial >= control->serial) {
+				engine_mcontrol_t selected = { .serial = serial,
+				    .codec = h->magic, .floor = h->high[2],
+				    .certified = h->high[3] };
+				memcpy(&selected.directory, h->reserved,
+				    sizeof (selected.directory));
+				memcpy(selected.pending, h->reserved + 6,
+				    sizeof (selected.pending));
+				if (serial > control->serial) {
+					*control = selected;
+					conflict = B_FALSE;
+				} else if (!engine_mcontrol_same(control,
+				    &selected)) {
+					conflict = B_TRUE;
+				}
+			}
+			*serial_high = MAX(*serial_high, serial);
+			*generation = MAX(*generation, h->generation);
+			found = B_TRUE;
+		}
+	}
+	uint64_t top = 0;
+	for (uint_t i = 0; i < slots; i++)
+		top = MAX(top, serials[i]);
+	for (uint_t i = 0; i < slots; i++) {
+		if (serials[i] == 0 || serials[i] + 1 < top)
+			continue;
+		for (uint_t j = 0; j < pages; j++)
+			bitmap[j] |= masks[i * pages + j];
+	}
+	engine_mnode_free(n);
+	kmem_free(masks, slots * pages);
+	kmem_free(serials, slots * sizeof (*serials));
+	if (error != 0)
+		return (error);
+	return (conflict ? ECKSUM : (found ? 0 : ENOENT));
+}
+
+static int
+engine_r02_add_arena(engine_r02_manifest_private_t *m, uint64_t p,
+    uint64_t pages, const uint64_t uuid[2], boolean_t initial)
+{
+	engine_t *engine = m->spa->spa_reloc;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	int error = engine_r02_extent(engine, p, pages);
+	if (error != 0)
+		return (error);
+	for (uint_t i = 0; i < m->count; i++) {
+		engine_r02_arena_t *a = &m->arenas[i];
+		if (p < a->p + a->pages * stripe && a->p < p + pages * stripe)
+			return (ENGINE_EINVAL(74));
+	}
+	uint8_t *bits = kmem_zalloc(pages, KM_SLEEP);
+	uint64_t generation = 0, serial = 0;
+	engine_mcontrol_t *control = initial ? &m->control : NULL;
+	error = engine_r02_slots(m, p, pages, uuid, bits, &generation,
+	    &serial, control);
+	if (error != 0) {
+		kmem_free(bits, pages);
+		return (error);
+	}
+	if (initial && (m->control.codec != ENGINE_M_ALLOC_MAGIC ||
+	    m->control.serial == 0 || generation == 0)) {
+		kmem_free(bits, pages);
+		return (ENOTSUP);
+	}
+	if (m->count == m->capacity) {
+		uint64_t wanted = m->capacity == 0 ? 4 :
+		    (uint64_t)m->capacity * 2;
+		uint64_t limit = MIN(UINT_MAX, engine->total / stripe);
+		uint_t capacity = MIN(wanted, limit);
+		if (capacity == m->capacity || (capacity != 0 &&
+		    SIZE_MAX / capacity < sizeof (*m->arenas))) {
+			kmem_free(bits, pages);
+			return (EOVERFLOW);
+		}
+		engine_r02_arena_t *arenas = pr19262_alloc(capacity *
+		    sizeof (*arenas), KM_SLEEP);
+		if (m->arenas != NULL) {
+			memcpy(arenas, m->arenas, m->count * sizeof (*arenas));
+			kmem_free(m->arenas, m->capacity * sizeof (*arenas));
+		}
+		m->arenas = arenas;
+		m->capacity = capacity;
+	}
+	engine_r02_arena_t *a = &m->arenas[m->count++];
+	a->p = p;
+	a->pages = pages;
+	memcpy(a->uuid, uuid, sizeof (a->uuid));
+	a->bits = bits;
+	m->reservation_generation = MAX(m->reservation_generation, generation);
+	error = engine_r02_entry_add(m, PR19262_R02_MANIFEST_ACTIVE_ARENA,
+	    p, pages, generation, NULL);
+	if (error != 0)
+		return (error);
+	if (initial)
+		m->generation = generation;
+	return (0);
+}
+
+static int
+engine_r02_manifest_open(engine_r02_manifest_private_t *m)
+{
+	engine_t *engine = m->spa->spa_reloc;
+	uint64_t zero[2] = { 0 };
+	int error = engine_r02_add_arena(m, engine->arena, ENGINE_STORE_PAGES,
+	    zero, B_TRUE);
+	if (error != 0)
+		return (error);
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	engine_mref_t ref = m->control.directory;
+	while (!engine_mref_empty(&ref)) {
+		if (ref.generation == 0 || ref.generation > m->generation ||
+		    zfs_range_tree_contains(m->directory, ref.p, stripe))
+			return (ENGINE_EINVAL(75));
+		engine_mnode_t *n;
+		error = engine_r02_read_ref(m, &ref, ENGINE_R02_DIRECTORY, &n);
+		if (error != 0)
+			return (error);
+		engine_mheader_t *h = engine_mheader(n);
+		uint64_t *data = engine_mpayload(n);
+		if (h->type != ENGINE_M_DIRECTORY || data[0] >= ref.p ||
+		    ref.p - data[0] != 2 * stripe ||
+		    (data[2] == 0 && data[3] == 0)) {
+			error = ENGINE_EINVAL(76);
+		} else {
+			error = engine_r02_add_arena(m, data[0], data[1],
+			    data + 2, B_FALSE);
+		}
+		engine_mref_t next;
+		memcpy(&next, data + 4, sizeof (next));
+		if (error == 0 && !engine_mref_empty(&next) &&
+		    next.generation > ref.generation)
+			error = ENGINE_EINVAL(77);
+		engine_mnode_free(n);
+		if (error != 0)
+			return (error);
+		ref = next;
+	}
+	uint64_t empty[4] = { 0 };
+	if (memcmp(m->control.pending, empty, sizeof (empty)) != 0) {
+		if (m->control.pending[1] == 0 ||
+		    (m->control.pending[2] == 0 && m->control.pending[3] == 0))
+			return (ENGINE_EINVAL(78));
+		error = engine_r02_extent(engine, m->control.pending[0],
+		    m->control.pending[1]);
+		if (error != 0)
+			return (error);
+		for (uint_t i = 0; i < m->count; i++) {
+			engine_r02_arena_t *a = &m->arenas[i];
+			if (m->control.pending[0] < a->p + a->pages * stripe &&
+			    a->p < m->control.pending[0] +
+			    m->control.pending[1] * stripe)
+				return (ENGINE_EINVAL(79));
+		}
+		m->pending = 1;
+		error = engine_r02_entry_add(m,
+		    PR19262_R02_MANIFEST_PENDING_ARENA, m->control.pending[0],
+		    m->control.pending[1], m->control.serial, NULL);
+		if (error != 0)
+			return (error);
+		/*
+		 * A reseed also carries whichever pending-arena allocation slot
+		 * already validates for that arena and uuid, so recovery
+		 * selects the same pending state on the exact new leaf.  The
+		 * read-only observer keeps its original closure and counts.
+		 */
+		if (m->reseed) {
+			uint8_t *bits = kmem_zalloc(m->control.pending[1],
+			    KM_SLEEP);
+			uint64_t generation = 0, serial = 0;
+			error = engine_r02_slots(m, m->control.pending[0],
+			    m->control.pending[1], m->control.pending + 2, bits,
+			    &generation, &serial, NULL);
+			kmem_free(bits, m->control.pending[1]);
+			if (error == ENOENT)
+				error = 0;
+			if (error != 0)
+				return (error);
+		}
+	}
+	for (uint_t i = 0; i < m->count; i++)
+		if (!m->arenas[i].bits[0] || !m->arenas[i].bits[1])
+			return (ENGINE_EINVAL(80));
+	return (0);
+}
+
+typedef struct engine_r02_tree_reader {
+	engine_r02_manifest_private_t *manifest;
+	uint64_t generation;
+	const uchar_t *bitmap;
+	zfs_range_tree_t *seen;
+	uint64_t last[4];
+	boolean_t have_last;
+} engine_r02_tree_reader_t;
+
+typedef struct engine_r02_root_check {
+	const engine_r02_manifest_private_t *manifest;
+	const uchar_t *bitmap;
+	boolean_t bad;
+} engine_r02_root_check_t;
+
+static void
+engine_r02_root_check_page(void *arg, uint64_t p, uint64_t size)
+{
+	engine_r02_root_check_t *check = arg;
+	engine_t *engine = check->manifest->spa->spa_reloc;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	if (stripe == 0 || size % stripe != 0 || p > UINT64_MAX - size) {
+		check->bad = B_TRUE;
+		return;
+	}
+	for (uint64_t at = p, end = p + size; at < end; at += stripe)
+		if (!engine_r02_allocated(check->manifest, check->bitmap, at))
+			check->bad = B_TRUE;
+}
+
+static int
+engine_r02_row(engine_r02_tree_reader_t *r, const engine_mrow_t *row)
+{
+	if (row->key[0] != 1 || row->key[1] != row->data[0] ||
+	    row->key[2] != row->data[3] || row->data[6] > 3 ||
+	    (row->key[3] != 0 && row->key[3] != row->data[15]) ||
+	    (r->have_last && engine_mkey_compare(r->last, row->key) >= 0))
+		return (ENGINE_EINVAL(81));
+	memcpy(r->last, row->key, sizeof (r->last));
+	r->have_last = B_TRUE;
+	return (0);
+}
+
+static int
+engine_r02_walk(engine_r02_tree_reader_t *r, const engine_mref_t *ref,
+    uint64_t level, uint64_t low[4], uint64_t high[4])
+{
+	engine_t *engine = r->manifest->spa->spa_reloc;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	if (ref->generation == 0 || ref->generation > r->generation ||
+	    !engine_r02_allocated(r->manifest, r->bitmap, ref->p) ||
+	    zfs_range_tree_contains(r->seen, ref->p, stripe))
+		return (ENGINE_EINVAL(82));
+	engine_mnode_t *n;
+	int error = engine_r02_read_ref(r->manifest, ref, ENGINE_R02_TREE, &n);
+	if (error != 0)
+		return (error);
+	engine_mheader_t *h = engine_mheader(n);
+	zfs_range_tree_add(r->seen, ref->p, stripe);
+	if ((level != UINT64_MAX && level != h->level) ||
+	    (h->type != ENGINE_M_LEAF && h->type != ENGINE_M_BRANCH)) {
+		error = ENGINE_EINVAL(83);
+	} else if (h->type == ENGINE_M_LEAF) {
+		engine_mrow_t *rows = engine_mpayload(n);
+		if (engine_mkey_compare(rows[0].key, h->low) != 0 ||
+		    engine_mkey_compare(rows[h->count - 1].key, h->high) != 0)
+			error = ENGINE_EINVAL(84);
+		for (uint_t i = 0; error == 0 && i < h->count; i++)
+			error = engine_r02_row(r, &rows[i]);
+	} else {
+		engine_mchild_t *children = engine_mpayload(n);
+		uint64_t previous[4] = { 0 };
+		for (uint_t i = 0; error == 0 && i < h->count; i++) {
+			uint64_t clow[4] = { 0 }, chigh[4] = { 0 };
+			if (children[i].ref.generation > h->generation)
+				error = ENGINE_EINVAL(85);
+			else
+				error = engine_r02_walk(r, &children[i].ref,
+				    h->level - 1, clow, chigh);
+			if (error == 0) {
+				boolean_t bad = engine_mkey_compare(chigh,
+				    children[i].high) != 0;
+				bad |= i == 0 && engine_mkey_compare(clow,
+				    h->low) != 0;
+				bad |= i != 0 && engine_mkey_compare(previous,
+				    clow) >= 0;
+				if (bad)
+					error = ENGINE_EINVAL(86);
+			}
+			memcpy(previous, chigh, sizeof (previous));
+		}
+		if (error == 0 && engine_mkey_compare(previous, h->high) != 0)
+			error = ENGINE_EINVAL(87);
+	}
+	memcpy(low, h->low, sizeof (h->low));
+	memcpy(high, h->high, sizeof (h->high));
+	engine_mnode_free(n);
+	return (error);
+}
+
+static int
+engine_r02_root(engine_r02_manifest_private_t *m, const uberblock_t *ub,
+    void *arg, int (*add)(void *, const uberblock_t *))
+{
+	engine_t *engine = m->spa->spa_reloc;
+	const uint64_t *d = ub->ub_pr19262;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	if (d[15] < 6 || d[7] == 0 || d[7] > ENGINE_STORE_BYTES ||
+	    stripe == 0 || d[4] % stripe != 0 || d[4] >= engine->total ||
+	    stripe > engine->total - d[4])
+		return (ENOTSUP);
+	engine_mref_t ref = { .p = d[4] };
+	memcpy(&ref.hash, d + 8, sizeof (ref.hash));
+	zfs_range_tree_t *seen = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	    NULL, 0, 0);
+	char *packed = kmem_alloc(d[7], KM_SLEEP);
+	uint64_t offset = 0, generation = 0;
+	int error = 0;
+	while (error == 0 && ref.p != UINT64_MAX) {
+		if (ref.generation != 0 && ref.generation > generation) {
+			error = ENGINE_EINVAL(88);
+			break;
+		}
+		if (zfs_range_tree_contains(seen, ref.p, stripe)) {
+			error = ENGINE_EINVAL(89);
+			break;
+		}
+		engine_mnode_t *n;
+		error = engine_r02_read_ref(m, &ref, ENGINE_R02_CATALOG, &n);
+		if (error != 0)
+			break;
+		engine_mheader_t *h = engine_mheader(n);
+		if (offset == 0)
+			generation = h->generation;
+		if (h->type != ENGINE_M_BLOB || h->generation != generation ||
+		    h->low[0] != offset || h->high[0] != d[7] ||
+		    offset > d[7] || h->count > d[7] - offset ||
+		    !engine_r02_allocated(m, NULL, ref.p)) {
+			error = ENGINE_EINVAL(90);
+		} else {
+			memcpy(packed + offset, engine_mpayload(n), h->count);
+			offset += h->count;
+			zfs_range_tree_add(seen, ref.p, stripe);
+			memcpy(&ref, h->reserved, sizeof (ref));
+			if (ref.p != UINT64_MAX && ref.generation == 0)
+				error = ENGINE_EINVAL(91);
+		}
+		engine_mnode_free(n);
+	}
+	nvlist_t *nv = NULL;
+	if (error == 0 && offset != d[7])
+		error = ENGINE_EINVAL(92);
+	if (error == 0)
+		error = nvlist_unpack(packed, d[7], &nv, KM_SLEEP);
+	kmem_free(packed, d[7]);
+	uint64_t *tree, generation_nv;
+	uchar_t *bitmap;
+	uint_t nt, nb;
+	if (error == 0 && (nvlist_exists(nv, "owners") ||
+	    nvlist_lookup_uint64_array(nv, "page-tree", &tree, &nt) != 0 ||
+	    nt != 6 || nvlist_lookup_uint64(nv, "page-generation",
+	    &generation_nv) != 0 || generation_nv != generation ||
+	    nvlist_lookup_byte_array(nv, "bitmap", &bitmap, &nb) != 0 ||
+	    nb != ENGINE_STORE_PAGES))
+		error = ENGINE_EINVAL(93);
+	for (uint_t i = 0; error == 0 && i < ENGINE_STORE_PAGES; i++)
+		if (bitmap[i] > 1)
+			error = ENGINE_EINVAL(94);
+	if (error == 0 && (!bitmap[0] || !bitmap[1]))
+		error = ENGINE_EINVAL(95);
+	if (error == 0 && m->reservation_generation < generation)
+		error = ECKSUM;
+	if (error == 0) {
+		engine_r02_root_check_t check = {
+			.manifest = m, .bitmap = bitmap
+		};
+		zfs_range_tree_walk(seen, engine_r02_root_check_page, &check);
+		if (check.bad)
+			error = ENGINE_EINVAL(99);
+	}
+	engine_mref_t tree_ref;
+	if (error == 0)
+		memcpy(&tree_ref, tree, sizeof (tree_ref));
+	if (error == 0 && tree_ref.p != UINT64_MAX) {
+		engine_r02_tree_reader_t reader = {
+			.manifest = m, .generation = generation,
+			.bitmap = bitmap,
+			.seen = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+			    NULL, 0, 0)
+		};
+		uint64_t low[4], high[4];
+		error = engine_r02_walk(&reader, &tree_ref, UINT64_MAX, low,
+		    high);
+		zfs_range_tree_vacate(reader.seen, NULL, NULL);
+		zfs_range_tree_destroy(reader.seen);
+	}
+	uint64_t txg, pool, top, *mos, *checkpoint;
+	uint_t nm, nc;
+	if (error == 0 && (nvlist_lookup_uint64(nv, "txg", &txg) != 0 ||
+	    nvlist_lookup_uint64(nv, "pool", &pool) != 0 ||
+	    nvlist_lookup_uint64(nv, "top", &top) != 0 ||
+	    nvlist_lookup_uint64_array(nv, "mos", &mos, &nm) != 0 ||
+	    nvlist_lookup_uint64_array(nv, "checkpoint", &checkpoint, &nc) !=
+	    0 || nm != sizeof (blkptr_t) / sizeof (uint64_t) ||
+	    nc != sizeof (uberblock_t) / sizeof (uint64_t) || txg != d[6] ||
+	    pool != spa_guid(m->spa) || top != d[1] ||
+	    memcmp(mos, &ub->ub_rootbp, sizeof (blkptr_t)) != 0))
+		error = ENGINE_EINVAL(96);
+	if (error == 0) {
+		uberblock_t pin;
+		memcpy(&pin, checkpoint, sizeof (pin));
+		if (pin.ub_txg != 0) {
+			if (uberblock_verify(&pin) != 0 || pin.ub_txg > txg ||
+			    pin.ub_checkpoint_txg != pin.ub_txg ||
+			    pin.ub_pr19262[6] >= d[6])
+				error = ENGINE_EINVAL(97);
+			else if (!engine_native_checkpoint(&pin))
+				error = add(arg, &pin);
+		}
+	}
+	if (error == 0)
+		error = engine_r02_entry_add(m, PR19262_R02_MANIFEST_ROOT,
+		    d[4], d[5], d[6], (const zio_cksum_t *)(d + 8));
+	if (error == 0)
+		m->roots++;
+	nvlist_free(nv);
+	zfs_range_tree_vacate(seen, NULL, NULL);
+	zfs_range_tree_destroy(seen);
+	return (error);
+}
+
+typedef struct engine_r02_check {
+	const engine_r02_manifest_private_t *manifest;
+	boolean_t bad;
+} engine_r02_check_t;
+
+static void
+engine_r02_check_page(void *arg, uint64_t p, uint64_t size)
+{
+	engine_r02_check_t *check = arg;
+	engine_t *engine = check->manifest->spa->spa_reloc;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	if (stripe == 0 || size % stripe != 0 || p > UINT64_MAX - size) {
+		check->bad = B_TRUE;
+		return;
+	}
+	for (uint64_t at = p, end = p + size; at < end; at += stripe)
+		if (!engine_r02_allocated(check->manifest, NULL, at))
+			check->bad = B_TRUE;
+}
+
+static int
+engine_r02_manifest_check(engine_r02_manifest_private_t *m)
+{
+	engine_r02_check_t check = { .manifest = m };
+	zfs_range_tree_walk(m->all, engine_r02_check_page, &check);
+	return (check.bad ? ENGINE_EINVAL(98) : 0);
+}
+
+static void
+engine_r02_manifest_counts(const engine_r02_manifest_private_t *m,
+    pr19262_r02_manifest_t *out)
+{
+	engine_t *engine = m->spa->spa_reloc;
+	uint64_t stripe = ENGINE_STORE_PAGE * engine->vd->vdev_children;
+	memset(out, 0, sizeof (*out));
+	out->roots = m->roots;
+	out->catalog_pages = zfs_range_tree_space(m->catalog) / stripe;
+	out->tree_pages = zfs_range_tree_space(m->tree) / stripe;
+	out->control_pages = zfs_range_tree_space(m->control_pages) / stripe;
+	out->directory_pages = zfs_range_tree_space(m->directory) / stripe;
+	out->active_arenas = m->count;
+	out->pending_arenas = m->pending;
+	out->journal_heads = m->journal_heads;
+	out->journal_binds = m->journal_binds;
+	out->journal_forwards = m->journal_forwards;
+	out->journal_pending = m->journal_pending;
+}
+
+static void
+engine_r02_manifest_fini(engine_r02_manifest_private_t *m)
+{
+	for (uint_t i = 0; i < m->count; i++)
+		kmem_free(m->arenas[i].bits, m->arenas[i].pages);
+	if (m->arenas != NULL)
+		kmem_free(m->arenas, m->capacity * sizeof (*m->arenas));
+	engine_r02_entry_t *entry;
+	while ((entry = list_remove_head(&m->entries)) != NULL)
+		kmem_free(entry, sizeof (*entry));
+	list_destroy(&m->entries);
+	zfs_range_tree_vacate(m->all, NULL, NULL);
+	zfs_range_tree_destroy(m->all);
+	zfs_range_tree_vacate(m->catalog, NULL, NULL);
+	zfs_range_tree_destroy(m->catalog);
+	zfs_range_tree_vacate(m->tree, NULL, NULL);
+	zfs_range_tree_destroy(m->tree);
+	zfs_range_tree_vacate(m->control_pages, NULL, NULL);
+	zfs_range_tree_destroy(m->control_pages);
+	zfs_range_tree_vacate(m->directory, NULL, NULL);
+	zfs_range_tree_destroy(m->directory);
+	zfs_range_tree_vacate(m->journal, NULL, NULL);
+	zfs_range_tree_destroy(m->journal);
 }
 
 static int

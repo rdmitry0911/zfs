@@ -2797,6 +2797,30 @@ vdev_raidz_read_birth(zio_t *zio)
 	return (zio->io_txg);
 }
 
+/*
+ * P selects the physical RAIDZ layout and is tested first.  A translated
+ * resilver can additionally carry original B, which is a repair-selection
+ * birth only.  Return the birth that made this column stale for diagnostics.
+ */
+static boolean_t
+vdev_raidz_read_dtl_contains(zio_t *zio, vdev_t *cvd, uint64_t *birthp)
+{
+	uint64_t backing_birth = vdev_raidz_read_birth(zio);
+	uint64_t source_birth = zio->io_pr19262_repair_source_birth;
+
+	*birthp = backing_birth;
+	if (vdev_dtl_contains(cvd, DTL_MISSING, backing_birth, 1))
+		return (B_TRUE);
+
+	if (source_birth != 0 && source_birth != backing_birth &&
+	    vdev_dtl_contains(cvd, DTL_MISSING, source_birth, 1)) {
+		*birthp = source_birth;
+		return (B_TRUE);
+	}
+
+	return (B_FALSE);
+}
+
 static void
 vdev_raidz_io_verify(zio_t *zio, raidz_map_t *rm, raidz_row_t *rr, int col)
 {
@@ -2938,8 +2962,9 @@ vdev_raidz_io_start_read_row(zio_t *zio, raidz_row_t *rr, boolean_t forceparity)
 			rc->rc_skipped = 1;
 			continue;
 		}
-		if (vdev_dtl_contains(cvd, DTL_MISSING,
-		    vdev_raidz_read_birth(zio), 1)) {
+		uint64_t stale_birth;
+		if (vdev_raidz_read_dtl_contains(zio, cvd,
+		    &stale_birth)) {
 			if (c >= rr->rr_firstdatacol)
 				rr->rr_missingdata++;
 			else
@@ -2949,7 +2974,7 @@ vdev_raidz_io_start_read_row(zio_t *zio, raidz_row_t *rr, boolean_t forceparity)
 			pr19262_printf("PR19262_DTL_STALE child=%u birth=%llu "
 			    "offset=%llu size=%llu objset=%llu object=%llu "
 			    "level=%lld blkid=%llu\n", (uint_t)rc->rc_devidx,
-			    (u_longlong_t)vdev_raidz_read_birth(zio),
+			    (u_longlong_t)stale_birth,
 			    (u_longlong_t)zio->io_offset,
 			    (u_longlong_t)zio->io_size,
 			    (u_longlong_t)zio->io_bookmark.zb_objset,
@@ -3027,13 +3052,14 @@ vdev_raidz_io_start_read_phys_cols(zio_t *zio, raidz_map_t *rm)
 			prc->rc_skipped = 1;
 			continue;
 		}
-		if (vdev_dtl_contains(cvd, DTL_MISSING,
-		    vdev_raidz_read_birth(zio), 1)) {
+		uint64_t stale_birth;
+		if (vdev_raidz_read_dtl_contains(zio, cvd,
+		    &stale_birth)) {
 			prc->rc_error = SET_ERROR(ESTALE);
 			prc->rc_skipped = 1;
 			pr19262_printf("PR19262_DTL_STALE_PARITY child=%u "
 			    "birth=%llu offset=%llu\n", (uint_t)i,
-			    (u_longlong_t)vdev_raidz_read_birth(zio),
+			    (u_longlong_t)stale_birth,
 			    (u_longlong_t)zio->io_offset);
 			continue;
 		}
@@ -3740,16 +3766,24 @@ vdev_raidz_io_done_verified(zio_t *zio, raidz_row_t *rr)
 			 * reserved as a spare anyway.
 			 */
 			zio_flag_t aflags = add_flags;
-			if (rc->rc_tgt_is_dspare)
+			if (rc->rc_tgt_is_dspare) {
 				aflags &= ~ZIO_FLAG_SPECULATIVE;
+			}
+			zio_flag_t repair_flags = ZIO_FLAG_IO_REPAIR | aflags;
+			if (unexpected_errors)
+				repair_flags |= ZIO_FLAG_SELF_HEAL;
 
+			/* R-01 observes natural reconstruction. */
+#ifdef _KERNEL
+			pr19262_engine_r01_repair_created(zio, cvd,
+			    rc->rc_offset, rc->rc_size, c, repair_flags);
+#endif
 			zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
 			    rc->rc_offset, rc->rc_abd, rc->rc_size,
 			    ZIO_TYPE_WRITE,
 			    zio->io_priority == ZIO_PRIORITY_REBUILD ?
 			    ZIO_PRIORITY_REBUILD : ZIO_PRIORITY_ASYNC_WRITE,
-			    ZIO_FLAG_IO_REPAIR | (unexpected_errors ?
-			    ZIO_FLAG_SELF_HEAL : 0) | aflags, NULL, NULL));
+			    repair_flags, NULL, NULL));
 		}
 	}
 

@@ -72,6 +72,7 @@
 #include <sys/zfeature.h>
 #include <sys/abd.h>
 #include <sys/vdev_reloc_probe.h>
+#include <sys/vdev_reloc_engine.h>
 #include <sys/blkptr.h>
 #include <sys/dsl_crypt.h>
 #include <sys/dsl_scan.h>
@@ -94,7 +95,9 @@
 #include "zdb.h"
 
 
+#ifdef ZFS_DEBUG
 extern int reference_tracking_enable;
+#endif
 extern int zfs_recover;
 extern uint_t zfs_vdev_async_read_max_active;
 extern boolean_t spa_load_verify_dryrun;
@@ -6300,6 +6303,9 @@ typedef struct zdb_cb {
 	zdb_blkstats_t	zcb_type[ZB_TOTAL + 1][ZDB_OT_TOTAL + 1];
 	uint64_t	zcb_removing_size;
 	uint64_t	zcb_checkpoint_size;
+	/* PR19262 engine: unreferenced V of retired owners (deferred free). */
+	uint64_t	zcb_engine_retired_size;
+	uint64_t	zcb_engine_retired_owners;
 	uint64_t	zcb_dedup_asize;
 	uint64_t	zcb_dedup_blocks;
 	uint64_t	zcb_clone_asize;
@@ -7045,6 +7051,95 @@ zdb_leak(void *arg, uint64_t start, uint64_t size)
 	    (u_longlong_t)vd->vdev_id, (u_longlong_t)start, (u_longlong_t)size);
 }
 
+/*
+ * PR19262 engine vdev: when a block on the translated vdev is freed, its
+ * owner is retired and its native V stays allocated in the space map until
+ * a fence releases it (pr19262_engine_retire(); the fence's release sync
+ * task frees the V).  No block pointer references that V, so the traversal
+ * leaves it in ms_allocatable.  Like checkpointed space it is accounted,
+ * not leaked, but it is subtracted after the traversal, not before: split
+ * each unreferenced segment into whole retired owners (exported read-only
+ * engine queries only; the import is read only, so no sync, store or fence
+ * changes the owners meanwhile) and report as leaked only what no retired
+ * owner explains, exactly at owner granularity.
+ */
+typedef struct zdb_engine_leak {
+	vdev_t		*zel_vd;
+	zdb_cb_t	*zel_zcb;
+} zdb_engine_leak_t;
+
+/*
+ * The incarnation of the owner that starts exactly at off, else 0.  Owners
+ * are ashift-aligned (checked at catalog load and journal replay), so an
+ * owner found for [off, off + sector) either starts at off or covers off
+ * from before, and then it also covers off - sector.
+ */
+static uint64_t
+zdb_engine_owner_at(spa_t *spa, uint64_t off, uint64_t sector)
+{
+	uint64_t inc = pr19262_engine_owner_incarnation(spa, off, sector);
+	/* An owner that also covers the sector before off started earlier. */
+	if (inc != 0 && off >= sector &&
+	    pr19262_engine_owner_incarnation(spa, off - sector, sector) == inc)
+		return (0);
+	return (inc);
+}
+
+static void
+zdb_leak_engine(void *arg, uint64_t start, uint64_t size)
+{
+	zdb_engine_leak_t *zel = arg;
+	vdev_t *vd = zel->zel_vd;
+	spa_t *spa = vd->vdev_spa;
+	uint64_t sector = 1ULL << vd->vdev_ashift;
+	uint64_t end = start + size, off = start, hole = start;
+
+	/* Owners are ashift-aligned; never probe the engine off-grid. */
+	if (!IS_P2ALIGNED(start, sector) || !IS_P2ALIGNED(size, sector)) {
+		zdb_leak(vd, start, size);
+		return;
+	}
+	while (off < end) {
+		uint64_t inc = zdb_engine_owner_at(spa, off, sector);
+		pr19262_engine_info_t info = { 0 };
+		if (inc == 0) {
+			/* No owner overlaps the rest: it is all unexplained. */
+			if (pr19262_engine_owner_incarnation(spa, off,
+			    end - off) == 0)
+				break;
+			off += sector;
+			continue;
+		}
+		blkptr_t bp = {{{{0}}}};
+		DVA_SET_VDEV(&bp.blk_dva[0], vd->vdev_id);
+		DVA_SET_OFFSET(&bp.blk_dva[0], off);
+		DVA_SET_ASIZE(&bp.blk_dva[0], sector);
+		pr19262_engine_inspect(spa, &bp, 0, &info);
+		if (info.incarnation != inc || info.vsize == 0) {
+			off += sector;
+			continue;
+		}
+		if (!info.retired || info.aborted || info.vsize > end - off) {
+			/* Owners never overlap: no other one starts inside. */
+			off += MIN(info.vsize, end - off);
+			continue;
+		}
+		if (hole < off)
+			zdb_leak(vd, hole, off - hole);
+		if (dump_opt['b'] >= 3)
+			(void) printf("engine-retired space: vdev %llu, "
+			    "offset 0x%llx, size %llu\n",
+			    (u_longlong_t)vd->vdev_id, (u_longlong_t)off,
+			    (u_longlong_t)info.vsize);
+		zel->zel_zcb->zcb_engine_retired_size += info.vsize;
+		zel->zel_zcb->zcb_engine_retired_owners++;
+		off += info.vsize;
+		hole = off;
+	}
+	if (hole < end)
+		zdb_leak(vd, hole, end - hole);
+}
+
 static metaslab_ops_t zdb_metaslab_ops = {
 	NULL	/* alloc */
 };
@@ -7772,6 +7867,11 @@ zdb_leak_fini(spa_t *spa, zdb_cb_t *zcb)
 			if (vd->vdev_ops == &vdev_indirect_ops) {
 				zfs_range_tree_vacate(msp->ms_allocatable,
 				    NULL, NULL);
+			} else if (vd == pr19262_engine_vdev(spa)) {
+				zdb_engine_leak_t zel = {
+					.zel_vd = vd, .zel_zcb = zcb };
+				zfs_range_tree_vacate(msp->ms_allocatable,
+				    zdb_leak_engine, &zel);
 			} else {
 				zfs_range_tree_vacate(msp->ms_allocatable,
 				    zdb_leak, vd);
@@ -7780,6 +7880,22 @@ zdb_leak_fini(spa_t *spa, zdb_cb_t *zcb)
 				msp->ms_loaded = B_FALSE;
 			}
 		}
+	}
+
+	/*
+	 * Every retired owner should have been found whole in unreferenced
+	 * V.  One that was not is referenced by a block (released V would be
+	 * reused under it), not allocated, or split by a checkpoint drain.
+	 */
+	if (pr19262_engine_vdev(spa) != NULL) {
+		pr19262_engine_census_t census;
+		pr19262_engine_census(spa, 0, &census);
+		if (census.retired_owners != zcb->zcb_engine_retired_owners)
+			(void) printf("engine-retired owners not found in "
+			    "unreferenced space: %llu of %llu\n",
+			    (u_longlong_t)(census.retired_owners -
+			    zcb->zcb_engine_retired_owners),
+			    (u_longlong_t)census.retired_owners);
 	}
 
 	kmem_free(zcb->zcb_vd_obsolete_counts,
@@ -8104,7 +8220,15 @@ dump_block_stats(spa_t *spa)
 	    get_unflushed_alloc_space(spa);
 	total_found =
 	    tzb->zb_asize - zcb->zcb_dedup_asize - zcb->zcb_clone_asize +
-	    zcb->zcb_removing_size + zcb->zcb_checkpoint_size;
+	    zcb->zcb_removing_size + zcb->zcb_checkpoint_size +
+	    zcb->zcb_engine_retired_size;
+
+	if (zcb->zcb_engine_retired_owners != 0 && !dump_opt['L']) {
+		(void) printf("\tengine-retired (deferred free): %llu owners, "
+		    "%llu bytes\n",
+		    (u_longlong_t)zcb->zcb_engine_retired_owners,
+		    (u_longlong_t)zcb->zcb_engine_retired_size);
+	}
 
 	if (total_found == total_alloc && !dump_opt['L']) {
 		(void) printf("\n\tNo leaks (block sum matches space"
@@ -10544,7 +10668,9 @@ main(int argc, char **argv)
 	/*
 	 * Disable reference tracking for better performance.
 	 */
+#ifdef ZFS_DEBUG
 	reference_tracking_enable = B_FALSE;
+#endif
 
 	/*
 	 * Do not fail spa_load when spa_load_verify fails. This is needed

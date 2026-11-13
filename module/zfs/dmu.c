@@ -49,6 +49,7 @@
 #include <sys/trace_zfs.h>
 #include <sys/zfs_racct.h>
 #include <sys/zfs_rlock.h>
+#include <sys/vdev_reloc_engine.h>
 #ifdef _KERNEL
 #include <sys/vmsystm.h>
 #include <sys/zfs_znode.h>
@@ -1104,6 +1105,53 @@ dmu_evict_range(objset_t *os, uint64_t object, uint64_t offset, uint64_t len)
 }
 
 /*
+ * PR19262 L13: the L0 blocks of [begin, end) that freeing retires, from
+ * the fill of each L1 indirect covering it, or UINT64_MAX when that is
+ * not known (an L1 is dirty, so its pointer may lag the blocks under it;
+ * or the range spans too many L1s to look at).  An L1 born at or before
+ * the dataset's previous snapshot holds only blocks that snapshot keeps:
+ * freeing them moves them to the deadlist and retires no catalog owner
+ * (a snapshot destroy racing this pricing sends such blocks to the paced
+ * free bpobj: dsl_dataset_block_kill).  An L1 that is freed retires its
+ * own DVAs too, and each block one row per copy.
+ */
+#define	DMU_FREE_LIVE_MAX_L1	512
+
+static uint64_t
+dmu_free_chunk_live(dnode_t *dn, uint64_t begin, uint64_t end)
+{
+	if (dn->dn_nlevels <= 1 || end <= begin)
+		return (UINT64_MAX);
+	dsl_dataset_t *ds = dn->dn_objset->os_dsl_dataset;
+	uint64_t prev = ds != NULL ? dsl_dataset_phys(ds)->ds_prev_snap_txg :
+	    0;
+	uint64_t first = dbuf_whichblock(dn, 1, begin);
+	uint64_t last = dbuf_whichblock(dn, 1, end - 1);
+	if (last - first >= DMU_FREE_LIVE_MAX_L1)
+		return (UINT64_MAX);
+	uint64_t live = 0;
+	for (uint64_t i = first; i <= last; i++) {
+		rw_enter(&dn->dn_struct_rwlock, RW_READER);
+		dmu_buf_impl_t *db = dbuf_hold_level(dn, 1, i, FTAG);
+		rw_exit(&dn->dn_struct_rwlock);
+		if (db == NULL)
+			return (UINT64_MAX);
+		mutex_enter(&db->db_mtx);
+		boolean_t known = db->db_dirtycnt == 0;
+		const blkptr_t *bp = db->db_blkptr;
+		uint64_t n = known && bp != NULL && !BP_IS_HOLE(bp) &&
+		    BP_GET_BIRTH(bp) > prev ? BP_GET_FILL(bp) *
+		    MAX(dn->dn_objset->os_copies, 1) + BP_GET_NDVAS(bp) : 0;
+		mutex_exit(&db->db_mtx);
+		dbuf_rele(db, FTAG);
+		if (!known)
+			return (UINT64_MAX);
+		live += n;
+	}
+	return (live);
+}
+
+/*
  * Get the next "chunk" of file data to free.  We traverse the file from
  * the end so that the file gets shorter over time (if we crash in the
  * middle, this will leave us in a better state).  We find allocated file
@@ -1115,10 +1163,12 @@ dmu_evict_range(objset_t *os, uint64_t object, uint64_t offset, uint64_t len)
  * indirect blocks found within the chunk.
  */
 static int
-get_next_chunk(dnode_t *dn, uint64_t *start, uint64_t minimum, uint64_t *l1blks)
+get_next_chunk(dnode_t *dn, uint64_t *start, uint64_t minimum, uint64_t *l1blks,
+    uint64_t maxl1)
 {
 	uint64_t blks;
-	uint64_t maxblks = DMU_MAX_ACCESS >> (dn->dn_indblkshift + 1);
+	uint64_t maxblks = MIN(DMU_MAX_ACCESS >> (dn->dn_indblkshift + 1),
+	    maxl1);
 	/* bytes of data covered by a level-1 indirect block */
 	uint64_t iblkrange = (uint64_t)dn->dn_datablksz *
 	    EPB(dn->dn_indblkshift, SPA_BLKPTRSHIFT);
@@ -1223,10 +1273,22 @@ dmu_free_long_range_impl(objset_t *os, dnode_t *dn, uint64_t offset,
 	if (length == DMU_OBJECT_END || offset + length > object_size)
 		length = object_size - offset;
 
+	/* Txgs waited for the engine's row pacing since the last admission. */
+	uint64_t paced_waits = 0;
 	while (length != 0) {
 		uint64_t chunk_end, chunk_begin, chunk_len;
 		uint64_t l1blks;
 		dmu_tx_t *tx;
+		/*
+		 * Each L0 block a chunk frees retires a catalog row per copy;
+		 * a freed L1 retires its own DVAs (at most 3).
+		 */
+		uint64_t epb = EPB(dn->dn_indblkshift, SPA_BLKPTRSHIFT);
+		uint64_t copies = MAX(dn->dn_objset->os_copies, 1);
+		uint64_t l1rows = epb * copies + SPA_DVAS_PER_BP;
+		uint64_t rows_cap = pr19262_engine_free_chunk_rows(dp->dp_spa);
+		uint64_t maxl1 = rows_cap == UINT64_MAX ? UINT64_MAX :
+		    MAX(rows_cap / l1rows, 1);
 
 		if (dmu_objset_zfs_unmounting(dn->dn_objset))
 			return (SET_ERROR(EINTR));
@@ -1234,12 +1296,61 @@ dmu_free_long_range_impl(objset_t *os, dnode_t *dn, uint64_t offset,
 		chunk_end = chunk_begin = offset + length;
 
 		/* move chunk_begin backwards to the beginning of this chunk */
-		err = get_next_chunk(dn, &chunk_begin, offset, &l1blks);
+		err = get_next_chunk(dn, &chunk_begin, offset, &l1blks, maxl1);
 		if (err)
 			return (err);
 		ASSERT3U(chunk_begin, >=, offset);
 		ASSERT3U(chunk_begin, <=, chunk_end);
 
+		/*
+		 * PR19262 L13: while the engine's row budget is below one L1,
+		 * free fewer blocks than the L1 maps, so the chunk fits it (at
+		 * least a PR19262_FREE_PIECE_ROWS piece).  The window ends at
+		 * the last allocated block below chunk_end: the hole above it
+		 * goes in the same chunk and costs no row (a sparse file or a
+		 * discard over holes is not walked window by window).  Blocks
+		 * of the last unsynced txgs are not visible there (OPEN: they
+		 * go unpaced); a failed lookup proves nothing and cuts at
+		 * chunk_end.
+		 */
+		uint64_t data_end = chunk_end;
+		/*
+		 * The blocks the chunk retires, priced from its L1s' fill and
+		 * birth (a sparse file or blocks a snapshot keeps cost what
+		 * they retire, not what the range spans); a chunk whose live
+		 * blocks fit the budget goes uncut.
+		 */
+		uint64_t fill = rows_cap == UINT64_MAX ? UINT64_MAX :
+		    dmu_free_chunk_live(dn, chunk_begin, chunk_end);
+		uint64_t target = rows_cap == UINT64_MAX ? UINT64_MAX :
+		    MAX(rows_cap, PR19262_FREE_PIECE_ROWS);
+		boolean_t cut = B_FALSE;
+		if (rows_cap != UINT64_MAX && dn->dn_nlevels > 1 &&
+		    rows_cap < l1rows && chunk_end > chunk_begin &&
+		    (fill == UINT64_MAX || fill + 2 > target)) {
+			/* (blocks + 2) * copies + 3 rows fit target */
+			cut = B_TRUE;
+			uint64_t blocks = MAX((target - SPA_DVAS_PER_BP) /
+			    copies, 3) - 2;
+			uint64_t maxlen = blocks * dn->dn_datablksz;
+			uint64_t last = chunk_end - 1;
+			int nerr = dnode_next_offset(dn, DNODE_FIND_BACKWARDS,
+			    &last, 1, 1, 0);
+			if (nerr == ESRCH ||
+			    (nerr == 0 && last < chunk_begin)) {
+				/* No data in the chunk: nothing to retire. */
+				data_end = chunk_begin;
+			} else {
+				if (nerr == 0)
+					data_end = MIN(chunk_end,
+					    P2ROUNDUP_TYPED(last + 1,
+					    dn->dn_datablksz, uint64_t));
+				if (data_end - chunk_begin > maxlen)
+					chunk_begin = MAX(chunk_begin,
+					    P2ALIGN_TYPED(data_end - maxlen,
+					    dn->dn_datablksz, uint64_t));
+			}
+		}
 		chunk_len = chunk_end - chunk_begin;
 
 		tx = dmu_tx_create(os);
@@ -1275,6 +1386,38 @@ dmu_free_long_range_impl(objset_t *os, dnode_t *dn, uint64_t offset,
 			txg_wait_open(dp, 0, B_TRUE);
 			continue;
 		}
+
+		/*
+		 * The relocation engine bounds the catalog rows frees retire
+		 * per txg while its page store cannot grow; past the budget
+		 * the chunk waits for the next txg like the threshold above.
+		 */
+		uint64_t rows = dn->dn_nlevels <= 1 ? dn->dn_nblkptr :
+		    cut ? ((data_end - chunk_begin) / dn->dn_datablksz + 2) *
+		    copies + SPA_DVAS_PER_BP :
+		    fill != UINT64_MAX ? fill + 2 :
+		    MIN(l1blks * epb, chunk_len / dn->dn_datablksz + 2) *
+		    copies + SPA_DVAS_PER_BP * l1blks;
+		int paced = pr19262_engine_free_pace(dp->dp_spa, txg, rows,
+		    epb, paced_waits);
+		if (paced == PR19262_FREE_DEFER ||
+		    paced == PR19262_FREE_WAIT) {
+			dmu_tx_commit(tx);
+			paced_waits++;
+			/* Under a checkpoint a forced txg would only leak. */
+			txg_wait_open(dp, 0, paced == PR19262_FREE_DEFER);
+			continue;
+		}
+		/*
+		 * After an aged admission the next one may age again only
+		 * after PR19262_FREE_REAGE_TXGS more waits: an aged free stays
+		 * rate-bounded and fences catch up in between.
+		 */
+		if (paced == PR19262_FREE_ADMIT)
+			paced_waits = 0;
+		else if (paced == PR19262_FREE_AGED)
+			paced_waits = PR19262_FREE_AGE_TXGS -
+			    PR19262_FREE_REAGE_TXGS;
 
 		/*
 		 * In order to prevent unnecessary write throttling, for each

@@ -1751,9 +1751,10 @@ pr19262_ub_inventory_done(zio_t *zio)
 }
 
 /* A disk snapshot only; publication and reader/writer leases are separate. */
-int
-pr19262_vdev_uberblocks(spa_t *spa, void *arg,
-    int (*visit)(void *, const uberblock_t *))
+static int
+pr19262_vdev_uberblocks_impl(spa_t *spa, void *arg,
+    int (*visit)(void *, const uberblock_t *), boolean_t pairs,
+    vdev_t *absent_ok)
 {
 	ASSERT(spa_config_held(spa, SCL_STATE, RW_READER) == SCL_STATE ||
 	    spa_config_held(spa, SCL_STATE, RW_WRITER) == SCL_STATE);
@@ -1763,19 +1764,50 @@ pr19262_vdev_uberblocks(spa_t *spa, void *arg,
 	const uint_t max_leaves = 1024;
 	uint_t nleaves = 0;
 	vdev_t **leaves = kmem_alloc(max_leaves * sizeof (*leaves), KM_SLEEP);
+	/* A superseded leaf may be unreadable; its labels are not authority. */
+	boolean_t *optional = kmem_zalloc(max_leaves * sizeof (boolean_t),
+	    KM_SLEEP);
 	for (uint_t t = 0; t < root->vdev_children; t++) {
 		vdev_t *top = root->vdev_child[t];
+		/*
+		 * A hole (a removed log top-level) has no device, labels or
+		 * uberblocks.  A missing top-level stays required.
+		 */
+		if (top->vdev_ishole)
+			continue;
 		if (top->vdev_ops->vdev_op_leaf) {
 			if (nleaves == max_leaves)
 				goto out;
+			optional[nleaves] = top == absent_ok;
 			leaves[nleaves++] = top;
 			continue;
 		}
 		for (uint_t c = 0; c < top->vdev_children; c++) {
 			vdev_t *leaf = top->vdev_child[c];
+			/*
+			 * R02: a strict replacing pair contributes both exact
+			 * concrete leaves, never the parent; its old leaf is
+			 * the superseded copy.
+			 */
+			if (pairs && leaf->vdev_ops == &vdev_replacing_ops &&
+			    leaf->vdev_children == 2 &&
+			    leaf->vdev_child[0]->vdev_ops->vdev_op_leaf &&
+			    leaf->vdev_child[0]->vdev_children == 0 &&
+			    leaf->vdev_child[1]->vdev_ops->vdev_op_leaf &&
+			    leaf->vdev_child[1]->vdev_children == 0) {
+				if (nleaves + 2 > max_leaves)
+					goto out;
+				optional[nleaves] = B_TRUE;
+				leaves[nleaves++] = leaf->vdev_child[0];
+				optional[nleaves] =
+				    leaf->vdev_child[1] == absent_ok;
+				leaves[nleaves++] = leaf->vdev_child[1];
+				continue;
+			}
 			if (!leaf->vdev_ops->vdev_op_leaf ||
 			    nleaves == max_leaves)
 				goto out;
+			optional[nleaves] = leaf == absent_ok;
 			leaves[nleaves++] = leaf;
 		}
 	}
@@ -1794,6 +1826,8 @@ pr19262_vdev_uberblocks(spa_t *spa, void *arg,
 	for (uint_t c = 0; c < nleaves; c++) {
 		vdev_t *leaf = leaves[c];
 		if (!vdev_readable(leaf)) {
+			if (optional[c])
+				continue;
 			mutex_enter(&zio->io_lock);
 			inventory.error = ENXIO;
 			mutex_exit(&zio->io_lock);
@@ -1817,8 +1851,25 @@ pr19262_vdev_uberblocks(spa_t *spa, void *arg,
 		error = visit(arg, &inventory.roots[i]);
 	kmem_free(inventory.roots, capacity * sizeof (uberblock_t));
 out:
+	kmem_free(optional, max_leaves * sizeof (boolean_t));
 	kmem_free(leaves, max_leaves * sizeof (*leaves));
 	return (error);
+}
+
+int
+pr19262_vdev_uberblocks(spa_t *spa, void *arg,
+    int (*visit)(void *, const uberblock_t *))
+{
+	return (pr19262_vdev_uberblocks_impl(spa, arg, visit, B_FALSE, NULL));
+}
+
+/* The R02 variant: strict replacing pairs and one superseded leaf. */
+int
+pr19262_vdev_uberblocks_r02(spa_t *spa, void *arg,
+    int (*visit)(void *, const uberblock_t *), vdev_t *absent_ok)
+{
+	return (pr19262_vdev_uberblocks_impl(spa, arg, visit, B_TRUE,
+	    absent_ok));
 }
 
 /*
@@ -2325,7 +2376,7 @@ retry:
 		    txg, spa->spa_mmp.mmp_delay);
 
 		boolean_t mapped = B_FALSE;
-		mapped = pr19262_engine_store_dirty(spa);
+		mapped = pr19262_engine_store_dirty(spa, txg);
 		if (!changed && list_is_empty(&spa->spa_config_dirty_list) &&
 		    !spa_multihost(spa) && !mapped)
 			return (0);

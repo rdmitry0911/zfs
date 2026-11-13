@@ -3629,6 +3629,14 @@ zpool_vdev_online(zpool_handle_t *zhp, const char *path, int flags,
 			    "instead", "zpool detach");
 			return (zfs_error(hdl, EZFS_POSTSPLIT_ONLINE, errbuf));
 		}
+		if (errno == ZFS_ERR_VDEV_NOTSUP &&
+		    (flags & ZFS_ONLINE_EXPAND)) {
+			zfs_error_aux(hdl, "its top-level vdev is translated "
+			    "by the private relocation engine and its size is "
+			    "fixed (growing it would make the pool "
+			    "unimportable); use 'zpool online' without -e");
+			return (zfs_error(hdl, EZFS_VDEV_NOTSUP, errbuf));
+		}
 		return (zpool_standard_error(hdl, errno, errbuf));
 	}
 

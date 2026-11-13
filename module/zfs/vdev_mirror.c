@@ -507,6 +507,26 @@ vdev_mirror_child_missing(mirror_child_t *mc, uint64_t txg, uint64_t size)
 }
 
 /*
+ * B3G (A34, KP2): the birth that decides whether a child holds the data
+ * this read returns.  An engine-translated read carries the concrete write
+ * of its backing (io_pr19262_backing_birth, as vdev_raidz_read_birth() and
+ * vdev_mirror_repair_birth()); its operation txg can be later: a copy reads
+ * its source at the open txg (pr19262_engine_physical_io), so by io_txg an
+ * unresilvered R-02 leaf looked current for a backing written before its
+ * attach, and RAIDZ1 with another member missing failed with ECKSUM.  The
+ * DVA-level mirror (io_vd == NULL) keeps io_txg.
+ */
+static uint64_t pr19262_mirror_split_prints;
+
+static uint64_t
+vdev_mirror_read_birth(const zio_t *zio)
+{
+	if (zio->io_vd != NULL && zio->io_pr19262_backing_birth != 0)
+		return (zio->io_pr19262_backing_birth);
+	return (zio->io_txg);
+}
+
+/*
  * Try to find a vdev whose DTL doesn't contain the block we want to read
  * preferring vdevs based on determined load. If we can't, try the read on
  * any vdev we haven't already tried.
@@ -520,10 +540,11 @@ static int
 vdev_mirror_child_select(zio_t *zio)
 {
 	mirror_map_t *mm = zio->io_vsd;
-	uint64_t txg = zio->io_txg;
+	uint64_t txg = vdev_mirror_read_birth(zio);
 	int c, lowest_load;
 
-	ASSERT(zio->io_bp == NULL || BP_GET_PHYSICAL_BIRTH(zio->io_bp) == txg);
+	ASSERT(zio->io_bp == NULL ||
+	    BP_GET_PHYSICAL_BIRTH(zio->io_bp) == zio->io_txg);
 
 	lowest_load = INT_MAX;
 	mm->mm_preferred_cnt = 0;
@@ -542,18 +563,37 @@ vdev_mirror_child_select(zio_t *zio)
 			continue;
 		}
 
-		if (vdev_mirror_child_missing(mc, txg, 1)) {
+		boolean_t missing = vdev_mirror_child_missing(mc, txg, 1);
+		/*
+		 * B3G: where the operation txg would have chosen otherwise
+		 * (first 64 per module load; only engine reads whose backing
+		 * birth differs from io_txg pay the second lookup).
+		 */
+		if (txg != zio->io_txg && pr19262_mirror_split_prints < 64 &&
+		    missing != vdev_mirror_child_missing(mc, zio->io_txg, 1)) {
+			pr19262_mirror_split_prints++;
+			pr19262_printf("PR19262_MIRROR_BIRTH_SPLIT vd=%llu "
+			    "guid=%llu txg=%llu backing=%llu offset=%llu "
+			    "stale=%d\n", (u_longlong_t)mc->mc_vd->vdev_id,
+			    (u_longlong_t)mc->mc_vd->vdev_guid,
+			    (u_longlong_t)zio->io_txg, (u_longlong_t)txg,
+			    (u_longlong_t)mc->mc_offset, (int)missing);
+		}
+		if (missing) {
 			mc->mc_error = SET_ERROR(ESTALE);
 			mc->mc_skipped = 1;
 			mc->mc_speculative = 1;
 			pr19262_printf("PR19262_MIRROR_STALE vd=%llu txg=%llu "
 			    "offset=%llu objset=%llu object=%llu level=%lld "
-			    "blkid=%llu\n", (u_longlong_t)mc->mc_vd->vdev_id,
-			    (u_longlong_t)txg, (u_longlong_t)mc->mc_offset,
+			    "blkid=%llu birth=%llu\n",
+			    (u_longlong_t)mc->mc_vd->vdev_id,
+			    (u_longlong_t)zio->io_txg,
+			    (u_longlong_t)mc->mc_offset,
 			    (u_longlong_t)zio->io_bookmark.zb_objset,
 			    (u_longlong_t)zio->io_bookmark.zb_object,
 			    (longlong_t)zio->io_bookmark.zb_level,
-			    (u_longlong_t)zio->io_bookmark.zb_blkid);
+			    (u_longlong_t)zio->io_bookmark.zb_blkid,
+			    (u_longlong_t)txg);
 			continue;
 		}
 
@@ -714,6 +754,34 @@ vdev_mirror_worst_error(mirror_map_t *mm)
 	}
 
 	return (error[0] ? error[0] : error[1]);
+}
+
+static uint64_t
+vdev_mirror_repair_birth(zio_t *zio)
+{
+	if (zio->io_pr19262_backing_birth != 0)
+		return (zio->io_pr19262_backing_birth);
+	return (zio->io_txg);
+}
+
+static boolean_t
+vdev_mirror_repair_dtl_contains(zio_t *zio, vdev_t *vd,
+    uint64_t *birthp)
+{
+	uint64_t backing_birth = vdev_mirror_repair_birth(zio);
+	uint64_t source_birth = zio->io_pr19262_repair_source_birth;
+
+	*birthp = backing_birth;
+	if (vdev_dtl_contains(vd, DTL_PARTIAL, backing_birth, 1))
+		return (B_TRUE);
+
+	if (source_birth != 0 && source_birth != backing_birth &&
+	    vdev_dtl_contains(vd, DTL_PARTIAL, source_birth, 1)) {
+		*birthp = source_birth;
+		return (B_TRUE);
+	}
+
+	return (B_FALSE);
 }
 
 static void
@@ -904,6 +972,7 @@ vdev_mirror_io_done(zio_t *zio)
 			 */
 			mc = &mm->mm_child[c];
 
+			uint64_t repair_birth = vdev_mirror_repair_birth(zio);
 			if (mc->mc_error == 0) {
 				vdev_ops_t *ops = mc->mc_vd->vdev_ops;
 
@@ -925,14 +994,15 @@ vdev_mirror_io_done(zio_t *zio)
 				if (!(zio->io_flags & ZIO_FLAG_SCRUB) &&
 				    ops != &vdev_indirect_ops &&
 				    ops != &vdev_draid_spare_ops &&
-				    !vdev_dtl_contains(mc->mc_vd, DTL_PARTIAL,
-				    zio->io_txg, 1))
+				    !vdev_mirror_repair_dtl_contains(zio,
+				    mc->mc_vd, &repair_birth))
 					continue;
 				mc->mc_error = SET_ERROR(ESTALE);
 				pr19262_printf("PR19262_MIRROR_STALE_DONE "
-				    "vd=%llu txg=%llu\n",
+				    "vd=%llu txg=%llu repair_birth=%llu\n",
 				    (u_longlong_t)mc->mc_vd->vdev_id,
-				    (u_longlong_t)zio->io_txg);
+				    (u_longlong_t)zio->io_txg,
+				    (u_longlong_t)repair_birth);
 			}
 
 			zio_nowait(zio_vdev_child_io(zio, zio->io_bp,

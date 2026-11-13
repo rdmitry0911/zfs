@@ -68,6 +68,9 @@ int traverse_dataset_destroyed(spa_t *spa, blkptr_t *blkptr,
     blkptr_cb_t func, void *arg);
 int traverse_pool(spa_t *spa,
     uint64_t txg_start, int flags, blkptr_cb_t func, void *arg);
+/* Caller owns dp_config_rwlock writer in a dsl sync task. */
+int traverse_pool_sync(spa_t *spa,
+    uint64_t txg_start, int flags, blkptr_cb_t func, void *arg);
 
 /*
  * Note that this calculation cannot overflow with the current maximum indirect

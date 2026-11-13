@@ -1,5 +1,15 @@
 # SPDX-License-Identifier: CDDL-1.0
 #
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# https://opensource.org/license/CDDL-1.0.
+#
+#
 # Helpers for the private pr19262 online-lifetime engine tests.
 #
 
@@ -102,7 +112,8 @@ function pr19262_cleanup
 	rm -rf $PR19262_DIR
 }
 
-# The durable floor the kernel driver reports after its last fence.
+# The control floor in the kernel status: live while the engine is active,
+# else the last fence's.
 function pr19262_floor
 {
 	pr19262_status | sed -n 's/.*floor=\([0-9]*\).*/\1/p'

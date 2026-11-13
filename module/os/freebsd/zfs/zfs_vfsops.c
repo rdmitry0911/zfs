@@ -55,6 +55,7 @@
 #include <sys/dsl_dir.h>
 #include <sys/jail.h>
 #include <sys/osd.h>
+#include <sys/vdev_reloc_engine.h>
 #include <ufs/ufs/quota.h>
 #include <sys/zfs_quota.h>
 
@@ -1630,7 +1631,12 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 {
 	znode_t	*zp;
 	dsl_dir_t *dd;
+	spa_t	*reloc_spa;
 
+	/* Keep a test R-01 root from blocking this ZIL close's sync wait. */
+	reloc_spa = zfsvfs->z_os != NULL ? dmu_objset_spa(zfsvfs->z_os) : NULL;
+	if (reloc_spa != NULL)
+		pr19262_engine_zil_prepare(reloc_spa);
 	/*
 	 * If someone has not already unmounted this file system,
 	 * drain the zrele_taskq to ensure all active references to the
@@ -1690,6 +1696,8 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	if (!unmounting && (zfsvfs->z_unmounted || zfsvfs->z_os == NULL)) {
 		ZFS_TEARDOWN_INACTIVE_EXIT_WRITE(zfsvfs);
 		ZFS_TEARDOWN_EXIT(zfsvfs, FTAG);
+		if (reloc_spa != NULL)
+			pr19262_engine_zil_finish(reloc_spa);
 		return (SET_ERROR(EIO));
 	}
 
@@ -1725,8 +1733,11 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	 * zfsvfs, so just return as the properties had already been
 	 * unregistered and cached data had been evicted before.
 	 */
-	if (zfsvfs->z_os == NULL)
+	if (zfsvfs->z_os == NULL) {
+		if (reloc_spa != NULL)
+			pr19262_engine_zil_finish(reloc_spa);
 		return (0);
+	}
 
 	/*
 	 * Unregister properties.
@@ -1751,6 +1762,8 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	dd = zfsvfs->z_os->os_dsl_dataset->ds_dir;
 	dsl_dir_cancel_waiters(dd);
 
+	if (reloc_spa != NULL)
+		pr19262_engine_zil_finish(reloc_spa);
 	return (0);
 }
 

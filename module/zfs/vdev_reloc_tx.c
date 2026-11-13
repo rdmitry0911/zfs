@@ -1,5 +1,15 @@
 /* SPDX-License-Identifier: CDDL-1.0 */
 /*
+ * This file and its contents are supplied under the terms of the
+ * Common Development and Distribution License ("CDDL"), version 1.0.
+ * You may only use this file in accordance with the terms of version
+ * 1.0 of the CDDL.
+ *
+ * A full copy of the text of the CDDL should have accompanied this
+ * source.  A copy of the CDDL is also available via the Internet at
+ * https://opensource.org/license/CDDL-1.0.
+ */
+/*
  * Private userspace admission experiment, included by dmu_tx.c.
  * Native identity P allocations consume per-TXG committed credits.
  * No persistent dual allocator/catalog is implemented by this fixture.
@@ -16,6 +26,15 @@ typedef struct probe_tx_budget {
 	uint64_t inflight;
 	uint64_t refs;
 	uint64_t pending_refs;
+	/*
+	 * Catalog rows the txg's credits declared and the pages admission
+	 * charged for them, per class: charged per txg, not per write (see
+	 * pr19262_engine_admit_txg_pages()), returned with the last credit.
+	 */
+	uint64_t m_rows[PR19262_ADMIT_CLASSES];
+	uint64_t m_charged[PR19262_ADMIT_CLASSES];
+	/* New live pages this txg's store may add (later txgs' ahead). */
+	uint64_t m_growth[PR19262_ADMIT_CLASSES];
 } probe_tx_budget_t;
 
 typedef struct probe_tx_credit {
@@ -23,9 +42,9 @@ typedef struct probe_tx_credit {
 	uint64_t txg;
 	spa_t *spa;
 	probe_tx_budget_t *budget;
-	/* Vector reserved with the engine: pages and frames, by class. */
+	/* Vector reserved with the engine: rows (pages per txg) and frames. */
 	uint_t class;
-	uint64_t m_pages;
+	uint64_t m_rows;
 	uint64_t j_frames;
 } probe_tx_credit_t;
 
@@ -141,8 +160,30 @@ probe_tx_budget_drop(probe_tx_state_t *pt, probe_tx_budget_t *b)
 	VERIFY0(b->committed);
 	VERIFY0(b->inflight);
 	VERIFY0(b->pending_refs);
+	for (uint_t k = 0; k < PR19262_ADMIT_CLASSES; k++) {
+		VERIFY0(b->m_rows[k]);
+		VERIFY0(b->m_charged[k]);
+		VERIFY0(b->m_growth[k]);
+	}
 	list_remove(&pt->budgets, b);
 	kmem_free(b, sizeof (*b));
+}
+
+/* Return a credit's rows; the txg's pages go back with its last row. */
+static void
+probe_tx_vector_release(probe_tx_credit_t *c)
+{
+	probe_tx_budget_t *b = c->budget;
+	uint_t k = c->class;
+	VERIFY3U(b->m_rows[k], >=, c->m_rows);
+	b->m_rows[k] -= c->m_rows;
+	uint64_t pages = 0;
+	if (b->m_rows[k] == 0) {
+		pages = b->m_charged[k];
+		b->m_charged[k] = 0;
+		b->m_growth[k] = 0;
+	}
+	pr19262_engine_admit_release(c->spa, k, 0, pages, c->j_frames);
 }
 
 /*
@@ -185,20 +226,73 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 	    (tx->tx_objset != pt->os || pt->os == NULL)))
 		goto out;
 	VERIFY3P(tx->tx_pr19262_physical_credit, ==, NULL);
-	uint_t class = tx->tx_netfree ? PR19262_ADMIT_NETFREE :
-	    PR19262_ADMIT_CLIENT;
+	/*
+	 * A transaction that frees a whole object and holds no data write is
+	 * admitted as a net free.  zfs_rmnode's final transaction (free the
+	 * object, update the unlinked set) is not marked netfree, and refusing
+	 * it leaks the file in the unlinked set until remount.  For a regular
+	 * file dmu_free_long_range has already freed the data; a directory or
+	 * symlink is freed whole here.  Legacy pre-SA files with an external
+	 * ACL also free that ACL object in rename, link and setattr; their
+	 * other holds are bounded metadata.  Any write, append, clone or space
+	 * hold keeps the transaction a client.
+	 */
+	boolean_t whole_free = B_FALSE, writes = B_FALSE;
+	for (dmu_tx_hold_t *txh = list_head(&tx->tx_holds); txh != NULL;
+	    txh = list_next(&tx->tx_holds, txh)) {
+		if (txh->txh_type == THT_FREE && txh->txh_arg1 == 0 &&
+		    txh->txh_arg2 == DMU_OBJECT_END)
+			whole_free = B_TRUE;
+		if (txh->txh_type == THT_WRITE ||
+		    txh->txh_type == THT_APPEND ||
+		    txh->txh_type == THT_CLONE ||
+		    txh->txh_type == THT_SPACE)
+			writes = B_TRUE;
+	}
+	boolean_t frees = tx->tx_netfree || (whole_free && !writes);
+	uint_t class = frees ? PR19262_ADMIT_NETFREE : PR19262_ADMIT_CLIENT;
 	uint64_t rows = 0, frames = 0, m_pages = 0;
+	probe_tx_budget_t *b = probe_tx_budget_find(pt, tx->tx_txg);
+	if (b == NULL) {
+		b = kmem_zalloc(sizeof (*b), KM_SLEEP);
+		b->txg = tx->tx_txg;
+		list_insert_tail(&pt->budgets, b);
+	}
 	if (runtime) {
 		probe_tx_vector(tx, &rows, &frames);
-		m_pages = rows * pr19262_engine_admit_row_pages(spa);
+		/*
+		 * Pages are charged for the txg's rows together: one store
+		 * copies each page at most once, so the txg needs far fewer
+		 * pages than its writes' paths summed.  Only the increase
+		 * this write causes is admitted.
+		 */
+		/* New live pages the earlier txgs not yet stored may add. */
+		uint64_t ahead = 0, ahead_rows = 0, growth = 0;
+		for (probe_tx_budget_t *e = list_head(&pt->budgets);
+		    e != NULL; e = list_next(&pt->budgets, e)) {
+			if (e->txg >= b->txg)
+				continue;
+			for (uint_t k = 0; k < PR19262_ADMIT_CLASSES; k++) {
+				ahead += e->m_growth[k];
+				ahead_rows += e->m_rows[k];
+			}
+		}
+		uint64_t want = pr19262_engine_admit_txg_pages(spa,
+		    b->m_rows[class] + rows, ahead, ahead_rows, &growth);
+		m_pages = want > b->m_charged[class] ?
+		    want - b->m_charged[class] : 0;
 		/* Physical bytes, pages and frames admitted together. */
 		error = pr19262_engine_admit(spa, class, pt->reserved,
 		    bytes, m_pages, frames);
 		if (error != 0) {
 			if (error == ENOSPC)
 				pt->rejected++;
+			probe_tx_budget_drop(pt, b);
 			goto out;
 		}
+		b->m_rows[class] += rows;
+		b->m_charged[class] += m_pages;
+		b->m_growth[class] = MAX(b->m_growth[class], growth);
 	}
 	metaslab_class_t *mc = spa_normal_class(tx->tx_pool->dp_spa);
 	uint64_t total = metaslab_class_get_space(mc);
@@ -213,13 +307,8 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 	    bytes > limit - pt->reserved)) {
 		pt->rejected++;
 		error = ENOSPC;
+		probe_tx_budget_drop(pt, b);
 		goto out;
-	}
-	probe_tx_budget_t *b = probe_tx_budget_find(pt, tx->tx_txg);
-	if (b == NULL) {
-		b = kmem_zalloc(sizeof (*b), KM_SLEEP);
-		b->txg = tx->tx_txg;
-		list_insert_tail(&pt->budgets, b);
 	}
 	probe_tx_credit_t *c = kmem_alloc(sizeof (*c), KM_SLEEP);
 	c->bytes = bytes;
@@ -227,7 +316,7 @@ probe_tx_admit(dmu_tx_t *tx, uint64_t bytes)
 	c->spa = spa;
 	c->budget = b;
 	c->class = class;
-	c->m_pages = m_pages;
+	c->m_rows = rows;
 	c->j_frames = frames;
 	b->open += bytes;
 	b->refs++;
@@ -252,9 +341,8 @@ probe_tx_unreserve(dmu_tx_t *tx)
 	b->open -= c->bytes;
 	pt->reserved -= c->bytes;
 	b->refs--;
+	probe_tx_vector_release(c);
 	probe_tx_budget_drop(pt, b);
-	pr19262_engine_admit_release(c->spa, c->class, 0, c->m_pages,
-	    c->j_frames);
 	kmem_free(c, sizeof (*c));
 	pt->rolled_back++;
 	tx->tx_pr19262_physical_credit = NULL;
@@ -368,11 +456,10 @@ probe_tx_synced(void *arg, int error)
 		pt->reserved -= b->committed;
 		b->committed = 0;
 	}
-	probe_tx_budget_drop(pt, b);
 	pt->callbacks++;
 	/* The catalog of this txg is stored: its pages and frames return. */
-	pr19262_engine_admit_release(c->spa, c->class, 0, c->m_pages,
-	    c->j_frames);
+	probe_tx_vector_release(c);
+	probe_tx_budget_drop(pt, b);
 	kmem_free(c, sizeof (*c));
 	cv_broadcast(&pt->done);
 	mutex_exit(&pt->lock);

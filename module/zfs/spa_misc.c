@@ -1570,6 +1570,15 @@ spa_vdev_state_exit(spa_t *spa, vdev_t *vd, int error)
 	spa_config_exit(spa, spa->spa_vdev_locks, spa);
 
 	/*
+	 * R02 (v3.2): a replacing-pair leaf that returned is audited or
+	 * reseeded and readmitted now, outside syncing context and before
+	 * zpool clear resumes a suspended sync or this waits for one.
+	 */
+	pr19262_engine_r02_readmit(spa, vd);
+	/* L23: so is a direct member that missed raw writes. */
+	pr19262_engine_member_readmit(spa, vd);
+
+	/*
 	 * If anything changed, wait for it to sync.  This ensures that,
 	 * from the system administrator's perspective, zpool(8) commands
 	 * are synchronous.  This is important for things like zpool offline:

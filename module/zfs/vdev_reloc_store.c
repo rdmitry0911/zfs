@@ -1,4 +1,14 @@
 /* SPDX-License-Identifier: CDDL-1.0 */
+/*
+ * This file and its contents are supplied under the terms of the
+ * Common Development and Distribution License ("CDDL"), version 1.0.
+ * You may only use this file in accordance with the terms of version
+ * 1.0 of the CDDL.
+ *
+ * A full copy of the text of the CDDL should have accompanied this
+ * source.  A copy of the CDDL is also available via the Internet at
+ * https://opensource.org/license/CDDL-1.0.
+ */
 /* Private userspace persistence experiment, included by the normal engine. */
 #define	ENGINE_STORE_MAGIC 0x31393236324d3031ULL
 #define	ENGINE_STORE_PAGE 4096ULL
@@ -67,13 +77,20 @@ pr19262_engine_persistent(spa_t *spa)
 	return (active);
 }
 
+/*
+ * Whether the uberblock of txg must be written although nothing native
+ * changed.  Deferred space forces it only at the txgs that move the
+ * deferral (engine_reuse_due_locked): the store that stages it, and the
+ * uberblock that releases a batch, so that an idle pool still releases.
+ */
 boolean_t
-pr19262_engine_store_dirty(spa_t *spa)
+pr19262_engine_store_dirty(spa_t *spa, uint64_t txg)
 {
 	engine_t *engine = spa->spa_reloc;
 	mutex_enter(&engine->lock);
 	boolean_t dirty = engine->spa == spa && engine->persistent &&
-	    engine->revision != engine->stored_revision;
+	    (engine->revision != engine->stored_revision ||
+	    engine_reuse_due_locked(engine, txg));
 	mutex_exit(&engine->lock);
 	return (dirty);
 }
@@ -190,28 +207,257 @@ pr19262_engine_store_enable(spa_t *spa)
 	return (error);
 }
 
-/* Create one raw member I/O as a child of pio (NULL: caller waits). */
+typedef enum engine_store_member_kind {
+	ENGINE_STORE_MEMBER_UNSUPPORTED,
+	ENGINE_STORE_MEMBER_LEAF,
+	ENGINE_STORE_MEMBER_REPLACING
+} engine_store_member_kind_t;
+
+typedef struct engine_store_member {
+	engine_store_member_kind_t kind;
+	vdev_t *slot;
+	/* For REPLACING these are its old and exact new leaves, in order. */
+	vdev_t *leaf[2];
+} engine_store_member_t;
+
+/*
+ * Classify a logical raw-store member without treating a replacing parent as
+ * a leaf.  The REPLACING result is deliberately not I/O-capable yet: its
+ * mirror parent can report a write/flush success when only its old child
+ * completed, so it cannot prove a raw page or flush reached the exact new
+ * leaf.  A later reseed implementation will consume both named leaves and
+ * collect exact-leaf completion results before it permits this shape.
+ */
 static int
-engine_store_zio(zio_t *pio, vdev_t *vd, uint64_t arena, uint64_t page,
-    uint64_t pages, abd_t *abd, boolean_t write, zio_t **zp)
+engine_store_member_classify(vdev_t *slot, engine_store_member_t *out)
 {
-	engine_t *engine = vd->vdev_spa->spa_reloc;
+	memset(out, 0, sizeof (*out));
+	out->slot = slot;
+	if (slot == NULL)
+		return (ENXIO);
+	if (slot->vdev_ops->vdev_op_leaf && slot->vdev_children == 0) {
+		out->kind = ENGINE_STORE_MEMBER_LEAF;
+		out->leaf[0] = slot;
+		return (0);
+	}
+	if (slot->vdev_ops == &vdev_replacing_ops &&
+	    slot->vdev_children == 2 && slot->vdev_child[0] != NULL &&
+	    slot->vdev_child[1] != NULL &&
+	    slot->vdev_child[0]->vdev_ops->vdev_op_leaf &&
+	    slot->vdev_child[0]->vdev_children == 0 &&
+	    slot->vdev_child[1]->vdev_ops->vdev_op_leaf &&
+	    slot->vdev_child[1]->vdev_children == 0) {
+		out->kind = ENGINE_STORE_MEMBER_REPLACING;
+		out->leaf[0] = slot->vdev_child[0];
+		out->leaf[1] = slot->vdev_child[1];
+		return (0);
+	}
+	return (ENOTSUP);
+}
+
+/*
+ * Return only the direct-leaf case.  Every existing raw-store data I/O and
+ * flush goes through this gate, so an unexpected replacing topology fails
+ * cleanly rather than tripping zio_{read,write}_phys()'s leaf assertion.
+ */
+static int
+engine_store_member_direct(vdev_t *slot, vdev_t **leafp)
+{
+	engine_store_member_t member;
+	int error = engine_store_member_classify(slot, &member);
+	if (error != 0)
+		return (error);
+	if (member.kind != ENGINE_STORE_MEMBER_LEAF)
+		return (ENOTSUP);
+	*leafp = member.leaf[0];
+	return (0);
+}
+
+/* Used during activation/recovery before raw I/O is made authoritative. */
+static boolean_t
+engine_store_direct_topology(vdev_t *vd)
+{
+	if (vd == NULL || vd->vdev_children == 0)
+		return (B_FALSE);
+	for (uint_t c = 0; c < vd->vdev_children; c++) {
+		vdev_t *leaf;
+		if (engine_store_member_direct(vd->vdev_child[c], &leaf) != 0)
+			return (B_FALSE);
+	}
+	return (B_TRUE);
+}
+
+/* Both production collection and the ztest negative probe use this gate. */
+static int
+engine_r02_manifest_gate(spa_t *spa, engine_t *engine, boolean_t direct,
+    uint64_t codec)
+{
+	mutex_enter(&engine->lock);
+	boolean_t persistent = engine->spa == spa && engine->persistent;
+	mutex_exit(&engine->lock);
+	return (persistent && direct && codec >= 6 && codec <= 7 ? 0 :
+	    ENOTSUP);
+}
+
+static boolean_t
+engine_r02_manifest_codec_supported(uint64_t codec)
+{
+	return (codec >= 6 && codec <= 7);
+}
+
+#ifndef _KERNEL
+static boolean_t
+engine_store_has_replacing_topology(vdev_t *vd)
+{
+	if (vd == NULL)
+		return (B_FALSE);
+	for (uint_t c = 0; c < vd->vdev_children; c++) {
+		engine_store_member_t member;
+		int error = engine_store_member_classify(vd->vdev_child[c],
+		    &member);
+		if (error == 0 &&
+		    member.kind == ENGINE_STORE_MEMBER_REPLACING)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+int
+pr19262_engine_r02_manifest_test_state(spa_t *spa,
+    pr19262_r02_manifest_state_t *out)
+{
+	if (out == NULL)
+		return (EINVAL);
+	memset(out, 0, sizeof (*out));
+	engine_t *engine = spa->spa_reloc;
+	rw_enter(&engine->r02_topology_lock, RW_READER);
+	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+	mutex_enter(&engine->store_lock);
+	out->direct = engine_store_direct_topology(engine->vd);
+	out->replacing = engine_store_has_replacing_topology(engine->vd);
+	/* The observer's lock order is store, journal, then engine state. */
+	mutex_enter(&engine->journal_lock);
+	mutex_enter(&engine->lock);
+	out->persistent = engine->spa == spa && engine->persistent;
+	out->codec = engine->store_codec;
+	out->io_errors = atomic_load_64(&engine->io_errors);
+	out->revision = engine->revision;
+	out->stored_revision = engine->stored_revision;
+	out->durable_ub_txg = engine->durable_ub_txg;
+	out->durable_catalog_txg = engine->durable_catalog_txg;
+	out->arena = engine->arena;
+	out->arena_bytes = engine->arena_bytes;
+	out->journal_root = engine->journal_root;
+	memcpy(out->journal_root_epoch, engine->journal_root_epoch,
+	    sizeof (out->journal_root_epoch));
+	out->journal_arena = engine->journal_arena;
+	memcpy(out->journal_epoch, engine->journal_epoch,
+	    sizeof (out->journal_epoch));
+	out->journal_bytes = engine->journal_bytes;
+	out->journal_seq = engine->journal_seq;
+	out->journal_serial = engine->journal_serial;
+	memcpy(&out->journal_hash, &engine->journal_hash,
+	    sizeof (out->journal_hash));
+	mutex_exit(&engine->lock);
+	mutex_exit(&engine->journal_lock);
+	mutex_exit(&engine->store_lock);
+	spa_config_exit(spa, SCL_STATE, FTAG);
+	rw_exit(&engine->r02_topology_lock);
+	return (0);
+}
+
+/*
+ * The test never mutates vdev topology or an on-disk root.  It feeds the
+ * same eligibility gate a synthetic replacing shape or codec 5, both of
+ * which must be refused before the collector can issue its raw reads.
+ */
+int
+pr19262_engine_r02_manifest_test_reject(spa_t *spa, boolean_t replacing,
+    uint64_t codec)
+{
+	engine_t *engine = spa->spa_reloc;
+	rw_enter(&engine->r02_topology_lock, RW_READER);
+	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+	mutex_enter(&engine->store_lock);
+	boolean_t direct = !replacing &&
+	    engine_store_direct_topology(engine->vd);
+	int error = engine_r02_manifest_gate(spa, engine, direct, codec);
+	mutex_exit(&engine->store_lock);
+	spa_config_exit(spa, SCL_STATE, FTAG);
+	rw_exit(&engine->r02_topology_lock);
+	return (error);
+}
+#endif
+
+typedef enum engine_store_leaf_io_mode {
+	ENGINE_STORE_LEAF_IO_NORMAL,
+	ENGINE_STORE_LEAF_IO_CONFIG_WRITER
+} engine_store_leaf_io_mode_t;
+
+/*
+ * Create one raw I/O for an already-classified concrete leaf.  This is the
+ * R02 exact-endpoint primitive: it deliberately has no parent traversal and
+ * consequently cannot turn a replacing-mirror completion into an assertion
+ * about either child.  It also does not acquire an SPA config lock.  A normal
+ * raw caller holds its usual SCL_ZIO reader; the future attach writer will
+ * use this same primitive while it owns SCL_ALL and therefore must not enter
+ * SCL_ZIO recursively.  That writer uses a synchronous (pio == NULL) ZIO.
+ */
+/*
+ * The endpoint-independent checks of one exact raw I/O.  The R02 pair writer
+ * runs them for every endpoint before it creates any child, so an endpoint
+ * that cannot take the write is reported instead of half-issuing the pair.
+ */
+static int
+engine_store_leaf_check(engine_t *engine, vdev_t *leaf, uint64_t arena,
+    uint64_t page, uint64_t pages, boolean_t write)
+{
+	if (engine == NULL || leaf == NULL || !leaf->vdev_ops->vdev_op_leaf ||
+	    leaf->vdev_children != 0)
+		return (ENOTSUP);
+	if (engine->vd == NULL || engine->vd->vdev_children == 0 ||
+	    pages == 0 || pages > UINT64_MAX / ENGINE_STORE_PAGE)
+		return (EINVAL);
 	uint64_t offset = VDEV_LABEL_START_SIZE +
 	    arena / engine->vd->vdev_children + page * ENGINE_STORE_PAGE;
 	uint64_t bytes = pages * ENGINE_STORE_PAGE;
-	if (!vdev_readable(vd) || (write && !vdev_writeable(vd)))
+	if (!vdev_readable(leaf) || (write && !vdev_writeable(leaf)))
 		return (ENXIO);
-	if (offset > vd->vdev_psize || bytes > vd->vdev_psize - offset)
+	if (offset > leaf->vdev_psize || bytes > leaf->vdev_psize - offset)
 		ENGINE_REFUSE(1);
+	return (0);
+}
+
+static int
+engine_store_leaf_zio(zio_t *pio, engine_t *engine, vdev_t *leaf,
+    uint64_t arena, uint64_t page, uint64_t pages, abd_t *abd,
+    boolean_t write, engine_store_leaf_io_mode_t mode, zio_t **zp)
+{
+	if (abd == NULL || zp == NULL)
+		return (ENOTSUP);
+	if (mode != ENGINE_STORE_LEAF_IO_NORMAL &&
+	    mode != ENGINE_STORE_LEAF_IO_CONFIG_WRITER)
+		return (EINVAL);
+	if (mode == ENGINE_STORE_LEAF_IO_CONFIG_WRITER && pio != NULL)
+		return (EINVAL);
+	int error = engine_store_leaf_check(engine, leaf, arena, page, pages,
+	    write);
+	if (error != 0)
+		return (error);
+	uint64_t offset = VDEV_LABEL_START_SIZE +
+	    arena / engine->vd->vdev_children + page * ENGINE_STORE_PAGE;
+	uint64_t bytes = pages * ENGINE_STORE_PAGE;
 	/*
 	 * An aggregate of adjacent pages would reach the dispatch as a new
 	 * physical write without the engine's authority, and be refused.
 	 */
 	zio_flag_t flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY |
 	    ZIO_FLAG_DONT_AGGREGATE;
-	zio_t *zio = write ? zio_write_phys(pio, vd, offset, bytes,
+	if (mode == ENGINE_STORE_LEAF_IO_CONFIG_WRITER)
+		flags |= ZIO_FLAG_CONFIG_WRITER;
+	zio_t *zio = write ? zio_write_phys(pio, leaf, offset, bytes,
 	    abd, ZIO_CHECKSUM_OFF, NULL, NULL, ZIO_PRIORITY_SYNC_WRITE,
-	    flags, B_FALSE) : zio_read_phys(pio, vd, offset, bytes,
+	    flags, B_FALSE) : zio_read_phys(pio, leaf, offset, bytes,
 	    abd, ZIO_CHECKSUM_OFF, NULL, NULL, ZIO_PRIORITY_SYNC_READ,
 	    flags, B_FALSE);
 	zio->io_pr19262_metadata_authority = engine;
@@ -219,19 +465,462 @@ engine_store_zio(zio_t *pio, vdev_t *vd, uint64_t arena, uint64_t page,
 	return (0);
 }
 
+/* Wait for one exact leaf; no parent result can mask this status. */
+static int
+engine_store_leaf_io(engine_t *engine, vdev_t *leaf, uint64_t arena,
+    uint64_t page, uint64_t pages, abd_t *abd, boolean_t write,
+    engine_store_leaf_io_mode_t mode)
+{
+	zio_t *zio;
+	int error = engine_store_leaf_zio(NULL, engine, leaf, arena, page,
+	    pages, abd, write, mode, &zio);
+	if (error == 0)
+		error = zio_wait(zio);
+	return (error);
+}
+
+/*
+ * Reseed durability requires the synchronous, reportable exact-leaf flush.
+ * Do not substitute engine_metadata_flush_nowait(): it returns no endpoint
+ * failure and is only suitable for the existing multi-member publisher.
+ */
+static int
+engine_store_leaf_flush(vdev_t *leaf, engine_store_leaf_io_mode_t mode)
+{
+	if (leaf == NULL || !leaf->vdev_ops->vdev_op_leaf ||
+	    leaf->vdev_children != 0)
+		return (ENOTSUP);
+	if (mode == ENGINE_STORE_LEAF_IO_CONFIG_WRITER)
+		return (pr19262_engine_metadata_flush_config_writer(leaf));
+	if (mode != ENGINE_STORE_LEAF_IO_NORMAL)
+		return (EINVAL);
+	return (pr19262_engine_metadata_flush(leaf));
+}
+
+/*
+ * The final part of one exact write contract.  It is intentionally separate
+ * from ordinary store publication: attaching it there would silently change
+ * the existing batch protocol.  The future manifest binder must use it after
+ * a successful write and synchronous exact-leaf flush.
+ */
+static int __maybe_unused
+engine_store_leaf_readback_equal(engine_t *engine, vdev_t *leaf,
+    uint64_t arena, uint64_t page, uint64_t pages, abd_t *expected,
+    engine_store_leaf_io_mode_t mode)
+{
+	if (expected == NULL || pages == 0 ||
+	    pages > UINT64_MAX / ENGINE_STORE_PAGE)
+		return (EINVAL);
+	uint64_t bytes = pages * ENGINE_STORE_PAGE;
+	if (bytes != abd_get_size(expected))
+		return (EINVAL);
+	abd_t *actual = abd_alloc_linear(bytes, B_TRUE);
+	int error = engine_store_leaf_io(engine, leaf, arena, page, pages,
+	    actual, B_FALSE, mode);
+	if (error == 0 && abd_cmp(actual, expected) != 0)
+		error = ECKSUM;
+	abd_free(actual);
+	return (error);
+}
+
+/*
+ * R02 exact-new-leaf reseed (D70), on by default (B3).  One admits only the
+ * staged protocol below: a single strict replacing pair of two concrete
+ * leaves in one engine member slot.  Every other replacement of an engine
+ * member (hot spare, sequential rebuild, same-path replace, a nested attach,
+ * a second pair, a codec-5 store) is still refused before any mutation.
+ * Zero restores the D64 refusal of every new admission; an existing strict
+ * pair is recovered and completed whatever the value.
+ */
+int zfs_pr19262_r02_reseed = 1;
+#ifndef _KERNEL
+/* ztest only: one crash cut and synthetic exact-new-endpoint failures. */
+int zfs_pr19262_r02_reseed_cut = 0;
+uint_t zfs_pr19262_r02_new_endpoint_faults = 0;
+#endif
+
+#define	ENGINE_R02_PAIR_NONE		0ULL
+#define	ENGINE_R02_PAIR_ADMITTED	1ULL
+#define	ENGINE_R02_PAIR_FAULTED		2ULL
+
+static void
+engine_r02_cut(uint_t stage)
+{
+#ifndef _KERNEL
+	if (zfs_pr19262_r02_reseed_cut == (int)stage) {
+		pr19262_printf("PR19262_R02_RESEED_CUT stage=%u\n", stage);
+		pr19262_flush();
+		pr19262_exit(100 + stage);
+	}
+#else
+	(void) stage;
+#endif
+}
+
+/*
+ * ztest only: make the next exact-new-endpoint write or flush fail.  The
+ * knob belongs to the cell that armed it: a scheduled fence (growth or
+ * admission, run from the fence task) never consumes it.
+ */
+static int
+engine_r02_test_fault(engine_t *engine)
+{
+#ifndef _KERNEL
+	/* Set and cleared by the fence task itself: exact without a lock. */
+	if (engine->fence_task_thread == curthread)
+		return (0);
+	volatile uint_t *faults = &zfs_pr19262_r02_new_endpoint_faults;
+	uint_t n = atomic_load_32(faults);
+	while (n != 0) {
+		uint_t seen = atomic_cas_32(faults, n, n - 1);
+		if (seen == n) {
+			pr19262_printf("PR19262_R02_TEST_ENDPOINT_FAULT\n");
+			return (SET_ERROR(EIO));
+		}
+		n = seen;
+	}
+#else
+	(void) engine;
+#endif
+	return (0);
+}
+
+static boolean_t
+engine_r02_pair_known(engine_t *engine, const engine_store_member_t *m)
+{
+	return (m->kind == ENGINE_STORE_MEMBER_REPLACING &&
+	    atomic_load_64(&engine->r02_pair_state) != ENGINE_R02_PAIR_NONE &&
+	    engine->r02_pair_old_guid == m->leaf[0]->vdev_guid &&
+	    engine->r02_pair_new_guid == m->leaf[1]->vdev_guid);
+}
+
+/* R1: no parent or old-leaf success may hide an exact-endpoint failure. */
+static void
+engine_r02_pair_fault(engine_t *engine, int error)
+{
+	atomic_inc_64(&engine->r02_pair_faults);
+	if (atomic_cas_64(&engine->r02_pair_state, ENGINE_R02_PAIR_ADMITTED,
+	    ENGINE_R02_PAIR_FAULTED) == ENGINE_R02_PAIR_ADMITTED)
+		pr19262_printf("PR19262_R02_PAIR_FAULT error=%d\n", error);
+}
+
+/* The old endpoint is superseded: its failure only marks it stale. */
+static void
+engine_r02_old_stale(engine_t *engine, int error)
+{
+	if (atomic_cas_64(&engine->r02_old_stale, 0, 1) == 0)
+		pr19262_printf("PR19262_R02_OLD_STALE error=%d\n", error);
+}
+
+#define	ENGINE_R02_ROLE_DIRECT	0
+#define	ENGINE_R02_ROLE_NEW	1
+#define	ENGINE_R02_ROLE_OLD	2
+
+typedef struct engine_store_endpoints {
+	uint_t count;
+	boolean_t pair;
+	/* Write only: the old leaf had missed no write when resolved. */
+	boolean_t old_current;
+	vdev_t *leaf[2];
+	uint_t role[2];
+} engine_store_endpoints_t;
+
+/*
+ * Resolve one logical member slot to exact concrete endpoints, never to a
+ * replacing parent.  A direct leaf is its own endpoint.  For a strict pair,
+ * a read gets both leaves in preference order and the caller validates the
+ * content it accepts.  A write needs the pair this engine seeded and
+ * verified.  It goes to the exact new leaf while the pair is admitted, and
+ * always to the old leaf while that is writeable: once the new leaf has
+ * faulted it is frozen (stale) and the old leaf carries the slot, provided
+ * it has missed no write.  An unwriteable old leaf becomes stale.
+ */
+static int
+engine_store_member_endpoints(engine_t *engine, vdev_t *slot,
+    boolean_t write, engine_store_endpoints_t *ep)
+{
+	engine_store_member_t member;
+	memset(ep, 0, sizeof (*ep));
+	int error = engine_store_member_classify(slot, &member);
+	if (error != 0)
+		return (error);
+	if (member.kind == ENGINE_STORE_MEMBER_LEAF) {
+		ep->count = 1;
+		ep->leaf[0] = member.leaf[0];
+		ep->role[0] = ENGINE_R02_ROLE_DIRECT;
+		return (0);
+	}
+	vdev_t *oleaf = member.leaf[0], *nleaf = member.leaf[1];
+	boolean_t known = engine_r02_pair_known(engine, &member);
+	uint64_t state = atomic_load_64(&engine->r02_pair_state);
+	ep->pair = B_TRUE;
+	if (!write) {
+		boolean_t fresh = known && state == ENGINE_R02_PAIR_ADMITTED;
+		ep->leaf[0] = fresh ? nleaf : oleaf;
+		ep->leaf[1] = fresh ? oleaf : nleaf;
+		ep->role[0] = fresh ? ENGINE_R02_ROLE_NEW : ENGINE_R02_ROLE_OLD;
+		ep->role[1] = fresh ? ENGINE_R02_ROLE_OLD : ENGINE_R02_ROLE_NEW;
+		ep->count = 2;
+		return (0);
+	}
+	if (!known)
+		return (SET_ERROR(ENOTSUP));
+	if (state == ENGINE_R02_PAIR_ADMITTED) {
+		ep->leaf[ep->count] = nleaf;
+		ep->role[ep->count++] = ENGINE_R02_ROLE_NEW;
+	}
+	if (vdev_writeable(oleaf)) {
+		ep->old_current =
+		    atomic_load_64(&engine->r02_old_stale) == 0;
+		ep->leaf[ep->count] = oleaf;
+		ep->role[ep->count++] = ENGINE_R02_ROLE_OLD;
+	} else {
+		engine_r02_old_stale(engine, ENXIO);
+	}
+	return (ep->count == 0 ? SET_ERROR(ENXIO) : 0);
+}
+
+/*
+ * One slot result from its exact endpoint results.  The admitted new leaf,
+ * or an old leaf that has missed no write, can hold the slot.  A failed new
+ * leaf freezes the pair (FAULTED: it is reseeded and audited before the old
+ * leaf may be detached); a failed old leaf becomes stale (it is reseeded
+ * before a cancel may collapse onto it).  Neither failure is hidden, and
+ * the slot fails only when no eligible endpoint holds the data.
+ */
+static int
+engine_r02_slot_result(engine_t *engine, const engine_store_endpoints_t *ep,
+    const int *err)
+{
+	if (!ep->pair)
+		return (err[0]);
+	boolean_t held = B_FALSE, by_new = B_FALSE;
+	int first = 0;
+	for (uint_t i = 0; i < ep->count; i++) {
+		if (err[i] == 0) {
+			by_new |= ep->role[i] == ENGINE_R02_ROLE_NEW;
+			held |= ep->role[i] == ENGINE_R02_ROLE_NEW ||
+			    ep->old_current;
+			continue;
+		}
+		if (first == 0)
+			first = err[i];
+		if (ep->role[i] == ENGINE_R02_ROLE_NEW)
+			engine_r02_pair_fault(engine, err[i]);
+		else
+			engine_r02_old_stale(engine, err[i]);
+	}
+	if (held) {
+		atomic_inc_64(&engine->r02_pair_writes);
+		if (!by_new)
+			atomic_inc_64(&engine->r02_pair_old_held);
+		return (0);
+	}
+	return (first != 0 ? first : SET_ERROR(EIO));
+}
+
+/*
+ * L23 (A35): a direct member whose raw write or flush failed (absent,
+ * offline, faulted, an I/O error) may lack pages that every other member
+ * holds.  Mark its slot until pr19262_engine_member_readmit() audits it
+ * clean against the closure.  A pair slot is the R02 code's (old_stale,
+ * FAULTED).  No lock: the pass clears a mark only while it excludes raw I/O.
+ * A member that is still readable and writeable (an I/O error, not an
+ * absence) gets no state exit, so a new mark asks the async thread for the
+ * pass; an absent one is passed when it returns.
+ */
+static void
+engine_member_missed(engine_t *engine, vdev_t *slot, int error)
+{
+	if (error == 0 || engine->vd == NULL || slot == NULL ||
+	    slot->vdev_parent != engine->vd ||
+	    !slot->vdev_ops->vdev_op_leaf || slot->vdev_children != 0 ||
+	    slot->vdev_id >= ENGINE_MEMBER_BITS)
+		return;
+	uint64_t *w = &engine->member_missed[slot->vdev_id / 64];
+	uint64_t bit = 1ULL << (slot->vdev_id % 64), old;
+	do {
+		old = atomic_load_64(w);
+		if (old & bit)
+			return;
+	} while (atomic_cas_64(w, old, old | bit) != old);
+	boolean_t usable = vdev_readable(slot) && vdev_writeable(slot);
+	pr19262_printf("PR19262_MEMBER_MISSED slot=%llu error=%d usable=%d\n",
+	    (u_longlong_t)slot->vdev_id, error, usable);
+	if (usable) {
+		atomic_store_64(&engine->member_readmit_retries, 0);
+		spa_async_request(slot->vdev_spa, SPA_ASYNC_MEMBER_READMIT);
+	}
+}
+
+/* Read a pair in preference order; the caller validates the content. */
+static int
+engine_store_endpoints_read(engine_t *engine,
+    const engine_store_endpoints_t *ep, uint64_t arena, uint64_t page,
+    uint64_t pages, abd_t *abd, engine_store_leaf_io_mode_t mode)
+{
+	int error = ENXIO;
+	if (ep->pair)
+		atomic_inc_64(&engine->r02_pair_reads);
+	for (uint_t i = 0; i < ep->count; i++) {
+		error = engine_store_leaf_io(engine, ep->leaf[i], arena, page,
+		    pages, abd, B_FALSE, mode);
+		if (error == 0)
+			break;
+	}
+	return (error);
+}
+
+/* Write and wait for every exact endpoint, then combine their results. */
+static int
+engine_store_endpoints_write(engine_t *engine,
+    const engine_store_endpoints_t *ep, uint64_t arena, uint64_t page,
+    uint64_t pages, abd_t *abd)
+{
+	int err[2] = { 0, 0 };
+	for (uint_t i = 0; i < ep->count; i++) {
+		if (ep->role[i] == ENGINE_R02_ROLE_NEW)
+			err[i] = engine_r02_test_fault(engine);
+		if (err[i] == 0)
+			err[i] = engine_store_leaf_io(engine, ep->leaf[i],
+			    arena, page, pages, abd, B_TRUE,
+			    ENGINE_STORE_LEAF_IO_NORMAL);
+	}
+	return (engine_r02_slot_result(engine, ep, err));
+}
+
+/* Create one raw member I/O as a child of pio (NULL: caller waits). */
+static int
+engine_store_zio(zio_t *pio, vdev_t *vd, uint64_t arena, uint64_t page,
+    uint64_t pages, abd_t *abd, boolean_t write, zio_t **zp)
+{
+	engine_t *engine = vd->vdev_spa->spa_reloc;
+	engine_store_endpoints_t ep;
+	int error = engine_store_member_endpoints(engine, vd, write, &ep);
+	if (error != 0)
+		return (error);
+	if (!ep.pair || !write) {
+		vdev_t *leaf = ep.leaf[0];
+		/*
+		 * An asynchronous pair read (the control-slot reader that
+		 * reached a replacing parent before D69) takes the first
+		 * readable exact leaf.
+		 */
+		if (ep.pair)
+			atomic_inc_64(&engine->r02_pair_async_reads);
+		if (ep.pair && !vdev_readable(leaf))
+			leaf = ep.leaf[1];
+		return (engine_store_leaf_zio(pio, engine, leaf, arena, page,
+		    pages, abd, write, ENGINE_STORE_LEAF_IO_NORMAL, zp));
+	}
+	/*
+	 * No current caller issues an asynchronous raw write to a member
+	 * slot (engine_members_write() resolves endpoints itself).  Refuse
+	 * rather than let one parent ZIO mix the new and old endpoint results.
+	 */
+	return (SET_ERROR(ENOTSUP));
+}
+
+static int
+engine_store_flush(vdev_t *vd)
+{
+	engine_t *engine = vd->vdev_spa->spa_reloc;
+	engine_store_endpoints_t ep;
+	int error = engine_store_member_endpoints(engine, vd, B_TRUE, &ep);
+	if (error != 0) {
+		engine_member_missed(engine, vd, error);
+		return (error);
+	}
+	int err[2] = { 0, 0 };
+	for (uint_t i = 0; i < ep.count; i++) {
+		if (ep.role[i] == ENGINE_R02_ROLE_NEW)
+			err[i] = engine_r02_test_fault(engine);
+		if (err[i] == 0)
+			err[i] = engine_store_leaf_flush(ep.leaf[i],
+			    ENGINE_STORE_LEAF_IO_NORMAL);
+	}
+	error = engine_r02_slot_result(engine, &ep, err);
+	if (!ep.pair)
+		engine_member_missed(engine, vd, error);
+	return (error);
+}
+
 static int
 engine_store_io_at(vdev_t *vd, uint64_t arena, uint64_t page,
     uint64_t pages, abd_t *abd, boolean_t write)
 {
 	engine_t *engine = vd->vdev_spa->spa_reloc;
-	zio_t *zio;
-	int error = engine_store_zio(NULL, vd, arena, page, pages, abd,
-	    write, &zio);
-	if (error == 0)
-		error = zio_wait(zio);
+	engine_store_endpoints_t ep;
+	int error = engine_store_member_endpoints(engine, vd, write, &ep);
+	if (error == 0 && write)
+		error = engine_store_endpoints_write(engine, &ep, arena, page,
+		    pages, abd);
+	else if (error == 0)
+		error = engine_store_endpoints_read(engine, &ep, arena, page,
+		    pages, abd, ENGINE_STORE_LEAF_IO_NORMAL);
 	if (error != 0)
 		atomic_inc_64(&engine->io_errors);
+	if (write && !ep.pair)
+		engine_member_missed(engine, vd, error);
 	return (error);
+}
+
+/*
+ * The R02 manifest observer must not use engine_store_io_at(): that helper
+ * deliberately accounts every failure in engine->io_errors.  This exact-leaf
+ * read is otherwise intentionally the same physical operation, but owns no
+ * engine state and never issues a flush or a write.  The reseed writer
+ * passes its config-writer mode because it already owns SCL_ALL.
+ */
+static int
+engine_store_manifest_read(vdev_t *vd, uint64_t arena, uint64_t page,
+    abd_t *abd, engine_store_leaf_io_mode_t mode)
+{
+	engine_t *engine = vd->vdev_spa->spa_reloc;
+	engine_store_endpoints_t ep;
+	int error = engine_store_member_endpoints(engine, vd, B_FALSE, &ep);
+	return (error == 0 ? engine_store_endpoints_read(engine, &ep, arena,
+	    page, 1, abd, mode) : error);
+}
+
+/* The exact leaf whose state stands for a member slot, or NULL. */
+static vdev_t *
+engine_store_r02_member_leaf(vdev_t *slot)
+{
+	engine_store_member_t member;
+	if (engine_store_member_classify(slot, &member) != 0)
+		return (NULL);
+	return (member.kind == ENGINE_STORE_MEMBER_LEAF ? member.leaf[0] :
+	    member.leaf[1]);
+}
+
+/*
+ * Every member is a direct leaf except exactly one strict replacing pair,
+ * which is the pair this engine knows.  writable additionally requires
+ * that pair to be admitted rather than faulted.
+ */
+static boolean_t
+engine_store_r02_topology(vdev_t *vd, boolean_t writable)
+{
+	if (vd == NULL || vd->vdev_children == 0)
+		return (B_FALSE);
+	engine_t *engine = vd->vdev_spa->spa_reloc;
+	uint_t pairs = 0;
+	for (uint_t c = 0; c < vd->vdev_children; c++) {
+		engine_store_member_t member;
+		if (engine_store_member_classify(vd->vdev_child[c],
+		    &member) != 0)
+			return (B_FALSE);
+		if (member.kind == ENGINE_STORE_MEMBER_LEAF)
+			continue;
+		if (!engine_r02_pair_known(engine, &member) ||
+		    engine->r02_pair_slot != c)
+			return (B_FALSE);
+		pairs++;
+	}
+	return (pairs == 1 && (!writable ||
+	    atomic_load_64(&engine->r02_pair_state) ==
+	    ENGINE_R02_PAIR_ADMITTED));
 }
 
 /* A member's result: the first error, which an absence does not mask. */
@@ -361,32 +1050,62 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
 	engine_t *engine = spa->spa_reloc;
 	hrtime_t start = gethrtime();
 	uint_t children = engine->vd->vdev_children;
-	zio_t **root = kmem_zalloc(children * sizeof (zio_t *), KM_SLEEP);
+	/*
+	 * One root and one result per exact endpoint: a pair's two leaves are
+	 * independent results that engine_r02_slot_result() combines.
+	 */
+	uint_t slots = children * 2;
+	zio_t **root = kmem_zalloc(slots * sizeof (zio_t *), KM_SLEEP);
+	int *perr = kmem_zalloc(slots * sizeof (int), KM_SLEEP);
+	engine_store_endpoints_t *ep = kmem_zalloc(children * sizeof (*ep),
+	    KM_SLEEP);
+	boolean_t *resolved = kmem_zalloc(children * sizeof (boolean_t),
+	    KM_SLEEP);
 	engine_member_run_t *runs = pr19262_zalloc(MAX(1, n) * sizeof (*runs),
 	    KM_SLEEP);
 	uint_t nr = n == 0 ? 0 : engine_member_runs(engine, pv, n, runs);
 	for (uint_t c = 0; c < children; c++) {
 		errors[c] = 0;
+		int e = engine_store_member_endpoints(engine,
+		    engine->vd->vdev_child[c], B_TRUE, &ep[c]);
+		if (e != 0) {
+			engine_member_error(engine, &errors[c], e);
+			continue;
+		}
+		resolved[c] = B_TRUE;
 		if (nr == 0)
 			continue;
-		root[c] = zio_root(spa, NULL, NULL, ZIO_FLAG_CANFAIL);
-		for (uint_t i = 0; i < nr; i++) {
-			zio_t *zio;
-			int e = engine_store_zio(root[c],
-			    engine->vd->vdev_child[c], runs[i].arena,
-			    runs[i].page, runs[i].pages, runs[i].abd, B_TRUE,
-			    &zio);
-			if (e != 0)
-				engine_member_error(engine, &errors[c], e);
-			else
-				zio_nowait(zio);
+		for (uint_t k = 0; k < ep[c].count; k++) {
+			uint_t r = 2 * c + k;
+			if (ep[c].role[k] == ENGINE_R02_ROLE_NEW &&
+			    (perr[r] = engine_r02_test_fault(engine)) != 0)
+				continue;
+			root[r] = zio_root(spa, NULL, NULL, ZIO_FLAG_CANFAIL);
+			for (uint_t i = 0; i < nr; i++) {
+				zio_t *zio;
+				e = engine_store_leaf_zio(root[r], engine,
+				    ep[c].leaf[k], runs[i].arena, runs[i].page,
+				    runs[i].pages, runs[i].abd, B_TRUE,
+				    ENGINE_STORE_LEAF_IO_NORMAL, &zio);
+				if (e != 0 && !ep[c].pair)
+					engine_member_error(engine, &errors[c],
+					    e);
+				else if (e != 0 && perr[r] == 0)
+					perr[r] = e;
+				else if (e == 0)
+					zio_nowait(zio);
+			}
 		}
 	}
-	for (uint_t c = 0; c < children; c++) {
-		if (root[c] != NULL)
-			engine_member_error(engine, &errors[c],
-			    zio_wait(root[c]));
-		root[c] = NULL;
+	for (uint_t r = 0; r < slots; r++) {
+		if (root[r] == NULL)
+			continue;
+		int e = zio_wait(root[r]);
+		root[r] = NULL;
+		if (!ep[r / 2].pair)
+			engine_member_error(engine, &errors[r / 2], e);
+		else if (e != 0 && perr[r] == 0)
+			perr[r] = e;
 	}
 	for (uint_t i = 0; i < nr; i++)
 		if (runs[i].owned)
@@ -395,19 +1114,45 @@ engine_members_write(spa_t *spa, const engine_member_page_t *pv,
 	hrtime_t written = gethrtime();
 	if (flush) {
 		for (uint_t c = 0; c < children; c++) {
-			if (errors[c] != 0 && !flush_failed)
+			if (!resolved[c] || (!ep[c].pair && errors[c] != 0 &&
+			    !flush_failed))
 				continue;
-			root[c] = zio_root(spa, NULL, NULL, ZIO_FLAG_CANFAIL);
-			pr19262_engine_metadata_flush_nowait(root[c],
-			    engine->vd->vdev_child[c]);
+			for (uint_t k = 0; k < ep[c].count; k++) {
+				uint_t r = 2 * c + k;
+				if (ep[c].pair && perr[r] != 0 &&
+				    !flush_failed)
+					continue;
+				root[r] = zio_root(spa, NULL, NULL,
+				    ZIO_FLAG_CANFAIL);
+				pr19262_engine_metadata_flush_nowait(root[r],
+				    ep[c].leaf[k]);
+			}
 		}
-		for (uint_t c = 0; c < children; c++) {
-			if (root[c] != NULL)
-				engine_member_error(engine, &errors[c],
-				    zio_wait(root[c]));
+		for (uint_t r = 0; r < slots; r++) {
+			if (root[r] == NULL)
+				continue;
+			int e = zio_wait(root[r]);
+			root[r] = NULL;
+			if (!ep[r / 2].pair)
+				engine_member_error(engine, &errors[r / 2], e);
+			else if (e != 0 && perr[r] == 0)
+				perr[r] = e;
 		}
 	}
-	kmem_free(root, children * sizeof (zio_t *));
+	/* A pair slot's result is decided once, from both endpoints. */
+	for (uint_t c = 0; c < children; c++) {
+		if (resolved[c] && ep[c].pair)
+			engine_member_error(engine, &errors[c],
+			    engine_r02_slot_result(engine, &ep[c],
+			    &perr[2 * c]));
+		else if (nr != 0 || flush)
+			engine_member_missed(engine, engine->vd->vdev_child[c],
+			    errors[c]);
+	}
+	kmem_free(perr, slots * sizeof (int));
+	kmem_free(root, slots * sizeof (zio_t *));
+	kmem_free(resolved, children * sizeof (boolean_t));
+	kmem_free(ep, children * sizeof (*ep));
 	if (cost != NULL) {
 		cost->runs += nr;
 		cost->write += written - start;
@@ -573,10 +1318,16 @@ engine_dirty_settle(engine_t *engine, const engine_dirty_snap_t *s)
 
 #include "vdev_reloc_pages.c"
 
+/* R02 pair discovery and import recovery live with the reseed code. */
+static void engine_r02_pair_discover(engine_t *);
+static int engine_r02_pair_recover(spa_t *);
+
 static uint_t
 engine_store_tolerated(engine_t *engine)
 {
-	return (MIN(engine->pages->certified, VDEV_RAIDZ_MAXPARITY));
+	uint64_t tolerance = engine->pages->certified != 0 ?
+	    engine->pages->certified : engine->store_tolerance;
+	return (MIN(tolerance, VDEV_RAIDZ_MAXPARITY));
 }
 
 static boolean_t
@@ -948,7 +1699,7 @@ engine_store_packed(spa_t *spa, uberblock_t *ub, nvlist_t *nv)
 		    pages, abd, B_TRUE);
 		if (e != 0)
 			error = e;
-		e = pr19262_engine_metadata_flush(engine->vd->vdev_child[i]);
+		e = engine_store_flush(engine->vd->vdev_child[i]);
 		if (e != 0)
 			error = e;
 	}
@@ -989,11 +1740,15 @@ engine_store_sync(spa_t *spa, uberblock_t *ub)
 		return (0);
 	}
 	boolean_t paged = engine->store_codec >= 6;
+	/* This snapshot records every deferred free as gone. */
+	engine_reuse_stage_locked(engine, ub->ub_txg);
 	nvlist_t *nv = engine_store_snapshot(spa, ub, !paged);
 	if (paged)
 		return (engine_store_paged(spa, ub, nv));
 	return (engine_store_packed(spa, ub, nv));
 }
+
+static void engine_fence_growth_check(spa_t *);
 
 int
 pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
@@ -1003,6 +1758,20 @@ pr19262_engine_store_sync(spa_t *spa, uberblock_t *ub)
 	mutex_enter(&engine->store_lock);
 	int error = engine_store_sync(spa, ub);
 	mutex_exit(&engine->store_lock);
+	/*
+	 * Test cuts between this store sync and the uberblock: A4 after the
+	 * first replacing-config sync, D4 after the collapsing detach sync.
+	 */
+	if (error == 0 && atomic_load_64(&engine->r02_pair_state) ==
+	    ENGINE_R02_PAIR_ADMITTED)
+		engine_r02_cut(5);
+	if (error == 0 && atomic_load_64(&engine->r02_collapsed) != 0) {
+		engine_r02_cut(14);
+		atomic_store_64(&engine->r02_collapsed, 0);
+	}
+	/* Syncing context: may only dispatch a fence, never run one. */
+	if (error == 0)
+		engine_fence_growth_check(spa);
 	return (error);
 }
 
@@ -1010,6 +1779,15 @@ static void
 engine_store_clear(engine_t *engine)
 {
 	ASSERT(MUTEX_HELD(&engine->lock));
+	atomic_store_64(&engine->r02_pair_state, ENGINE_R02_PAIR_NONE);
+	engine->r02_pair_old_guid = engine->r02_pair_new_guid = 0;
+	engine->r02_pair_slot = 0;
+	atomic_store_64(&engine->r02_collapsed, 0);
+	atomic_store_64(&engine->r02_old_stale, 0);
+	atomic_store_64(&engine->r02_attach_old_current, 0);
+	atomic_store_64(&engine->r02_readmit_retries, 0);
+	memset(engine->member_missed, 0, sizeof (engine->member_missed));
+	atomic_store_64(&engine->member_readmit_retries, 0);
 	engine_pages_clear(engine);
 	engine_owner_t *e;
 	while ((e = avl_first(&engine->owners)) != NULL) {
@@ -1041,8 +1819,28 @@ engine_store_clear(engine_t *engine)
 		zfs_range_tree_vacate(engine->unusable, NULL, NULL);
 		zfs_range_tree_destroy(engine->unusable);
 	}
+	/* Deferred reuse is RAM-only: a load rebuilds free from a root. */
+	if (engine->reuse_open != NULL) {
+		zfs_range_tree_vacate(engine->reuse_open, NULL, NULL);
+		zfs_range_tree_destroy(engine->reuse_open);
+		engine->reuse_open = NULL;
+		for (uint_t i = 0; i < ENGINE_REUSE_BATCHES; i++) {
+			zfs_range_tree_vacate(engine->reuse_batch[i], NULL,
+			    NULL);
+			zfs_range_tree_destroy(engine->reuse_batch[i]);
+			engine->reuse_batch[i] = NULL;
+			engine->reuse_batch_txg[i] = 0;
+		}
+	}
+	engine->reuse_deferred = engine->reuse_released = 0;
 	if (engine->bitmap != NULL)
 		kmem_free(engine->bitmap, ENGINE_STORE_PAGES);
+	/* Reserved runs are RAM-only, inside store_extents: a load has none. */
+	if (engine->store_reserved != NULL) {
+		zfs_range_tree_vacate(engine->store_reserved, NULL, NULL);
+		zfs_range_tree_destroy(engine->store_reserved);
+		engine->store_reserved = NULL;
+	}
 	if (engine->store_extents != NULL) {
 		zfs_range_tree_vacate(engine->store_extents, NULL, NULL);
 		zfs_range_tree_destroy(engine->store_extents);
@@ -1085,13 +1883,21 @@ engine_store_clear(engine_t *engine)
 	    sizeof (engine->journal_root_epoch));
 	memset(&engine->journal_hash, 0, sizeof (engine->journal_hash));
 	engine->journal_error = 0;
+	engine->journal_roll_pending = B_FALSE;
+	engine->journal_roll_txg = engine->journal_roll_enospc = 0;
+	engine->journal_roll_waits = engine->journal_roll_recovered = 0;
 	engine->journal_ready = engine->journal_formatted = B_FALSE;
 	engine->journal_repair = B_FALSE;
 	memset(&engine->checkpoint, 0, sizeof (engine->checkpoint));
+	engine_ckpt_unpin_locked(engine);
+	engine->ckpt_session_txg = 0;
+	engine->ckpt_builds = engine->ckpt_build_errors = 0;
+	engine->ckpt_unpins = 0;
 	engine->durable_ub_txg = engine->durable_catalog_txg = 0;
 	memset(engine->stored_desc, 0, sizeof (engine->stored_desc));
 	memset(engine->durable_desc, 0, sizeof (engine->durable_desc));
 	engine->certified = 0;
+	engine->store_tolerance = 0;
 	engine->release_thread = NULL;
 	memset(engine->admit, 0, sizeof (engine->admit));
 	engine->admit_parity = engine->admit_reserve = 0;
@@ -1104,12 +1910,76 @@ engine_store_clear(engine_t *engine)
 	engine->admit_first = NULL;
 	VERIFY(!engine->fence_pending);
 	engine->fence_quiesced = engine->fence_stalled = B_FALSE;
+	engine->fence_timing = B_FALSE;
+	engine->fence_timing_mark = engine->fence_timing_waits = 0;
+	engine->fence_returns = 0;
+	engine->retired_pinned_valid = engine->retired_pinned_draining =
+	    B_FALSE;
+	engine->retired_pinned = engine->retired_pinned_v = 0;
+	engine->retired_pinned_ckpt = engine->retired_pinned_after = 0;
+	engine->retired_pinned_txg = engine->retired_pinned_counts = 0;
+	engine->retired_pinned_passes = engine->retired_pinned_prints = 0;
 #ifndef _KERNEL
 	engine->export_fence_test = NULL;
+	VERIFY3P(engine->fence_task_thread, ==, NULL);
 #endif
 	engine->fence_error = 0;
 	engine->fence_requests = engine->fence_auto = 0;
+	engine->fence_growth_pages_mark = engine->fence_growth_retired_mark = 0;
+	engine->fence_growth_triggers = 0;
+	engine->fence_growth_dispatch_failures = 0;
+	engine->admit_arena_rejections = 0;
+	engine->fence_completions = engine->fence_suspended = 0;
+	engine->admit_arena_wait_gen = engine->admit_arena_wait_deficit = 0;
+	engine->admit_defer_txg = 0;
+	engine->fence_growth_seeded = engine->fence_growth_running = B_FALSE;
 	engine->admit_fence_waits = 0;
+	/* store_extents, which held the standby, is already destroyed. */
+	engine->store_standby = 0;
+	engine->store_standby_valid = B_FALSE;
+	engine->store_headroom_low = engine->store_headroom_warned = B_FALSE;
+	engine->store_standby_fills = engine->store_standby_uses = 0;
+	engine->store_grow_enospc = engine->admit_headroom_rejections = 0;
+	engine->store_standby_releases = 0;
+	engine->store_reserve_fills = engine->store_reserve_uses = 0;
+	engine->store_reserve_returns = engine->store_reserve_peak = 0;
+	engine->netfree_wait_mark = engine->netfree_wait_last = 0;
+	engine->admit_held_waits = engine->copy_held_waits = 0;
+	engine->admit_held_takes = 0;
+	engine->checkpoint_headroom_refusals = 0;
+	/* L19: the reserve itself went with engine_ckpt_unpin_locked above. */
+	engine->ckres_churn_x16 = 0;
+	engine->ckres_conv_refused = B_FALSE;
+	engine->ckres_min_available = engine->ckres_arms = 0;
+	engine->ckres_releases = engine->ckres_refusals = 0;
+	engine->ckres_rejections = engine->ckres_disc_draws = 0;
+	engine->ckres_rel_txg = engine->ckres_rel_left = 0;
+	engine->ckres_rel_pages = 0;
+	engine->free_runs_cached = 0;
+	engine->free_runs_known = B_FALSE;
+	memset(engine->free_pace_txg, 0, sizeof (engine->free_pace_txg));
+	memset(engine->free_pace_rows, 0, sizeof (engine->free_pace_rows));
+	engine->free_paced_rows = engine->free_deferrals = 0;
+	engine->free_deferrals_mark = engine->free_aged = 0;
+	engine->bulk_pot_fresh = engine->bulk_rows = 0;
+	engine->bulk_destroy_charged = engine->release_carry = B_FALSE;
+	engine->bulk_pathed = engine->bulk_destroy_asked = B_FALSE;
+	engine->bulk_stall_txg = engine->bulk_runs_cached = 0;
+	engine->free_budget_synced = engine->free_budget_pages = 0;
+	engine->free_budget_admitted = 0;
+	engine->free_ckpt_asked = B_FALSE;
+	engine->bulk_waits = engine->bulk_waits_mark = 0;
+	engine->bulk_destroy_rows = engine->bulk_destroy_pauses = 0;
+	engine->bulk_release_cuts = engine->bulk_release_rounds = 0;
+	engine->bulk_prints = 0;
+	engine->ckpt_discard_txg = engine->ckpt_discard_budget = 0;
+	engine->ckpt_discard_need = engine->ckpt_discard_rows = 0;
+	engine->ckpt_discard_cuts = engine->ckpt_discard_stalls = 0;
+	engine->ckpt_discard_waits = engine->ckpt_discard_fences = 0;
+	engine->ckpt_discard_prints = 0;
+	engine->ckpt_discard_warned = B_FALSE;
+	engine->ckpt_drain_flags_loaded = B_FALSE;
+	engine->ckpt_drain_flagged = 0;
 }
 
 void
@@ -1132,13 +2002,20 @@ pr19262_engine_store_rebind(spa_t *spa)
 {
 	engine_t *engine = spa->spa_reloc;
 	mutex_enter(&engine->lock);
-	if (engine->spa == spa) {
+	boolean_t rebound = engine->spa == spa;
+	if (rebound) {
 		/* The config was reloaded: find the target by its guid. */
 		engine->vd = engine_target_vdev(spa, engine->vd_guid);
 		VERIFY3P(engine->vd, !=, NULL);
 		engine->foreign_normal = engine_foreign_normal(spa, engine->vd);
+		/* R02: a pair is known only from the trusted tree. */
+		atomic_store_64(&engine->r02_pair_state, ENGINE_R02_PAIR_NONE);
+		engine->r02_pair_old_guid = engine->r02_pair_new_guid = 0;
+		engine->r02_pair_slot = 0;
 	}
 	mutex_exit(&engine->lock);
+	if (rebound)
+		engine_r02_pair_discover(engine);
 }
 
 static boolean_t
@@ -1420,6 +2297,10 @@ typedef struct engine_root_graph {
 	uint_t count;
 	uint_t capacity;
 	zfs_range_tree_t *occupied;
+	/* The R02 observer obtains its floor from private raw control pages. */
+	boolean_t manifest;
+	boolean_t floor_valid;
+	uint64_t floor;
 } engine_root_graph_t;
 
 static int
@@ -1428,8 +2309,17 @@ engine_root_add(void *arg, const uberblock_t *ub)
 	engine_t *engine = ((engine_root_graph_t *)arg)->spa->spa_reloc;
 	engine_root_graph_t *g = arg;
 	const uint64_t *d = ub->ub_pr19262;
-	/* Roots below the durable floor are not importable: skip them. */
-	if (pr19262_engine_store_ub(ub) && ub->ub_txg < engine->pages->floor)
+	/*
+	 * Roots below the durable floor are not importable: skip them.  The
+	 * guarded checkpoint root is, and its pages stay pinned.
+	 */
+	if (g->manifest && pr19262_engine_store_ub(ub) &&
+	    !engine_r02_manifest_codec_supported(d[15]))
+		return (ENOTSUP);
+	if (pr19262_engine_store_ub(ub) &&
+	    (g->floor_valid ? ub->ub_txg < g->floor :
+	    (!g->manifest && ub->ub_txg < engine->pages->floor)) &&
+	    !engine_ckpt_exempt(engine, ub))
 		return (0);
 	if (!pr19262_engine_store_ub(ub) || !engine_store_layout(d) ||
 	    d[1] != engine->vd->vdev_guid || d[2] != engine->arena ||
@@ -1558,12 +2448,24 @@ pr19262_engine_store_inventory(spa_t *spa, uint64_t *roots, uint64_t *pages)
 		spa_config_exit(spa, SCL_STATE, FTAG);
 		return (ENOTSUP);
 	}
+	/*
+	 * This observer has no endpoint vector.  It must not let a successful
+	 * read through a replacing parent stand in for an exact-leaf manifest.
+	 * Keep the existing per-I/O classifier as the backstop, but refuse the
+	 * whole inspection before collecting any result from that topology.
+	 */
+	if (!engine_store_direct_topology(engine->vd) &&
+	    !engine_store_r02_topology(engine->vd, B_FALSE)) {
+		mutex_exit(&engine->store_lock);
+		spa_config_exit(spa, SCL_STATE, FTAG);
+		return (ENOTSUP);
+	}
 	engine_root_graph_t *g = kmem_zalloc(sizeof (*g), KM_SLEEP);
 	g->spa = spa;
 	g->occupied = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
 	    NULL, 0, 0);
 	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
-	int error = pr19262_vdev_uberblocks(spa, g, engine_root_add);
+	int error = pr19262_vdev_uberblocks_r02(spa, g, engine_root_add, NULL);
 	for (uint_t i = 0; error == 0 && i < g->count; i++)
 		error = engine_root_read(g, &g->roots[i]);
 	spa_config_exit(spa, SCL_ZIO, FTAG);
@@ -1580,6 +2482,164 @@ pr19262_engine_store_inventory(spa_t *spa, uint64_t *roots, uint64_t *pages)
 	mutex_exit(&engine->store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	return (error);
+}
+
+/*
+ * A read-only R02 prerequisite.  The lock order is deliberate: the private
+ * topology gate precedes STATE, then store_lock, journal_lock, then ZIO.
+ * The journal lock freezes the persisted root while this read-only closure
+ * follows its HEAD/BIND prefix; it never calls journal recovery or apply.
+ */
+static int engine_r02_journal_manifest(engine_r02_manifest_private_t *);
+
+/* The uberblock enumeration order is not a visitor-order contract. */
+static int
+engine_r02_manifest_ub_compare(const uberblock_t *left,
+    const uberblock_t *right)
+{
+	if (left->ub_txg != right->ub_txg)
+		return (left->ub_txg < right->ub_txg ? -1 : 1);
+	for (uint_t i = 0; i < sizeof (left->ub_pr19262) /
+	    sizeof (left->ub_pr19262[0]); i++) {
+		if (left->ub_pr19262[i] != right->ub_pr19262[i])
+			return (left->ub_pr19262[i] < right->ub_pr19262[i] ?
+			    -1 : 1);
+	}
+	return (memcmp(&left->ub_rootbp, &right->ub_rootbp,
+	    sizeof (left->ub_rootbp)));
+}
+
+static void
+engine_r02_manifest_root_order(engine_root_graph_t *graph)
+{
+	/* The retained root set is small; an insertion sort keeps this scratch-only. */
+	for (uint_t i = 1; i < graph->count; i++) {
+		uberblock_t held = graph->roots[i];
+		uint_t at = i;
+		while (at != 0 && engine_r02_manifest_ub_compare(&held,
+		    &graph->roots[at - 1]) < 0) {
+			graph->roots[at] = graph->roots[at - 1];
+			at--;
+		}
+		graph->roots[at] = held;
+	}
+}
+
+static void
+engine_r02_manifest_init(engine_r02_manifest_private_t *m, spa_t *spa,
+    engine_store_leaf_io_mode_t mode, boolean_t reseed)
+{
+	memset(m, 0, sizeof (*m));
+	m->spa = spa;
+	m->mode = mode;
+	m->reseed = reseed;
+	m->all = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0, 0);
+	m->catalog = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0, 0);
+	m->tree = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0, 0);
+	m->control_pages = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL,
+	    0, 0);
+	m->directory = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0,
+	    0);
+	m->journal = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0, 0);
+	list_create(&m->entries, sizeof (engine_r02_entry_t),
+	    offsetof(engine_r02_entry_t, node));
+}
+
+/*
+ * The validated closure itself.  The caller owns SCL_STATE (reader, or the
+ * SCL_ALL writer), store_lock and journal_lock, and either an SCL_ZIO reader
+ * (normal mode) or SCL_ALL writer (config-writer mode); this helper requests
+ * no lock.  absent_ok names the one leaf whose labels may be unreadable: the
+ * old leaf being superseded by an R02 reseed.  The topology must be direct
+ * or carry exactly the strict pair this engine knows.
+ */
+static int
+engine_r02_collect_locked(engine_r02_manifest_private_t *m,
+    vdev_t *absent_ok)
+{
+	spa_t *spa = m->spa;
+	engine_t *engine = spa->spa_reloc;
+	boolean_t shaped = engine_store_direct_topology(engine->vd) ||
+	    engine_store_r02_topology(engine->vd, B_FALSE);
+	if (engine_r02_manifest_gate(spa, engine, shaped, 6) != 0)
+		return (SET_ERROR(ENOTSUP));
+	engine_root_graph_t graph = { .spa = spa, .manifest = B_TRUE };
+	/* Do not issue raw I/O before root_add() rejects codec 5. */
+	int error = pr19262_vdev_uberblocks_r02(spa, &graph, engine_root_add,
+	    absent_ok);
+	if (error == 0) {
+		engine_r02_manifest_root_order(&graph);
+		error = engine_r02_manifest_open(m);
+	}
+	if (error == 0) {
+		graph.floor = m->control.floor;
+		graph.floor_valid = B_TRUE;
+	}
+	for (uint_t i = 0; error == 0 && i < graph.count; i++) {
+		if (graph.roots[i].ub_txg < graph.floor &&
+		    !engine_ckpt_exempt(engine, &graph.roots[i]))
+			continue;
+		error = engine_r02_root(m, &graph.roots[i], &graph,
+		    engine_root_add);
+	}
+	if (error == 0)
+		error = engine_r02_journal_manifest(m);
+	if (error == 0)
+		error = engine_r02_manifest_check(m);
+	if (graph.roots != NULL)
+		kmem_free(graph.roots, graph.capacity * sizeof (*graph.roots));
+	return (error);
+}
+
+int
+pr19262_engine_r02_manifest_walk(spa_t *spa,
+    pr19262_r02_manifest_visit_t visit, void *arg,
+    pr19262_r02_manifest_t *out)
+{
+	if (out == NULL)
+		return (EINVAL);
+	memset(out, 0, sizeof (*out));
+	engine_t *engine = spa->spa_reloc;
+	rw_enter(&engine->r02_topology_lock, RW_READER);
+	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+	mutex_enter(&engine->store_lock);
+	boolean_t shaped = engine_store_direct_topology(engine->vd) ||
+	    engine_store_r02_topology(engine->vd, B_FALSE);
+	if (engine_r02_manifest_gate(spa, engine, shaped, 6) != 0) {
+		mutex_exit(&engine->store_lock);
+		spa_config_exit(spa, SCL_STATE, FTAG);
+		rw_exit(&engine->r02_topology_lock);
+		return (ENOTSUP);
+	}
+	engine_r02_manifest_private_t manifest;
+	engine_r02_manifest_init(&manifest, spa, ENGINE_STORE_LEAF_IO_NORMAL,
+	    B_FALSE);
+	mutex_enter(&engine->journal_lock);
+	spa_config_enter(spa, SCL_ZIO, FTAG, RW_READER);
+	int error = engine_r02_collect_locked(&manifest, NULL);
+	if (error == 0)
+		engine_r02_manifest_counts(&manifest, out);
+	spa_config_exit(spa, SCL_ZIO, FTAG);
+	mutex_exit(&engine->journal_lock);
+	mutex_exit(&engine->store_lock);
+	spa_config_exit(spa, SCL_STATE, FTAG);
+	rw_exit(&engine->r02_topology_lock);
+	if (error == 0 && visit != NULL) {
+		for (engine_r02_entry_t *e = list_head(&manifest.entries);
+		    e != NULL; e = list_next(&manifest.entries, e)) {
+			error = visit(arg, &e->entry);
+			if (error != 0)
+				break;
+		}
+	}
+	engine_r02_manifest_fini(&manifest);
+	return (error);
+}
+
+int
+pr19262_engine_r02_manifest(spa_t *spa, pr19262_r02_manifest_t *out)
+{
+	return (pr19262_engine_r02_manifest_walk(spa, NULL, NULL, out));
 }
 
 int
@@ -1632,6 +2692,7 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 		ENGINE_REFUSE(20);
 	engine->vd = vd;
 	engine->vd_guid = vd->vdev_guid;
+	engine_r02_pair_discover(engine);
 	engine->foreign_normal = engine_foreign_normal(spa, vd);
 	engine->total = vd->vdev_asize;
 	engine->arena = d[2]; engine->arena_bytes = d[3];
@@ -1684,9 +2745,15 @@ pr19262_engine_store_load(spa_t *spa, const uberblock_t *ub)
 		engine->stored_revision = engine->revision;
 		engine->durable_ub_txg = ub->ub_txg;
 		engine->durable_catalog_txg = d[6];
+		/* Open-context allocations may carry the next txgs. */
+		engine->ckpt_session_txg = ub->ub_txg + TXG_CONCURRENT_STATES;
 		memcpy(engine->stored_desc, d, sizeof (engine->stored_desc));
 		memcpy(engine->durable_desc, d, sizeof (engine->durable_desc));
 		engine->certified = engine->pages->certified;
+		/*
+		 * Import trusts the on-disk certificate; it never trusts RAM.
+		 */
+		engine->store_tolerance = 0;
 		engine->admit_batch = ENGINE_ADMIT_BATCH;
 		engine->admit_refreshed = UINT64_MAX;
 		engine->admit_cached_parity = UINT64_MAX;
@@ -1736,10 +2803,24 @@ pr19262_engine_store_recover(spa_t *spa)
 		return (0);
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
 	mutex_enter(&engine->store_lock);
-	int error = engine_pages_reconcile(spa, B_TRUE);
+	/* I1: an imported replacing pair is reseeded before any publication. */
+	int error = engine_r02_pair_recover(spa);
+	/* A pre-certificate runtime quorum is not durable import authority. */
+	boolean_t missing = engine->pages->certified == 0 &&
+	    !engine_store_members_ready(engine->vd);
+	if (error == 0)
+		error = missing ? ENXIO : engine_pages_reconcile(spa, B_TRUE);
+	if (missing)
+		pr19262_printf("PR19262_RECOVER_REFUSED certified=0 members\n");
 	/* Members that returned after missing writes get the live pages. */
 	if (error == 0)
 		error = engine_pages_resilver_members(spa);
+	/* L23: a member absent now may lack anything stored before it. */
+	for (uint_t c = 0; error == 0 && c < engine->vd->vdev_children; c++) {
+		vdev_t *m = engine->vd->vdev_child[c];
+		if (!vdev_readable(m) || !vdev_writeable(m))
+			engine_member_missed(engine, m, ENXIO);
+	}
 	mutex_exit(&engine->store_lock);
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	return (error);

@@ -1058,8 +1058,11 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 	}
 
 	taskq_init_ent(&zio->io_tqent);
-	if (pio != NULL)
+	if (pio != NULL) {
 		zio->io_pr19262_backing_birth = pio->io_pr19262_backing_birth;
+		zio->io_pr19262_repair_source_birth =
+		    pio->io_pr19262_repair_source_birth;
+	}
 	zio->io_pr19262_owner_hold = pr19262_engine_hold(spa, bp,
 	    pio != NULL ? pio->io_pr19262_owner_hold : NULL,
 	    type == ZIO_TYPE_READ, (flags & ZIO_FLAG_GANG_CHILD) != 0);
@@ -1393,20 +1396,41 @@ zio_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
 	    priority, flags, zb, NULL, B_FALSE));
 }
 
+static int
+pr19262_engine_metadata_flush_flags(vdev_t *vd, zio_flag_t extra)
+{
+	/* Raw-store durability is meaningful only for one concrete leaf. */
+	if (vd == NULL || !vd->vdev_ops->vdev_op_leaf ||
+	    vd->vdev_children != 0)
+		return (ENOTSUP);
+	zio_t *zio = zio_create(NULL, vd->vdev_spa, 0, NULL, NULL, 0, 0,
+	    NULL, NULL, ZIO_TYPE_FLUSH, ZIO_PRIORITY_NOW,
+	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY | extra, vd, 0, NULL,
+	    ZIO_STAGE_OPEN, ZIO_FLUSH_PIPELINE);
+	return (zio_wait(zio));
+}
+
 int
 pr19262_engine_metadata_flush(vdev_t *vd)
 {
-	zio_t *zio = zio_create(NULL, vd->vdev_spa, 0, NULL, NULL, 0, 0,
-	    NULL, NULL, ZIO_TYPE_FLUSH, ZIO_PRIORITY_NOW,
-	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY, vd, 0, NULL,
-	    ZIO_STAGE_OPEN, ZIO_FLUSH_PIPELINE);
-	return (zio_wait(zio));
+	return (pr19262_engine_metadata_flush_flags(vd, 0));
+}
+
+/* Synchronous exact-leaf flush for a caller that already owns SCL_ALL. */
+int
+pr19262_engine_metadata_flush_config_writer(vdev_t *vd)
+{
+	return (pr19262_engine_metadata_flush_flags(vd,
+	    ZIO_FLAG_CONFIG_WRITER));
 }
 
 /* The same flush as a child of pio, so that members flush at once. */
 void
 pr19262_engine_metadata_flush_nowait(zio_t *pio, vdev_t *vd)
 {
+	if (vd == NULL || !vd->vdev_ops->vdev_op_leaf ||
+	    vd->vdev_children != 0)
+		return;
 	zio_nowait(zio_create(pio, vd->vdev_spa, 0, NULL, NULL, 0, 0,
 	    NULL, NULL, ZIO_TYPE_FLUSH, ZIO_PRIORITY_NOW,
 	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY, vd, 0, NULL,
@@ -2413,6 +2437,17 @@ static void
 zio_taskq_dispatch(zio_t *zio, zio_taskq_type_t q, boolean_t cutinline)
 {
 	zio_taskq_dispatch_func(zio, q, cutinline, zio_execute);
+}
+
+/*
+ * PR19262: resume a zio the engine deferred (its stage was rewound by one)
+ * on its type's issue taskq, never on system_taskq.  The pipeline might have
+ * run that stage inline in its parent's thread instead.
+ */
+void
+pr19262_zio_resume(zio_t *zio)
+{
+	zio_taskq_dispatch(zio, ZIO_TASKQ_ISSUE, B_FALSE);
 }
 
 static boolean_t
@@ -5348,6 +5383,20 @@ zio_vdev_io_start(zio_t *zio)
 		zio->io_pr19262_owner_hold = hold;
 
 		/*
+		 * A write to an owner being copied waits for the copy here,
+		 * before any vdev child exists, and gives up SCL_ZIO: the copy
+		 * takes SCL_ZIO again before it publishes and resumes this zio,
+		 * which then retakes it above.  Once queued, the zio may run
+		 * and finish on another thread, so it is not dereferenced
+		 * again; its address is only the (unused) lock tag.  It is not
+		 * CONFIG_WRITER, so it holds SCL_ZIO.
+		 */
+		if (pr19262_engine_defer_logical(zio) == EINPROGRESS) {
+			spa_config_exit(spa, SCL_ZIO, zio);
+			return (NULL);
+		}
+
+		/*
 		 * The mirror_ops handle multiple DVAs in a single BP.
 		 */
 		vdev_mirror_ops.vdev_op_io_start(zio);
@@ -5359,6 +5408,13 @@ zio_vdev_io_start(zio_t *zio)
 		int error = pr19262_engine_dispatch(zio);
 		if (error == EINPROGRESS)
 			return (NULL);
+		if (error == EALREADY && zio->io_type == ZIO_TYPE_WRITE &&
+		    (zio->io_flags & ZIO_FLAG_IO_REPAIR)) {
+			/* A repair write to an owner being copied: skip it. */
+			pr19262_engine_repair_skipped(zio);
+			zio_vdev_io_bypass(zio);
+			return (zio);
+		}
 		if (error != 0) {
 			if (error == ESTALE &&
 			    pr19262_dispatch_stale_prints++ < 8) {
@@ -5473,16 +5529,67 @@ zio_vdev_io_start(zio_t *zio)
 	uint64_t repair_birth = zio->io_txg;
 	if (zio->io_pr19262_backing_birth != 0)
 		repair_birth = zio->io_pr19262_backing_birth;
+	uint64_t repair_source_birth =
+	    zio->io_pr19262_repair_source_birth;
+	boolean_t repair_dtl = B_FALSE;
+#ifdef _KERNEL
+	uint64_t r01_birth = 0, r01_txg = 0;
+	boolean_t r01_watch = (zio->io_flags & ZIO_FLAG_IO_REPAIR) != 0 &&
+	    pr19262_engine_r01_watch(zio, &r01_birth, &r01_txg);
+#endif
 	if ((zio->io_flags & ZIO_FLAG_IO_REPAIR) &&
 	    !(zio->io_flags & ZIO_FLAG_SELF_HEAL) &&
 	    repair_birth != 0 &&	/* not a delegated i/o */
 	    vd->vdev_ops != &vdev_indirect_ops &&
-	    vd->vdev_top->vdev_ops != &vdev_draid_ops &&
-	    !vdev_dtl_contains(vd, DTL_PARTIAL, repair_birth, 1)) {
+	    vd->vdev_top->vdev_ops != &vdev_draid_ops) {
+		/*
+		 * P is the current concrete target.  A translated resilver
+		 * may additionally carry its immutable original B, whose
+		 * missing-DTL obligation follows the logical block to P.
+		 */
+		repair_dtl = vdev_dtl_contains(vd, DTL_PARTIAL,
+		    repair_birth, 1);
+		if (!repair_dtl && repair_source_birth != 0 &&
+		    repair_source_birth != repair_birth) {
+			repair_dtl = vdev_dtl_contains(vd, DTL_PARTIAL,
+			    repair_source_birth, 1);
+		}
+#ifdef _KERNEL
+		if (r01_watch) {
+			/* Forwarding is P || B; status labels stay P-only. */
+			boolean_t dtl_p = vdev_dtl_contains(vd, DTL_PARTIAL,
+			    repair_birth, 1);
+			boolean_t dtl_b = dtl_p;
+			boolean_t dtl_t = dtl_p;
+			if (r01_birth != repair_birth)
+				dtl_b = vdev_dtl_contains(vd, DTL_PARTIAL,
+				    r01_birth, 1);
+			if (r01_txg != repair_birth)
+				dtl_t = vdev_dtl_contains(vd, DTL_PARTIAL,
+				    r01_txg, 1);
+			pr19262_engine_r01_repair_decision(zio, vd, dtl_p,
+			    dtl_b, dtl_t, !repair_dtl);
+		}
+#endif
+		if (!repair_dtl) {
 		ASSERT(zio->io_type == ZIO_TYPE_WRITE);
 		zio_vdev_io_bypass(zio);
 		return (zio);
+		}
 	}
+#ifdef _KERNEL
+	if (r01_watch && (zio->io_flags & ZIO_FLAG_SELF_HEAL) &&
+	    repair_birth != 0) {
+		boolean_t dtl_p = vdev_dtl_contains(vd, DTL_PARTIAL,
+		    repair_birth, 1);
+		boolean_t dtl_b = r01_birth == repair_birth ? dtl_p :
+		    vdev_dtl_contains(vd, DTL_PARTIAL, r01_birth, 1);
+		boolean_t dtl_t = r01_txg == repair_birth ? dtl_p :
+		    vdev_dtl_contains(vd, DTL_PARTIAL, r01_txg, 1);
+		pr19262_engine_r01_repair_decision(zio, vd, dtl_p, dtl_b,
+		    dtl_t, B_FALSE);
+	}
+#endif
 
 	/*
 	 * Select the next best leaf I/O to process.  Distributed spares are

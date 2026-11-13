@@ -766,9 +766,9 @@ traverse_dataset_destroyed(spa_t *spa, blkptr_t *blkptr,
 /*
  * NB: pool must not be changing on-disk (eg, from zdb or sync context).
  */
-int
-traverse_pool(spa_t *spa, uint64_t txg_start, int flags,
-    blkptr_cb_t func, void *arg)
+static int
+traverse_pool_impl(spa_t *spa, uint64_t txg_start, int flags,
+    blkptr_cb_t func, void *arg, boolean_t config_held)
 {
 	int err, hard_err = 0;
 	dsl_pool_t *dp = spa_get_dsl(spa);
@@ -799,9 +799,11 @@ traverse_pool(spa_t *spa, uint64_t txg_start, int flags,
 			dsl_dataset_t *ds;
 			uint64_t txg = txg_start;
 
-			dsl_pool_config_enter(dp, FTAG);
+			if (!config_held)
+				dsl_pool_config_enter(dp, FTAG);
 			err = dsl_dataset_hold_obj(dp, obj, FTAG, &ds);
-			dsl_pool_config_exit(dp, FTAG);
+			if (!config_held)
+				dsl_pool_config_exit(dp, FTAG);
 			if (err != 0) {
 				if (hard) {
 					hard_err = err;
@@ -828,6 +830,21 @@ traverse_pool(spa_t *spa, uint64_t txg_start, int flags,
 	return (err != 0 ? err : hard_err);
 }
 
+int
+traverse_pool(spa_t *spa, uint64_t txg_start, int flags,
+    blkptr_cb_t func, void *arg)
+{
+	return (traverse_pool_impl(spa, txg_start, flags, func, arg, B_FALSE));
+}
+
+int
+traverse_pool_sync(spa_t *spa, uint64_t txg_start, int flags,
+    blkptr_cb_t func, void *arg)
+{
+	ASSERT(RRW_WRITE_HELD(&spa_get_dsl(spa)->dp_config_rwlock));
+	return (traverse_pool_impl(spa, txg_start, flags, func, arg, B_TRUE));
+}
+
 /* The MOS alone, resumable: the private converter walks it in slices. */
 int
 pr19262_traverse_mos_resume(spa_t *spa, zbookmark_phys_t *resume, int flags,
@@ -839,6 +856,7 @@ pr19262_traverse_mos_resume(spa_t *spa, zbookmark_phys_t *resume, int flags,
 
 EXPORT_SYMBOL(traverse_dataset);
 EXPORT_SYMBOL(traverse_pool);
+EXPORT_SYMBOL(traverse_pool_sync);
 
 ZFS_MODULE_PARAM(zfs, zfs_, pd_bytes_max, INT, ZMOD_RW,
 	"Max number of bytes to prefetch");

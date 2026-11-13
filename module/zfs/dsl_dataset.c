@@ -30,6 +30,7 @@
 
 #include <sys/dmu_objset.h>
 #include <sys/dsl_dataset.h>
+#include <sys/vdev_reloc_engine.h>
 #include <sys/dsl_dir.h>
 #include <sys/dsl_prop.h>
 #include <sys/dsl_synctask.h>
@@ -312,6 +313,19 @@ dsl_dataset_block_kill(dsl_dataset_t *ds, const blkptr_t *bp, dmu_tx_t *tx,
 		boolean_t defer = spa_version(spa) >= SPA_VERSION_DEADLISTS &&
 		    (BP_IS_GANG(bp) || BP_GET_DEDUP(bp) ||
 		    brt_maybe_exists(spa, bp));
+		/*
+		 * PR19262 L13: a snapshot destroy just lowered our previous
+		 * snapshot txg, and a long free priced in open context counted
+		 * this block as kept by it (dmu_free_chunk_live): free it
+		 * through the paced free bpobj, not in this txg.
+		 */
+		if (!defer && spa_version(spa) >= SPA_VERSION_DEADLISTS &&
+		    ds->ds_pr19262_prev_lowered != 0 &&
+		    tx->tx_txg <= ds->ds_pr19262_prev_lowered +
+		    TXG_CONCURRENT_STATES &&
+		    BP_GET_BIRTH(bp) <= ds->ds_pr19262_prev_old &&
+		    pr19262_engine_persistent(spa))
+			defer = B_TRUE;
 
 		if (defer) {
 			dprintf_bp(bp, "putting on free list: %s", "");

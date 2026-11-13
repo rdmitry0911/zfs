@@ -2450,8 +2450,14 @@ vdev_open(vdev_t *vd, cred_t *cred)
 	if (vd->vdev_state == VDEV_STATE_HEALTHY &&
 	    ((asize > vd->vdev_asize &&
 	    (vd->vdev_expanding || spa->spa_autoexpand)) ||
-	    (asize < vd->vdev_asize)))
-		vd->vdev_asize = asize;
+	    (asize < vd->vdev_asize))) {
+		/* B3G (A33): an engine-translated vdev never grows. */
+		if (asize > vd->vdev_asize && pr19262_engine_size_fixed(vd))
+			pr19262_engine_size_refused(vd, asize,
+			    vd->vdev_expanding ? "expansion" : "autoexpand");
+		else
+			vd->vdev_asize = asize;
+	}
 
 	vdev_set_min_asize(vd);
 
@@ -4764,6 +4770,17 @@ vdev_online(spa_t *spa, uint64_t guid, uint64_t flags, vdev_state_t *newstate)
 
 	if ((vd = spa_lookup_by_guid(spa, guid, B_TRUE)) == NULL)
 		return (spa_vdev_state_exit(spa, NULL, SET_ERROR(ENODEV)));
+
+	/*
+	 * B3G (A33): the size of an engine-translated vdev is fixed; refuse
+	 * an explicit expansion of its members before anything changes.
+	 */
+	if ((flags & ZFS_ONLINE_EXPAND) && !vd->vdev_aux &&
+	    pr19262_engine_size_fixed(vd->vdev_top)) {
+		pr19262_engine_size_refused(vd->vdev_top, 0, "online -e");
+		return (spa_vdev_state_exit(spa, NULL,
+		    SET_ERROR(ZFS_ERR_VDEV_NOTSUP)));
+	}
 
 	wasoffline = (vd->vdev_offline || vd->vdev_tmpoffline);
 	oldstate = vd->vdev_state;
