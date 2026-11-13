@@ -375,8 +375,107 @@ boolean_t pr19262_engine_free_range(spa_t *, uint64_t, uint64_t);
 #ifndef _KERNEL
 /* ztest only: prefer a verified free P extent for one real DMU allocation. */
 int pr19262_engine_test_prefer_p(spa_t *, uint64_t, uint64_t);
+/*
+ * ztest only, growth-defer test: mark native extents (before activation);
+ * later report the highest arena run of marked space that is no longer
+ * legacy and where it is now; steer the next catalog growth onto a run
+ * (force: even if it is not free).
+ */
+typedef struct pr19262_reuse_probe {
+	uint64_t p;
+	uint64_t bytes;
+	uint64_t left;
+	uint64_t in_free;
+	uint64_t any_free;
+	uint64_t in_legacy;
+	uint64_t in_store;
+	uint64_t in_journal;
+	uint64_t owned;
+	uint64_t elsewhere;
+	uint64_t durable_ub;
+	uint64_t durable_catalog;
+	uint64_t stored_catalog;
+	uint64_t free_bytes;
+	uint64_t capacity;
+	/* Last steer: 0 none, 1 honoured, 2 forced, 3 refused (not free). */
+	uint64_t steer;
+} pr19262_reuse_probe_t;
+int pr19262_engine_test_mark(spa_t *, uint64_t, uint64_t);
+int pr19262_engine_test_reuse_probe(spa_t *, pr19262_reuse_probe_t *);
+int pr19262_engine_test_prefer_arena(spa_t *, uint64_t, boolean_t);
+/* Run fn(spa, arg) once, inside the next engine start, before it scans. */
+void pr19262_engine_test_start_hook(spa_t *, void (*)(spa_t *, void *),
+    void *);
+/*
+ * Reuse deferral probes.  defer_free moves bytes of free into the deferral
+ * and returns what is deferred (0 bytes: only ask; ENOTSUP without the
+ * deferral).  free_holes carves a hole into every 8 MiB of the free tree, so
+ * that it holds no arena run, or puts the holes back.
+ */
+int pr19262_engine_test_defer_free(spa_t *, uint64_t, uint64_t *);
+int pr19262_engine_test_free_holes(spa_t *, boolean_t);
+/* ztest only, floor-flake negative control: a wrong drain_releasable. */
+uint64_t pr19262_engine_test_flag_covered(spa_t *, uint64_t, uint64_t,
+    uint64_t *);
+/*
+ * ztest only, journal roll test (L10).  jroll_probe reports the journal and
+ * its roll state (retry: the tree has the retryable roll; runs: disjoint
+ * segment-sized, stripe-aligned runs in free).  jroll_squeeze leaves a roll
+ * no run: the standby run returns to free, one segment-sized run of free
+ * (*run) goes into the reuse deferral (op 1) or is held back (op 2, later
+ * deferred by op 3), and every 2 MiB of the rest of free gets a hole; op 0
+ * puts the holes (and a held run) back.
+ */
+typedef struct pr19262_jroll_probe {
+	uint64_t seq;
+	uint64_t frames;
+	uint64_t segments;
+	uint64_t rolls;
+	int64_t error;
+	uint64_t retry;
+	uint64_t pending;
+	uint64_t pending_txg;
+	uint64_t enospc;
+	uint64_t waits;
+	uint64_t recovered;
+	uint64_t deferred;
+	uint64_t standby;
+	uint64_t runs;
+	uint64_t free_bytes;
+	uint64_t synced;
+} pr19262_jroll_probe_t;
+int pr19262_engine_test_jroll_probe(spa_t *, pr19262_jroll_probe_t *);
+int pr19262_engine_test_jroll_squeeze(spa_t *, int, uint64_t *);
+/*
+ * L14 test only (L11 r2(a) cell): the retired bytes clients are measured
+ * against, the part of them owners loaded without drain_releasable hold
+ * while a discard drains, and the client refusals by branch.
+ */
+typedef struct pr19262_retired_probe {
+	uint64_t retired;
+	uint64_t limit;
+	uint64_t unflagged;
+	uint64_t unflagged_owners;
+	uint64_t draining;
+	uint64_t stalled;
+	int64_t fence_error;
+	uint64_t client_rejected;
+	uint64_t arena_rejections;
+	uint64_t headroom_rejections;
+	uint64_t fence_waits;
+	uint64_t fence_requests;
+} pr19262_retired_probe_t;
+int pr19262_engine_test_retired_probe(spa_t *, pr19262_retired_probe_t *);
+/* L14 test only (convert-busy8): a queued writer on bp's owner, or not. */
+int pr19262_engine_test_jroll_busy(spa_t *, const blkptr_t *, int);
 #endif
 void pr19262_engine_check(spa_t *, const char *);
+#ifndef _KERNEL
+/* Test only (L13 witness driver). */
+extern volatile int pr19262_l13_hold_release;
+void pr19262_engine_l13_status(spa_t *, char *, size_t);
+void pr19262_engine_l13_fence_dispatch(spa_t *);
+#endif
 zio_t *pr19262_engine_read_bound(zio_t *, spa_t *, const blkptr_t *,
     abd_t *, uint64_t, zio_done_func_t *, void *, zio_priority_t,
     zio_flag_t, const zbookmark_phys_t *, void **);
@@ -471,9 +570,19 @@ typedef struct pr19262_export_fence_test {
 	boolean_t exported;
 	int fence_error;
 	int export_error;
+	/* L15 test: hold a scheduled fence after its catalog (verdict). */
+	boolean_t hold_end;
+	boolean_t paused_end;
+	boolean_t release_end;
+	uint64_t reclaimed;
+	uint64_t released;
 } pr19262_export_fence_test_t;
 void pr19262_engine_export_fence_arm(spa_t *,
     pr19262_export_fence_test_t *);
+void pr19262_engine_fence_idle(spa_t *);
+/* L21 test: the checkpoint-pinned retired count and its counters. */
+void pr19262_engine_retired_pinned_report(spa_t *, uint64_t *, uint64_t *,
+    uint64_t *, uint64_t *, uint64_t *);
 #endif
 void pr19262_engine_hold_report(spa_t *, void *);
 int pr19262_engine_epoch(spa_t *, uint64_t, uint64_t *);

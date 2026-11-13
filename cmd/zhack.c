@@ -50,9 +50,18 @@
 #include <zfeature_common.h>
 #include <libzutil.h>
 #include <sys/metaslab_impl.h>
+#include <sys/dsl_scan.h>
+#include <sys/dsl_destroy.h>
+#include <sys/dsl_dataset.h>
+#include <sys/bpobj.h>
+#include <sys/vdev_reloc_engine.h>
+#include <pthread.h>
+#include <sys/spa_checkpoint.h>
 #include <libzpool.h>
 
 static importargs_t g_importargs;
+/* Test only (L11 driver): import an ACTIVE-labelled fixture. */
+static boolean_t g_force_active;
 static char *g_pool;
 static boolean_t g_readonly;
 static boolean_t g_dump_dbgmsg;
@@ -88,6 +97,11 @@ usage(void)
 	    "    -G               dump zfs_dbgmsg buffer before exiting\n"
 	    "\n"
 	    "    action idle <pool> [-f] [-t seconds]\n"
+	    "    action ckpt-discard <pool> [-s] [-t seconds]\n"
+	    "    action bulk-retire <pool> -m destroy|snap|rollback -D dataset\n"
+	    "        [-w MiB] [-S snap] [-P stride] [-t seconds] [-C] [-X] [-R]\n"
+	    "        [-K clone] [-f] [-s]\n"
+	    "        (also -m fill, -m free)\n"
 	    "        import the pool for a set time then export it\n"
 	    "        -t <seconds> sets the time the pool is imported\n"
 	    "\n"
@@ -231,7 +245,7 @@ zhack_import(char *target, boolean_t readonly)
 	dmu_objset_register_type(DMU_OST_ZFS, space_delta_cb);
 
 	g_readonly = readonly;
-	g_importargs.can_be_active = readonly;
+	g_importargs.can_be_active = readonly || g_force_active;
 	g_pool = strdup(target);
 
 	libpc_handle_t lpch = {
@@ -631,6 +645,717 @@ zhack_do_action_idle(int argc, char **argv)
 }
 
 /*
+ * Test only (L11 witness driver): import a pool read-write even if its
+ * labels say ACTIVE (a power-cut fixture), let the checkpoint discard
+ * thread run for up to -t seconds, report progress once a second, then
+ * (-s) scrub it and run the engine's invariant check.  main() exports.
+ */
+/*
+ * Test only (minors triage, L11 r2(c)): a paced client writer that
+ * rewrites a fixed region of one object while the discard runs.
+ */
+typedef struct l11w {
+	objset_t *os;
+	uint64_t obj;
+	uint64_t bs;
+	uint64_t nblk;
+	int rate;
+	int secs;
+	volatile int stop;
+	volatile int running;
+	volatile uint64_t written;
+	volatile uint64_t enospc;
+	volatile uint64_t other;
+} l11w_t;
+
+static void *
+l11w_thread(void *arg)
+{
+	l11w_t *w = arg;
+	uint64_t *buf = kmem_alloc(w->bs, KM_SLEEP);
+	/* Admission may refuse at first (no run left): retry. */
+	for (;;) {
+		dmu_tx_t *tx = dmu_tx_create(w->os);
+		dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+		int err = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (err == 0) {
+			w->obj = dmu_object_alloc(w->os, DMU_OT_UINT64_OTHER,
+			    (int)w->bs, DMU_OT_NONE, 0, tx);
+			dmu_tx_commit(tx);
+			break;
+		}
+		dmu_tx_abort(tx);
+		w->enospc += err == ENOSPC;
+		w->other += err != ENOSPC;
+		if (w->stop) {
+			kmem_free(buf, w->bs);
+			return (NULL);
+		}
+		(void) usleep(200000);
+	}
+	(void) printf("L11_W phase=object obj=%llu refusals=%llu\n",
+	    (u_longlong_t)w->obj, (u_longlong_t)(w->enospc + w->other));
+	(void) fflush(stdout);
+	hrtime_t start = gethrtime();
+	uint64_t i = 0;
+	w->running = 1;
+	while (!w->stop) {
+		hrtime_t now = gethrtime() - start;
+		if (now >= (hrtime_t)w->secs * NANOSEC)
+			break;
+		uint64_t due = (uint64_t)(now / (NANOSEC / 1000)) *
+		    (uint64_t)w->rate / 1000;
+		if (i >= due) {
+			(void) usleep(2000);
+			continue;
+		}
+		uint64_t off = (i % w->nblk) * w->bs;
+		dmu_tx_t *tx = dmu_tx_create(w->os);
+		dmu_tx_hold_write(tx, w->obj, off, w->bs);
+		int err = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (err != 0) {
+			dmu_tx_abort(tx);
+			if (err == ENOSPC)
+				w->enospc++;
+			else
+				w->other++;
+			(void) usleep(100000);
+			i++;
+			continue;
+		}
+		uint64_t x = 0x9E3779B97F4A7C15ULL ^ (i + 1);
+		for (uint64_t k = 0; k < w->bs / sizeof (uint64_t); k++) {
+			x ^= x << 13;
+			x ^= x >> 7;
+			x ^= x << 17;
+			buf[k] = x;
+		}
+		dmu_write(w->os, w->obj, off, w->bs, buf, tx, 0);
+		dmu_tx_commit(tx);
+		w->written++;
+		i++;
+	}
+	kmem_free(buf, w->bs);
+	w->running = 0;
+	return (NULL);
+}
+
+static void
+zhack_do_action_ckpt_discard(int argc, char **argv)
+{
+	spa_t *spa;
+	char *target, *tmp;
+	int limit = 60, c;
+	boolean_t scrub = B_FALSE;
+	l11w_t w = { .bs = 131072, .nblk = 128, .rate = 0, .secs = 0 };
+	int discard_at = -1;
+	/* L14 r2(a) cell: a retired limit set after the import (0: kept). */
+	uint64_t retired_limit = 0;
+
+	optind = 1;
+	while ((c = getopt(argc, argv, "+st:w:W:b:n:D:L:")) != -1) {
+		switch (c) {
+		case 'L':
+			retired_limit = strtoull(optarg, &tmp, 0);
+			break;
+		case 'D':
+			discard_at = strtol(optarg, &tmp, 0);
+			break;
+		case 'w':
+			w.rate = strtol(optarg, &tmp, 0);
+			break;
+		case 'W':
+			w.secs = strtol(optarg, &tmp, 0);
+			break;
+		case 'b':
+			w.bs = strtoull(optarg, &tmp, 0);
+			break;
+		case 'n':
+			w.nblk = strtoull(optarg, &tmp, 0);
+			break;
+		case 's':
+			scrub = B_TRUE;
+			break;
+		case 't':
+			limit = strtol(optarg, &tmp, 0);
+			if (*tmp || limit < 0)
+				usage();
+			break;
+		default:
+			usage();
+			break;
+		}
+	}
+	argc -= optind;
+	argv += optind;
+	if (argc < 1)
+		usage();
+	target = argv[0];
+
+	g_force_active = B_TRUE;
+	(void) printf("L11_DRV phase=import pool=%s\n", target);
+	(void) fflush(stdout);
+	zhack_spa_open(target, B_FALSE, FTAG, &spa);
+	dsl_pool_t *dp = spa_get_dsl(spa);
+	(void) printf("L11_DRV phase=imported synced=%llu\n",
+	    (u_longlong_t)spa_last_synced_txg(spa));
+	(void) fflush(stdout);
+	if (retired_limit != 0) {
+		pr19262_engine_retired_limit(spa, retired_limit);
+		(void) printf("L14_R2A phase=limit limit=%llu\n",
+		    (u_longlong_t)retired_limit);
+	}
+	pthread_t wtid;
+	if (w.rate > 0) {
+		VERIFY0(dmu_objset_own(target, DMU_OST_ZFS, B_FALSE, B_FALSE,
+		    FTAG, &w.os));
+		VERIFY0(pthread_create(&wtid, NULL, l11w_thread, &w));
+		(void) printf("L11_W phase=start rate=%d secs=%d bs=%llu "
+		    "nblk=%llu synced=%llu\n", w.rate, w.secs,
+		    (u_longlong_t)w.bs, (u_longlong_t)w.nblk,
+		    (u_longlong_t)spa_last_synced_txg(spa));
+		(void) fflush(stdout);
+	}
+	boolean_t done = B_FALSE;
+	for (int t = 0; t <= limit; t++) {
+		if (t == discard_at) {
+			int derr = spa_checkpoint_discard(target);
+			(void) printf("L11_W phase=discard_issued t=%d "
+			    "error=%d synced=%llu\n", t, derr,
+			    (u_longlong_t)spa_last_synced_txg(spa));
+		}
+		boolean_t active = spa_feature_is_active(spa,
+		    SPA_FEATURE_POOL_CHECKPOINT);
+		(void) printf("L11_DRV phase=discard t=%d active=%d "
+		    "has_checkpoint=%d dspace=%llu suspended=%d synced=%llu\n",
+		    t, active, spa_has_checkpoint(spa),
+		    (u_longlong_t)spa->spa_checkpoint_info.sci_dspace,
+		    spa_suspended(spa),
+		    (u_longlong_t)spa_last_synced_txg(spa));
+		pr19262_engine_admit_report_t rep;
+		pr19262_engine_admit_report(spa, "l11w", &rep);
+		int64_t spare = (int64_t)rep.pages_free -
+		    (int64_t)rep.pages_total - 256;
+		uint64_t est = spare > 0 ? MIN((uint64_t)spare / 2, 256) : 0;
+		(void) printf("L11_W t=%d writer=%d written=%llu enospc=%llu "
+		    "other=%llu pages_free=%llu pages_total=%llu "
+		    "client_m=%llu budget_est=%llu dspace=%llu synced=%llu\n",
+		    t, w.running, (u_longlong_t)w.written,
+		    (u_longlong_t)w.enospc, (u_longlong_t)w.other,
+		    (u_longlong_t)rep.pages_free,
+		    (u_longlong_t)rep.pages_total,
+		    (u_longlong_t)rep.classes[PR19262_ADMIT_CLIENT].m_pages,
+		    (u_longlong_t)est,
+		    (u_longlong_t)spa->spa_checkpoint_info.sci_dspace,
+		    (u_longlong_t)spa_last_synced_txg(spa));
+		pr19262_retired_probe_t rp;
+		if (pr19262_engine_test_retired_probe(spa, &rp) == 0)
+			(void) printf("L14_R2A t=%d retired=%llu limit=%llu "
+			    "unflagged=%llu unflagged_owners=%llu "
+			    "draining=%llu stalled=%llu fence_error=%lld "
+			    "client_rejected=%llu arena_rejections=%llu "
+			    "headroom_rejections=%llu fence_waits=%llu "
+			    "fence_requests=%llu\n", t,
+			    (u_longlong_t)rp.retired, (u_longlong_t)rp.limit,
+			    (u_longlong_t)rp.unflagged,
+			    (u_longlong_t)rp.unflagged_owners,
+			    (u_longlong_t)rp.draining, (u_longlong_t)rp.stalled,
+			    (longlong_t)rp.fence_error,
+			    (u_longlong_t)rp.client_rejected,
+			    (u_longlong_t)rp.arena_rejections,
+			    (u_longlong_t)rp.headroom_rejections,
+			    (u_longlong_t)rp.fence_waits,
+			    (u_longlong_t)rp.fence_requests);
+		(void) fflush(stdout);
+		if (!active) {
+			done = B_TRUE;
+			break;
+		}
+		if (t < limit)
+			(void) sleep(1);
+	}
+	(void) printf("L11_DRV phase=discard_result done=%d\n", done);
+	(void) fflush(stdout);
+	if (w.rate > 0) {
+		w.stop = 1;
+		VERIFY0(pthread_join(wtid, NULL));
+		txg_wait_synced(dp, 0);
+		dmu_objset_disown(w.os, B_FALSE, FTAG);
+		(void) printf("L11_W phase=stop written=%llu enospc=%llu "
+		    "other=%llu\n", (u_longlong_t)w.written,
+		    (u_longlong_t)w.enospc, (u_longlong_t)w.other);
+		(void) fflush(stdout);
+	}
+	if (done && scrub) {
+		VERIFY0(spa_scan(spa, POOL_SCAN_SCRUB, 0));
+		txg_wait_synced(dp, 0);
+		int waited = 0;
+		while (dsl_scan_scrubbing(dp) && waited++ < 600) {
+			txg_wait_synced(dp, 0);
+			(void) sleep(1);
+		}
+		vdev_stat_t *vs = &spa->spa_root_vdev->vdev_stat;
+		dsl_scan_phys_t *scn = &dp->dp_scan->scn_phys;
+		(void) printf("L11_DRV phase=scrub state=%llu errors=%llu "
+		    "examined=%llu read_errors=%llu cksum_errors=%llu "
+		    "errlog=%llu\n", (u_longlong_t)scn->scn_state,
+		    (u_longlong_t)scn->scn_errors,
+		    (u_longlong_t)scn->scn_examined,
+		    (u_longlong_t)vs->vs_read_errors,
+		    (u_longlong_t)vs->vs_checksum_errors,
+		    (u_longlong_t)spa_approx_errlog_size(spa));
+		(void) fflush(stdout);
+	}
+	if (done)
+		pr19262_engine_check(spa, "l11-driver-end");
+	(void) printf("L11_DRV phase=close\n");
+	(void) fflush(stdout);
+	spa_close(spa, FTAG);
+}
+
+/*
+ * Test only (L13 witness driver).  Import a pool read-write (also an
+ * ACTIVE-labelled fixture), start one bulk retirement and report once a
+ * second until the async destroy is done or the pool suspends:
+ *   destroy   destroy dataset D (bptree);
+ *   snap      snapshot D, free every file of D's head (the snapshot keeps
+ *             the blocks), destroy the snapshot (free bpobj);
+ *   rollback  roll D back to its latest snapshot (bptree of the discarded
+ *             head);
+ *   free      free every file of D (dmu_free_long_range, long-free pacing;
+ *             under -C the frees only mark owners checkpoint-only);
+ *   snaprace  with -S S: free every file of D and destroy D@S one second
+ *             into it (the free was priced with D@S keeping the blocks);
+ *   fill      (fixture prep) with -S, snapshot D@S first; write up to -w
+ *             MiB in 4K blocks to a new object of D, stop at the first
+ *             error (admission refuses at low catalog headroom), export;
+ *             with -P stride, -w 4K blocks, one per stride bytes (sparse);
+ *             with -S and -K C, clone D@S to C and fill the clone.
+ * -C takes a pool checkpoint before the retirement; -X discards it after
+ * the retirement loop and reports until the drain and the destroy end.
+ * -R holds every owner release (engine_owner_releasable) until the end,
+ * then -f dispatches one fence and reports it.  -s scrubs and runs the
+ * engine check.  On a suspension the process exits 3 without export.
+ */
+static void
+zhack_l13_report(spa_t *spa, const char *phase, int t)
+{
+	dsl_pool_t *dp = spa_get_dsl(spa);
+	char buf[768];
+	pr19262_engine_l13_status(spa, buf, sizeof (buf));
+	uint64_t freeing = dp->dp_free_dir != NULL ?
+	    dsl_dir_phys(dp->dp_free_dir)->dd_used_bytes : 0;
+	(void) printf("L13_DRV phase=%s t=%d synced=%llu suspended=%d "
+	    "async_destroying=%d bptree=%llu free_bpobj_empty=%d "
+	    "freeing=%llu %s\n", phase, t,
+	    (u_longlong_t)spa_last_synced_txg(spa), spa_suspended(spa),
+	    dp->dp_scan->scn_async_destroying,
+	    (u_longlong_t)dp->dp_bptree_obj,
+	    bpobj_is_empty(&dp->dp_free_bpobj), (u_longlong_t)freeing, buf);
+	(void) fflush(stdout);
+}
+
+static boolean_t
+zhack_l13_idle(spa_t *spa)
+{
+	dsl_pool_t *dp = spa_get_dsl(spa);
+	uint64_t freeing = dp->dp_free_dir != NULL ?
+	    dsl_dir_phys(dp->dp_free_dir)->dd_used_bytes : 0;
+	return (!dp->dp_scan->scn_async_destroying &&
+	    bpobj_is_empty(&dp->dp_free_bpobj) && freeing == 0 &&
+	    spa->spa_livelists_to_delete == 0);
+}
+
+static void
+zhack_l13_suspended_exit(spa_t *spa, int t)
+{
+	for (int i = 0; i < 3; i++) {
+		(void) sleep(1);
+		zhack_l13_report(spa, "suspended", t + i + 1);
+	}
+	(void) printf("L13_DRV phase=suspended_exit\n");
+	(void) fflush(stdout);
+	dump_debug_buffer();
+	_exit(3);
+}
+
+/* A sync task (destroy, rollback) waits forever on a suspended pool. */
+static void *
+zhack_l13_watchdog(void *arg)
+{
+	spa_t *spa = arg;
+	for (int t = 0; ; t++) {
+		if (spa_suspended(spa)) {
+			zhack_l13_report(spa, "watchdog", t);
+			zhack_l13_suspended_exit(spa, t);
+		}
+		(void) sleep(1);
+	}
+	return (NULL);
+}
+
+/* Wait for one more txg to sync, or for a suspension (no hang). */
+static boolean_t
+zhack_l13_wait_txg(spa_t *spa, int t)
+{
+	uint64_t want = spa_last_synced_txg(spa) + 1;
+	txg_kick(spa_get_dsl(spa), want);
+	for (int i = 0; i < 600; i++) {
+		if (spa_suspended(spa)) {
+			zhack_l13_report(spa, "suspended", t);
+			return (B_FALSE);
+		}
+		if (spa_last_synced_txg(spa) >= want)
+			return (B_TRUE);
+		(void) usleep(100000);
+	}
+	return (B_TRUE);
+}
+
+static int
+zhack_l13_snapshot(const char *snap)
+{
+	nvlist_t *snaps = fnvlist_alloc();
+	fnvlist_add_boolean(snaps, snap);
+	int err = dsl_dataset_snapshot(snaps, NULL, NULL);
+	fnvlist_free(snaps);
+	(void) printf("L13_DRV phase=snapshot name=%s err=%d\n", snap, err);
+	(void) fflush(stdout);
+	return (err);
+}
+
+static int
+zhack_l13_free_head(const char *ds)
+{
+	objset_t *os;
+	uint64_t obj = 0, files = 0, bytes = 0;
+	int err = dmu_objset_own(ds, DMU_OST_ZFS, B_FALSE, B_TRUE, FTAG, &os);
+	if (err != 0)
+		return (err);
+	while (err == 0 && dmu_object_next(os, &obj, B_FALSE, 0) == 0) {
+		dmu_object_info_t doi;
+		/* ZPL files, and the objects -m fill wrote. */
+		if (dmu_object_info(os, obj, &doi) != 0 ||
+		    (doi.doi_type != DMU_OT_PLAIN_FILE_CONTENTS &&
+		    doi.doi_type != DMU_OT_UINT64_OTHER))
+			continue;
+		bytes += doi.doi_physical_blocks_512 << 9;
+		err = dmu_free_long_range(os, obj, 0, DMU_OBJECT_END);
+		files++;
+	}
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	(void) printf("L13_DRV phase=head_freed files=%llu bytes=%llu err=%d\n",
+	    (u_longlong_t)files, (u_longlong_t)bytes, err);
+	(void) fflush(stdout);
+	return (err);
+}
+
+static int
+zhack_l13_write(const char *ds, uint64_t mib, uint64_t stride)
+{
+	objset_t *os;
+	int err = dmu_objset_own(ds, DMU_OST_ZFS, B_FALSE, B_TRUE, FTAG, &os);
+	if (err != 0)
+		return (err);
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
+	if (err != 0) {
+		dmu_tx_abort(tx);
+		dmu_objset_disown(os, B_TRUE, FTAG);
+		return (err);
+	}
+	uint64_t obj = dmu_object_alloc(os, DMU_OT_UINT64_OTHER, 4096,
+	    DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	/* stride != 0: mib 4K blocks, one per stride bytes (sparse). */
+	const uint64_t chunk = stride != 0 ? 4096 : 1ULL << 20;
+	uint64_t *buf = kmem_alloc(1ULL << 20, KM_SLEEP);
+	uint64_t x = 0x9e3779b97f4a7c15ULL, off;
+	uint64_t step = stride != 0 ? stride : chunk;
+	uint64_t end = stride != 0 ? mib * stride : (mib << 20);
+	for (off = 0; off < end; off += step) {
+		for (uint64_t i = 0; i < chunk / sizeof (uint64_t); i++) {
+			x ^= x << 13;
+			x ^= x >> 7;
+			x ^= x << 17;
+			buf[i] = x;
+		}
+		tx = dmu_tx_create(os);
+		dmu_tx_hold_write(tx, obj, off, chunk);
+		err = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (err != 0) {
+			dmu_tx_abort(tx);
+			break;
+		}
+		dmu_write(os, obj, off, chunk, buf, tx, 0);
+		dmu_tx_commit(tx);
+	}
+	kmem_free(buf, 1ULL << 20);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	(void) printf("L13_DRV phase=written obj=%llu bytes=%llu err=%d\n",
+	    (u_longlong_t)obj, (u_longlong_t)off, err);
+	(void) fflush(stdout);
+	return (err);
+}
+
+/*
+ * The snap cell frees ZPL files, which dirties their dnodes: user
+ * accounting needs their ids.  The fixtures' files are root's (uid, gid
+ * and generation 0, default project).
+ */
+static int
+zhack_l13_space_delta_cb(dmu_object_type_t bonustype, const void *data,
+    zfs_file_info_t *zoi)
+{
+	if (bonustype != DMU_OT_ZNODE && bonustype != DMU_OT_SA)
+		return (ENOENT);
+	zoi->zfi_project = ZFS_DEFAULT_PROJID;
+	if (data == NULL)
+		return (EEXIST);
+	zoi->zfi_user = 0;
+	zoi->zfi_group = 0;
+	zoi->zfi_generation = 0;
+	return (0);
+}
+
+/* snaprace: free D's files in a thread while D@S is destroyed. */
+static void *
+zhack_l13_free_thread(void *arg)
+{
+	(void) zhack_l13_free_head(arg);
+	return (NULL);
+}
+
+static void
+zhack_do_action_bulk_retire(int argc, char **argv)
+{
+	spa_t *spa;
+	char *target, *tmp, *mode = NULL, *ds = NULL, *fillsnap = NULL;
+	char *clone = NULL;
+	char snap[ZFS_MAX_DATASET_NAME_LEN];
+	int limit = 120, c, err = 0;
+	uint64_t mib = 64;
+	boolean_t scrub = B_FALSE, hold = B_FALSE, fence = B_FALSE;
+	boolean_t ckpt = B_FALSE, xdiscard = B_FALSE;
+	uint64_t sparse = 0;
+
+	optind = 1;
+	while ((c = getopt(argc, argv, "+m:D:w:S:P:K:t:CXRfs")) != -1) {
+		switch (c) {
+		case 'K':
+			clone = optarg;
+			break;
+		case 'P':
+			sparse = strtoull(optarg, &tmp, 0);
+			if (*tmp)
+				usage();
+			break;
+		case 'C':
+			ckpt = B_TRUE;
+			break;
+		case 'X':
+			xdiscard = B_TRUE;
+			break;
+		case 'S':
+			fillsnap = optarg;
+			break;
+		case 'm':
+			mode = optarg;
+			break;
+		case 'D':
+			ds = optarg;
+			break;
+		case 'w':
+			mib = strtoull(optarg, &tmp, 0);
+			if (*tmp)
+				usage();
+			break;
+		case 't':
+			limit = strtol(optarg, &tmp, 0);
+			if (*tmp || limit < 0)
+				usage();
+			break;
+		case 'R':
+			hold = B_TRUE;
+			break;
+		case 'f':
+			fence = B_TRUE;
+			break;
+		case 's':
+			scrub = B_TRUE;
+			break;
+		default:
+			usage();
+			break;
+		}
+	}
+	argc -= optind;
+	argv += optind;
+	if (argc < 1 || mode == NULL || ds == NULL)
+		usage();
+	target = argv[0];
+
+	g_force_active = B_TRUE;
+	pr19262_l13_hold_release = hold;
+	(void) printf("L13_DRV phase=import pool=%s mode=%s dataset=%s "
+	    "hold_release=%d\n", target, mode, ds, hold);
+	(void) fflush(stdout);
+	zhack_spa_open(target, B_FALSE, FTAG, &spa);
+	dmu_objset_register_type(DMU_OST_ZFS, zhack_l13_space_delta_cb);
+	dsl_pool_t *dp = spa_get_dsl(spa);
+	zhack_l13_report(spa, "imported", 0);
+	pthread_t wd;
+	VERIFY0(pthread_create(&wd, NULL, zhack_l13_watchdog, spa));
+	/* Let an import's own async work (a resumed destroy) finish first. */
+	for (int t = 0; t < limit && !zhack_l13_idle(spa); t++) {
+		if (spa_suspended(spa))
+			zhack_l13_suspended_exit(spa, t);
+		(void) sleep(1);
+		zhack_l13_report(spa, "resume", t + 1);
+	}
+	if (ckpt) {
+		err = spa_checkpoint(target);
+		(void) printf("L13_DRV phase=checkpoint err=%d\n", err);
+		zhack_l13_report(spa, "checkpointed", 0);
+	}
+	if (err != 0) {
+		/* No retirement without the checkpoint the cell asked for. */
+	} else if (strcmp(mode, "destroy") == 0) {
+		err = dsl_destroy_head(ds);
+	} else if (strcmp(mode, "snap") == 0) {
+		(void) snprintf(snap, sizeof (snap), "%s@l13s", ds);
+		err = zhack_l13_snapshot(snap);
+		if (err == 0)
+			err = zhack_l13_free_head(ds);
+		if (err == 0) {
+			txg_wait_synced(dp, 0);
+			zhack_l13_report(spa, "head_freed", 0);
+			err = dsl_destroy_snapshot(snap, B_FALSE);
+		}
+	} else if (strcmp(mode, "free") == 0) {
+		err = zhack_l13_free_head(ds);
+	} else if (strcmp(mode, "snaprace") == 0 && fillsnap != NULL) {
+		/* -S S: destroy D@S one second into the free of D's files. */
+		(void) snprintf(snap, sizeof (snap), "%s@%s", ds, fillsnap);
+		pthread_t ft;
+		VERIFY0(pthread_create(&ft, NULL, zhack_l13_free_thread, ds));
+		(void) sleep(1);
+		err = dsl_destroy_snapshot(snap, B_FALSE);
+		(void) printf("L13_DRV phase=snapdestroy name=%s err=%d\n",
+		    snap, err);
+		(void) fflush(stdout);
+		VERIFY0(pthread_join(ft, NULL));
+	} else if (strcmp(mode, "rollback") == 0) {
+		nvlist_t *result = fnvlist_alloc();
+		err = dsl_dataset_rollback(ds, NULL, NULL, result);
+		(void) printf("L13_DRV phase=rollback target=%s err=%d\n",
+		    nvlist_exists(result, "target") ?
+		    fnvlist_lookup_string(result, "target") : "-", err);
+		fnvlist_free(result);
+	} else if (strcmp(mode, "fill") == 0) {
+		if (fillsnap != NULL) {
+			(void) snprintf(snap, sizeof (snap), "%s@%s", ds,
+			    fillsnap);
+			err = zhack_l13_snapshot(snap);
+		}
+		/* -K: clone the snapshot and fill the clone (livelist). */
+		if (err == 0 && clone != NULL && fillsnap != NULL) {
+			err = dsl_dataset_clone(clone, snap);
+			(void) printf("L13_DRV phase=clone name=%s origin=%s "
+			    "err=%d\n", clone, snap, err);
+			ds = clone;
+		}
+		/* The write stops at the first error: that is the fill. */
+		if (err == 0)
+			(void) zhack_l13_write(ds, mib, sparse);
+		txg_wait_synced(dp, 0);
+		txg_wait_synced(dp, 0);
+		zhack_l13_report(spa, "filled", 0);
+		spa_close(spa, FTAG);
+		return;
+	} else {
+		usage();
+	}
+	(void) printf("L13_DRV phase=started mode=%s err=%d\n", mode, err);
+	(void) fflush(stdout);
+	boolean_t done = B_FALSE;
+	for (int t = 0; err == 0 && t <= limit; t++) {
+		zhack_l13_report(spa, "retire", t);
+		if (spa_suspended(spa))
+			zhack_l13_suspended_exit(spa, t);
+		if (zhack_l13_idle(spa) && t > 0) {
+			done = B_TRUE;
+			break;
+		}
+		if (t < limit)
+			(void) sleep(1);
+	}
+	(void) printf("L13_DRV phase=retire_result done=%d\n", done);
+	(void) fflush(stdout);
+	if (xdiscard && err == 0) {
+		int derr = spa_checkpoint_discard(target);
+		(void) printf("L13_DRV phase=discard err=%d\n", derr);
+		done = B_FALSE;
+		for (int t = 0; derr == 0 && t <= limit; t++) {
+			zhack_l13_report(spa, "drain", t);
+			if (!spa_feature_is_active(spa,
+			    SPA_FEATURE_POOL_CHECKPOINT) && zhack_l13_idle(spa)) {
+				done = B_TRUE;
+				break;
+			}
+			if (t < limit)
+				(void) sleep(1);
+		}
+		(void) printf("L13_DRV phase=drain_result done=%d\n", done);
+		(void) fflush(stdout);
+	}
+	/* Two more txgs: the store that lists the last retirements. */
+	for (int i = 0; done && i < 2; i++)
+		if (!zhack_l13_wait_txg(spa, limit))
+			zhack_l13_suspended_exit(spa, limit);
+	zhack_l13_report(spa, "retired", limit);
+	pr19262_l13_hold_release = 0;
+	if (done && fence) {
+		pr19262_engine_l13_fence_dispatch(spa);
+		/* Each fence waits for txgs; give it and its release time. */
+		for (int t = 0; t < 30; t++) {
+			(void) sleep(1);
+			zhack_l13_report(spa, "fence", t);
+			if (spa_suspended(spa))
+				zhack_l13_suspended_exit(spa, t);
+		}
+		for (int i = 0; i < 2; i++)
+			if (!zhack_l13_wait_txg(spa, 0))
+				zhack_l13_suspended_exit(spa, 0);
+	}
+	if (done && scrub) {
+		VERIFY0(spa_scan(spa, POOL_SCAN_SCRUB, 0));
+		int waited = 0;
+		while (dsl_scan_scrubbing(dp) && waited++ < 600) {
+			if (spa_suspended(spa))
+				zhack_l13_suspended_exit(spa, waited);
+			(void) sleep(1);
+		}
+		vdev_stat_t *vs = &spa->spa_root_vdev->vdev_stat;
+		dsl_scan_phys_t *scn = &dp->dp_scan->scn_phys;
+		(void) printf("L13_DRV phase=scrub state=%llu errors=%llu "
+		    "examined=%llu read_errors=%llu cksum_errors=%llu "
+		    "errlog=%llu\n", (u_longlong_t)scn->scn_state,
+		    (u_longlong_t)scn->scn_errors,
+		    (u_longlong_t)scn->scn_examined,
+		    (u_longlong_t)vs->vs_read_errors,
+		    (u_longlong_t)vs->vs_checksum_errors,
+		    (u_longlong_t)spa_approx_errlog_size(spa));
+		(void) fflush(stdout);
+	}
+	if (done)
+		pr19262_engine_check(spa, "l13-driver-end");
+	zhack_l13_report(spa, "close", 0);
+	spa_close(spa, FTAG);
+}
+
+/*
  * Collect the mirror legs this host could not open.  vdev_not_present is set
  * during import for any leaf whose open failed (vdev.c), and a leg in that
  * state is what the relaxed claim forgives, so it is also what has to be
@@ -814,6 +1539,10 @@ zhack_do_action(int argc, char **argv)
 	subcommand = argv[0];
 	if (strcmp(subcommand, "idle") == 0) {
 		zhack_do_action_idle(argc, argv);
+	} else if (strcmp(subcommand, "ckpt-discard") == 0) {
+		zhack_do_action_ckpt_discard(argc, argv);
+	} else if (strcmp(subcommand, "bulk-retire") == 0) {
+		zhack_do_action_bulk_retire(argc, argv);
 	} else {
 		(void) fprintf(stderr, "error: unknown subcommand: %s\n",
 		    subcommand);

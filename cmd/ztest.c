@@ -12002,13 +12002,25 @@ pr19262_runtime_wait_park(spa_t *spa, boolean_t writers)
 	VERIFY3U(pr19262_engine_waiting(spa, writers), >, 0);
 }
 
+/*
+ * Copy bp's DVAs (the first one with the race leg) to backing laid out for
+ * the parity epoch born at birth.  The caller holds an open fence
+ * transaction at txg, so the pool syncs no further than txg - 1 meanwhile.
+ */
 static void
 pr19262_runtime_move(spa_t *spa, blkptr_t *bp, uint64_t birth,
-    void *data, uint64_t size, boolean_t races)
+    uint64_t txg, void *data, uint64_t size, boolean_t races)
 {
 	blkptr_t original = *bp;
 	pr19262_engine_info_t before, after;
 	void *copy;
+	/*
+	 * Pin the copy's write TXG: engine_copy_io() issues the transfer write
+	 * at spa_last_synced_txg() + 1, which is txg once txg - 1 has synced.
+	 */
+	txg_wait_synced(spa->spa_dsl_pool, txg - 1);
+	VERIFY3U(spa_last_synced_txg(spa) + 1, ==, txg);
+	VERIFY3U(txg, >, birth);
 	pr19262_engine_inspect(spa, bp, 0, &before);
 	uint64_t free = pr19262_engine_limit(spa, B_TRUE);
 	VERIFY0(pr19262_engine_copy_begin(spa, bp, 0, birth, &copy));
@@ -12068,7 +12080,27 @@ pr19262_runtime_move(spa_t *spa, blkptr_t *bp, uint64_t birth,
 	pr19262_engine_inspect(spa, bp, 0, &after);
 	VERIFY3U(after.p, !=, before.p);
 	VERIFY3U(after.vsize, ==, before.vsize);
-	VERIFY3U(after.birth, ==, birth);
+	/*
+	 * Concrete birth (2026-10-28): the requested epoch birth selects the
+	 * copy's layout (engine_copy_begin()); P's birth is the operation TXG
+	 * of the copy's own transfer write (pr19262_engine_dispatch()), here
+	 * the pinned txg, which is past the epoch.  The P size check below
+	 * only shows agreement with engine_copy_begin(): txg is in the same
+	 * epoch, so it cannot tell which TXG chose the layout.  (An unwritten
+	 * rebind binds the BP's physical birth instead; this test copies
+	 * written blocks only.)
+	 */
+	VERIFY3U(spa_last_synced_txg(spa) + 1, ==, txg);
+	VERIFY3U(after.birth, ==, txg);
+	VERIFY3U(after.birth, >, birth);
+	vdev_t *vd = pr19262_engine_vdev(spa);
+	VERIFY3U(after.psize, ==, vdev_psize_to_asize_txg(vd,
+	    DVA_GET_GANG(&bp->blk_dva[0]) ? vdev_gang_header_psize(vd) :
+	    BP_GET_PSIZE(bp), birth));
+	(void) printf("PR19262_RUNTIME_MOVE_BIRTH epoch=%llu write_txg=%llu "
+	    "p_birth=%llu p_size=%llu\n", (u_longlong_t)birth,
+	    (u_longlong_t)txg, (u_longlong_t)after.birth,
+	    (u_longlong_t)after.psize);
 	VERIFY3U(after.versions, ==, before.versions + 1);
 	if (races) {
 		VERIFY3U(before.psize, ==, 160 * 1024);
@@ -12299,15 +12331,17 @@ pr19262_runtime_test(spa_t *spa)
 	txg_wait_synced(spa->spa_dsl_pool, 0);
 	fence = dmu_tx_create(os);
 	VERIFY0(dmu_tx_assign(fence, DMU_TX_WAIT));
-	pr19262_runtime_move(spa, &bp[0], birth, data, size, B_TRUE);
+	pr19262_runtime_move(spa, &bp[0], birth, dmu_tx_get_txg(fence), data,
+	    size, B_TRUE);
 	for (uint64_t i = 0; i < blocks; i++)
 		pr19262_runtime_raw(spa, &bp[i], data, size);
 	pr19262_engine_check(spa, "live-shared-data-changed-asize");
 	blkptr_t moving_mos = spa->spa_uberblock.ub_rootbp;
-	pr19262_runtime_move(spa, &moving_mos, birth, NULL,
-	    BP_GET_PSIZE(&moving_mos), B_FALSE);
+	pr19262_runtime_move(spa, &moving_mos, birth, dmu_tx_get_txg(fence),
+	    NULL, BP_GET_PSIZE(&moving_mos), B_FALSE);
 	pr19262_engine_check(spa, "live-MOS-copy");
-	pr19262_runtime_move(spa, &headbp, birth, NULL, size, B_FALSE);
+	pr19262_runtime_move(spa, &headbp, birth, dmu_tx_get_txg(fence), NULL,
+	    size, B_FALSE);
 	pr19262_runtime_raw(spa, &headbp, readback, size);
 	pr19262_engine_check(spa, "live-gang-header-copy");
 	dmu_tx_commit(fence);
@@ -14874,8 +14908,13 @@ pr19262_epoch_birth(spa_t *spa, uint64_t parity)
 	ztest_pe_append_t append = { .pa_vdev = 0,
 	    .pa_width = vd->vdev_children, .pa_parity = parity,
 	    .pa_lead = TXG_CONCURRENT_STATES };
+	/*
+	 * The planned conversion's weak growth is already hidden from AVAIL
+	 * on top of the slop, so a pool that refuses clients (AVAIL 0) must
+	 * still start it: half the slop, as for other administrative changes.
+	 */
 	VERIFY0(dsl_sync_task(spa_name(spa), ztest_pe_append_check,
-	    ztest_pe_append_sync, &append, 5, ZFS_SPACE_CHECK_NORMAL));
+	    ztest_pe_append_sync, &append, 5, ZFS_SPACE_CHECK_RESERVED));
 	uint64_t birth = append.pa_table[3 * (append.pa_nent - 1)];
 	ztest_pe_wait_epoch(spa, birth);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
@@ -15114,6 +15153,10 @@ pr19262_convert_prepare(spa_t *spa)
 		pr19262_classes_prepare(spa);
 }
 
+static void pr19262_fence_stall_control(spa_t *,
+    const pr19262_engine_census_t *);
+static void pr19262_ckguest_c2(spa_t *);
+
 static void
 pr19262_convert_test(spa_t *spa)
 {
@@ -15156,6 +15199,8 @@ pr19262_convert_test(spa_t *spa)
 		VERIFY3U(pinned.fences, >, 0);
 		pr19262_census_report(spa, parity, "checkpoint-pinned", &c);
 		VERIFY3U(c.weak_retired, >, 0);
+		if (getenv("PR19262_ENGINE_FENCE_STALL_CONTROL") != NULL)
+			pr19262_fence_stall_control(spa, &c);
 		(void) printf("PR19262_CHECKPOINT_PIN_FENCES fences=%llu "
 		    "reclaimed=%llu\n", (u_longlong_t)pinned.fences,
 		    (u_longlong_t)pinned.reclaimed_bytes);
@@ -15176,6 +15221,8 @@ pr19262_convert_test(spa_t *spa)
 		(void) printf("PR19262_CHECKPOINT_PIN pinned=%llu "
 		    "reclaimed_after_discard=%llu\n",
 		    (u_longlong_t)pinned.copied, (u_longlong_t)reclaimed);
+		if (getenv("PR19262_ENGINE_FENCE_STALL_CONTROL") != NULL)
+			pr19262_ckguest_c2(spa);
 	}
 	uint64_t soak = pr19262_env_u64("PR19262_ENGINE_SOAK_SECONDS", 0);
 	pr19262_soak_overlap = soak != 0 &&
@@ -15692,10 +15739,13 @@ pr19262_full_verify(boolean_t readonly)
 }
 
 /*
- * AVAIL model: the deflated free physical space minus the larger of the
- * native slop and the deflated protected amount, plus the native blind
- * spot (allocated bytes no dataset is charged for, the MOS), which native
- * AVAIL overstates by as well.
+ * AVAIL model: the deflated free physical space minus the deflated exact
+ * parity growth of the weak backing and the larger of the native slop and
+ * the deflated rest of the protected amount, plus the native blind spot
+ * (allocated bytes no dataset is charged for, the MOS), which native AVAIL
+ * overstates by as well.  The weak growth sits on top of the slop, so a
+ * converted full pool still keeps its slop and freed space returns to
+ * clients.
  */
 static uint64_t
 pr19262_full_avail(spa_t *spa, objset_t *os, const char *label,
@@ -15707,17 +15757,21 @@ pr19262_full_avail(spa_t *spa, objset_t *os, const char *label,
 	dmu_objset_space(os, &refd, &avail, &objs, &aobjs);
 	uint64_t ratio = vd->vdev_deflate_ratio;
 	uint64_t free_d = (r->free >> SPA_MINBLOCKSHIFT) * ratio;
-	uint64_t protected_d = (r->protected >> SPA_MINBLOCKSHIFT) * ratio;
+	uint64_t conv = MIN(r->reserve_growth, r->protected);
+	uint64_t conv_d = (conv >> SPA_MINBLOCKSHIFT) * ratio;
+	uint64_t transient_d = ((r->protected - conv) >> SPA_MINBLOCKSHIFT) *
+	    ratio;
 	uint64_t slop = spa_get_slop_space(spa);
 	uint64_t dalloc = metaslab_class_get_dalloc(spa_normal_class(spa));
 	uint64_t charged = dsl_dir_phys(dp->dp_root_dir)->dd_used_bytes;
 	uint64_t blind = dalloc > charged ? dalloc - charged : 0;
-	uint64_t keep = MAX(slop, protected_d);
+	uint64_t keep = MAX(slop, transient_d) + conv_d;
 	uint64_t model = (free_d > keep ? free_d - keep : 0) + blind;
 	(void) printf("PR19262_FULL_AVAIL label=%s avail=%llu model=%llu "
-	    "free=%llu protected=%llu slop=%llu blind=%llu dalloc=%llu "
-	    "charged=%llu\n", label, (u_longlong_t)avail, (u_longlong_t)model,
-	    (u_longlong_t)r->free, (u_longlong_t)r->protected,
+	    "free=%llu protected=%llu conv=%llu slop=%llu blind=%llu "
+	    "dalloc=%llu charged=%llu\n", label, (u_longlong_t)avail,
+	    (u_longlong_t)model, (u_longlong_t)r->free,
+	    (u_longlong_t)r->protected, (u_longlong_t)conv,
 	    (u_longlong_t)slop, (u_longlong_t)blind, (u_longlong_t)dalloc,
 	    (u_longlong_t)charged);
 	return (avail);
@@ -16919,6 +16973,199 @@ static void pr19262_ckpt_payload_check(spa_t *, boolean_t);
 static void pr19262_ckpt_floor_churn(spa_t *, const uberblock_t *,
     uint64_t);
 
+/*
+ * A draining checkpoint space map and the fence (floor-flake, test only).
+ * Since L11 a fence may release, while a discard still drains, an owner
+ * no remaining checkpoint SM entry names (drain_releasable: an ordinary
+ * free, or a discard step whose processed prefix held the whole V; L14
+ * re-derives the flag at import).  What must never happen is the release
+ * of a V the map still names: the discard frees or retires that range
+ * later.  Check that property on the allocator, as zdb's checkpoint
+ * verification does: every range a remaining entry names is still
+ * allocated in its metaslab (in none of ms_allocatable, ms_freeing,
+ * ms_freed, ms_defer).  The discard thread is held while the map is read,
+ * so the map is stable; a V the fence freed is in ms_freeing, ms_freed or
+ * ms_defer until TXG_DEFER_SIZE txgs later, so it cannot have been
+ * allocated again by then.
+ */
+typedef struct pr19262_drain_oracle {
+	vdev_t *vd;
+	uint64_t segments;
+	uint64_t bytes;
+	uint64_t covered;
+	uint64_t bad_offset;
+	uint64_t bad_size;
+	int bad_tree;
+} pr19262_drain_oracle_t;
+
+static int
+pr19262_drain_named(space_map_entry_t *sme, void *arg)
+{
+	VERIFY3U(sme->sme_type, ==, SM_FREE);
+	zfs_range_tree_clear(arg, sme->sme_offset, sme->sme_run);
+	zfs_range_tree_add(arg, sme->sme_offset, sme->sme_run);
+	return (0);
+}
+
+static void
+pr19262_drain_oracle_segment(void *arg, uint64_t start, uint64_t size)
+{
+	pr19262_drain_oracle_t *o = arg;
+	vdev_t *vd = o->vd;
+	o->segments++;
+	o->bytes += size;
+	for (uint64_t s = start; s < start + size; ) {
+		VERIFY3U(s >> vd->vdev_ms_shift, <, vd->vdev_ms_count);
+		metaslab_t *ms = vd->vdev_ms[s >> vd->vdev_ms_shift];
+		uint64_t end = MIN(start + size, ms->ms_start + ms->ms_size);
+		mutex_enter(&ms->ms_lock);
+		while (ms->ms_condensing) {
+			mutex_exit(&ms->ms_lock);
+			(void) usleep(1000);
+			mutex_enter(&ms->ms_lock);
+		}
+		VERIFY0(metaslab_load(ms));
+		zfs_range_tree_t *trees[3 + TXG_DEFER_SIZE] = {
+		    ms->ms_allocatable, ms->ms_freeing, ms->ms_freed };
+		for (int t = 0; t < TXG_DEFER_SIZE; t++)
+			trees[3 + t] = ms->ms_defer[t];
+		for (int t = 0; t < 3 + TXG_DEFER_SIZE; t++) {
+			uint64_t found, length;
+			if (!zfs_range_tree_find_in(trees[t], s, end - s,
+			    &found, &length))
+				continue;
+			if (o->covered == 0) {
+				o->bad_offset = found;
+				o->bad_size = length;
+				o->bad_tree = t;
+			}
+			o->covered += length;
+		}
+		mutex_exit(&ms->ms_lock);
+		s = end;
+	}
+}
+
+/* Every range the remaining checkpoint SMs name, per top-level vdev. */
+static zfs_range_tree_t *
+pr19262_drain_named_load(vdev_t *vd)
+{
+	zfs_range_tree_t *named = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	    NULL, 0, 0);
+	space_map_t *sm = vd->vdev_checkpoint_sm;
+	if (sm != NULL)
+		VERIFY0(space_map_iterate(sm, space_map_length(sm),
+		    pr19262_drain_named, named));
+	return (named);
+}
+
+static void
+pr19262_drain_hold(spa_t *spa, boolean_t *held)
+{
+	if (*held || spa->spa_checkpoint_discard_zthr == NULL)
+		return;
+	zthr_cancel(spa->spa_checkpoint_discard_zthr);
+	*held = B_TRUE;
+}
+
+static void
+pr19262_drain_unhold(spa_t *spa, boolean_t *held)
+{
+	if (!*held)
+		return;
+	zthr_resume(spa->spa_checkpoint_discard_zthr);
+	*held = B_FALSE;
+}
+
+static void
+pr19262_drain_oracle(spa_t *spa, uint64_t released, boolean_t *held)
+{
+	pr19262_drain_hold(spa, held);
+	vdev_t *rvd = spa->spa_root_vdev;
+	pr19262_drain_oracle_t all = { 0 };
+	all.bad_tree = -1;
+	for (uint64_t c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *vd = rvd->vdev_child[c];
+		if (!vdev_is_concrete(vd) || vd->vdev_checkpoint_sm == NULL)
+			continue;
+		zfs_range_tree_t *named = pr19262_drain_named_load(vd);
+		pr19262_drain_oracle_t o = { .vd = vd, .bad_tree = -1 };
+		zfs_range_tree_walk(named, pr19262_drain_oracle_segment, &o);
+		zfs_range_tree_vacate(named, NULL, NULL);
+		zfs_range_tree_destroy(named);
+		if (all.covered == 0 && o.covered != 0) {
+			all.bad_offset = o.bad_offset;
+			all.bad_size = o.bad_size;
+			all.bad_tree = o.bad_tree;
+		}
+		all.segments += o.segments;
+		all.bytes += o.bytes;
+		all.covered += o.covered;
+	}
+	(void) printf("PR19262_DRAIN_ORACLE released=%llu sm_segments=%llu "
+	    "sm_bytes=%llu covered_free=%llu bad_offset=%llu bad_size=%llu "
+	    "bad_tree=%d\n", (u_longlong_t)released,
+	    (u_longlong_t)all.segments, (u_longlong_t)all.bytes,
+	    (u_longlong_t)all.covered, (u_longlong_t)all.bad_offset,
+	    (u_longlong_t)all.bad_size, all.bad_tree);
+	(void) fflush(NULL);
+	/* A draining checkpoint SM keeps every V it still names. */
+	VERIFY0(all.covered);
+	pr19262_drain_unhold(spa, held);
+}
+
+/*
+ * Negative control (PR19262_FLAKE_NEG_FLAG_COVERED): with the discard
+ * held, give one owner a remaining entry names the state a wrong
+ * drain_releasable flag would give it.  The fence then releases it through
+ * its real path, and the oracle above must fail.
+ */
+typedef struct pr19262_drain_neg {
+	zfs_range_tree_t *named;
+	spa_t *spa;
+	uint64_t v;
+	uint64_t flagged;
+} pr19262_drain_neg_t;
+
+static void
+pr19262_drain_neg_segment(void *arg, uint64_t start, uint64_t size)
+{
+	pr19262_drain_neg_t *n = arg;
+	if (n->flagged == 0)
+		n->flagged = pr19262_engine_test_flag_covered(n->spa, start,
+		    size, &n->v);
+}
+
+static void
+pr19262_drain_neg_sync(void *arg, dmu_tx_t *tx)
+{
+	pr19262_drain_neg_t *n = arg;
+	n->spa = dmu_tx_pool(tx)->dp_spa;
+	zfs_range_tree_walk(n->named, pr19262_drain_neg_segment, n);
+}
+
+static void
+pr19262_drain_neg(spa_t *spa, boolean_t *held)
+{
+	pr19262_drain_hold(spa, held);
+	vdev_t *vd = pr19262_engine_vdev(spa);
+	VERIFY3P(vd, !=, NULL);
+	VERIFY3P(vd->vdev_checkpoint_sm, !=, NULL);
+	pr19262_drain_neg_t n = { .named = pr19262_drain_named_load(vd) };
+	VERIFY0(dsl_sync_task(spa_name(spa), NULL, pr19262_drain_neg_sync,
+	    &n, 0, ZFS_SPACE_CHECK_NONE));
+	(void) printf("PR19262_DRAIN_NEG flagged=%llu v=%llu segments=%llu\n",
+	    (u_longlong_t)n.flagged, (u_longlong_t)n.v,
+	    (u_longlong_t)zfs_range_tree_numsegs(n.named));
+	(void) fflush(NULL);
+	zfs_range_tree_vacate(n.named, NULL, NULL);
+	zfs_range_tree_destroy(n.named);
+	VERIFY3U(n.flagged, !=, 0);
+	/* The flag reaches a durable catalog before the fence's floor. */
+	txg_wait_synced(spa->spa_dsl_pool, spa_last_synced_txg(spa) +
+	    TXG_CONCURRENT_STATES);
+}
+
 static int
 pr19262_engine_cold_import(const char *directory, boolean_t write,
     boolean_t crash)
@@ -16928,6 +17175,10 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 	spa_config_path = cache;
 	kernel_init(write ? SPA_MODE_READ | SPA_MODE_WRITE : SPA_MODE_READ);
 	pr19262_arc_limit(pr19262_env_u64("PR19262_ARC_MAX_MIB", 0));
+	/* floor-flake: e.g. zfs_spa_discard_memory_limit=32 (1 entry/step) */
+	const char *tunable = getenv("PR19262_FLAKE_TUNABLE");
+	if (tunable != NULL)
+		VERIFY0(handle_tunable_option(tunable, B_FALSE));
 	char *paths[] = { (char *)directory };
 	importargs_t args = { .paths = 1, .path = paths,
 	    .can_be_active = B_TRUE };
@@ -17008,6 +17259,17 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 	if (getenv("PR19262_ENGINE_COLD_FENCE") != NULL) {
 		VERIFY(write);
 		uint64_t floor, reclaimed, released;
+		boolean_t held = B_FALSE;
+		boolean_t draining_before = spa_feature_is_active(spa,
+		    SPA_FEATURE_POOL_CHECKPOINT) &&
+		    spa->spa_checkpoint_txg == 0;
+		/* Hold the drain so that this fence runs during it. */
+		if (draining_before &&
+		    getenv("PR19262_FLAKE_HOLD_DRAIN") != NULL)
+			pr19262_drain_hold(spa, &held);
+		if (draining_before &&
+		    getenv("PR19262_FLAKE_NEG_FLAG_COVERED") != NULL)
+			pr19262_drain_neg(spa, &held);
 		VERIFY0(pr19262_engine_fence(spa, &floor, &reclaimed,
 		    &released, NULL));
 		pr19262_census_report(spa, parity, "cold-fenced", &census);
@@ -17016,10 +17278,19 @@ pr19262_engine_cold_import(const char *directory, boolean_t write,
 		    (u_longlong_t)floor, (u_longlong_t)spa->spa_checkpoint_txg,
 		    (u_longlong_t)released, spa_feature_is_active(spa,
 		    SPA_FEATURE_POOL_CHECKPOINT));
-		/* A draining checkpoint SM releases no V. */
+		/*
+		 * A draining checkpoint SM releases no V it still names (it
+		 * may release drain_releasable owners, L11/L14): checked on
+		 * the allocator by pr19262_drain_oracle.  The pre-L11 form,
+		 * "releases no V", is kept behind PR19262_FLAKE_OLD_ASSERT.
+		 */
 		if (spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT) &&
-		    spa->spa_checkpoint_txg == 0)
-			VERIFY0(released);
+		    spa->spa_checkpoint_txg == 0) {
+			if (getenv("PR19262_FLAKE_OLD_ASSERT") != NULL)
+				VERIFY0(released);
+			pr19262_drain_oracle(spa, released, &held);
+		}
+		pr19262_drain_unhold(spa, &held);
 		if (getenv("PR19262_ENGINE_CKPT_FLOOR") != NULL &&
 		    spa->spa_checkpoint_txg != 0) {
 			uberblock_t checkpoint;
@@ -17270,6 +17541,540 @@ pr19262_export_fence_test(spa_t *spa)
 	cv_destroy(&test.changed);
 	mutex_destroy(&test.lock);
 	(void) printf("PR19262_EXPORT_FENCE_PASS\n");
+}
+
+/*
+ * L15 repro: a scheduled fence F1 whose catalog lists no retired byte it
+ * could return (direct fences just took them) ends while more than the
+ * retired limit is retired after that catalog.  Then the clients past the
+ * limit while the next fence F2 is pending, and a DMU writer.
+ */
+#define	PR19262_STALL_DS	"pr19262_tx/stall"
+#define	PR19262_STALL_BLOCK	131072ULL
+#define	PR19262_STALL_TRIES	6
+
+static uint64_t
+pr19262_stall_object(objset_t *os, uint64_t blocks, int fill)
+{
+	void *data = kmem_alloc(PR19262_STALL_BLOCK, KM_SLEEP);
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	dmu_tx_hold_write(tx, DMU_NEW_OBJECT, 0, blocks * PR19262_STALL_BLOCK);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
+	    PR19262_STALL_BLOCK, DMU_OT_NONE, 0, tx);
+	for (uint64_t i = 0; i < blocks; i++) {
+		memset(data, (int)(fill + i), PR19262_STALL_BLOCK);
+		dmu_write(os, object, i * PR19262_STALL_BLOCK,
+		    PR19262_STALL_BLOCK, data, tx, 0);
+	}
+	dmu_tx_commit(tx);
+	kmem_free(data, PR19262_STALL_BLOCK);
+	return (object);
+}
+
+static void
+pr19262_stall_free(spa_t *spa, objset_t *os, uint64_t object)
+{
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_free(tx, object, 0, DMU_OBJECT_END);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	VERIFY0(dmu_object_free(os, object, tx));
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+}
+
+/* Direct fences until one returns nothing; the fences returned. */
+static uint64_t
+pr19262_stall_drain(spa_t *spa, const char *label)
+{
+	uint64_t floor, reclaimed, released, n = 0;
+	for (uint_t i = 0; i < 16; i++) {
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		VERIFY0(pr19262_engine_fence(spa, &floor, &reclaimed,
+		    &released, NULL));
+		(void) printf("PR19262_FENCE_STALL_DRAIN label=%s i=%u "
+		    "floor=%llu reclaimed=%llu released=%llu\n", label, i,
+		    (u_longlong_t)floor, (u_longlong_t)reclaimed,
+		    (u_longlong_t)released);
+		if (reclaimed == 0 && released == 0)
+			break;
+		n++;
+	}
+	return (n);
+}
+
+static void
+pr19262_stall_probe(spa_t *spa, uint_t count, uint_t *enospc,
+    uint_t *restart, uint_t *other)
+{
+	for (uint_t i = 0; i < count; i++) {
+		int e = pr19262_engine_admit(spa, PR19262_ADMIT_CLIENT, 0, 0,
+		    0, 0);
+		*enospc += e == ENOSPC;
+		*restart += e == ERESTART;
+		*other += e != ENOSPC && e != ERESTART;
+	}
+}
+
+typedef struct pr19262_stall_writer {
+	objset_t *os;
+	uint64_t object;
+	kmutex_t lock;
+	kcondvar_t cv;
+	boolean_t done;
+	int error;
+	hrtime_t ns;
+} pr19262_stall_writer_t;
+
+static void
+pr19262_stall_writer_thread(void *arg)
+{
+	pr19262_stall_writer_t *w = arg;
+	void *data = kmem_alloc(4096, KM_SLEEP);
+	memset(data, 0x5a, 4096);
+	hrtime_t start = gethrtime();
+	dmu_tx_t *tx = dmu_tx_create(w->os);
+	dmu_tx_hold_write(tx, w->object, 0, 4096);
+	int error = dmu_tx_assign(tx, DMU_TX_WAIT);
+	if (error == 0) {
+		dmu_write(w->os, w->object, 0, 4096, data, tx, 0);
+		dmu_tx_commit(tx);
+	} else {
+		dmu_tx_abort(tx);
+	}
+	kmem_free(data, 4096);
+	mutex_enter(&w->lock);
+	w->error = error;
+	w->ns = gethrtime() - start;
+	w->done = B_TRUE;
+	cv_broadcast(&w->cv);
+	mutex_exit(&w->lock);
+	thread_exit();
+}
+
+static void
+pr19262_stall_report(spa_t *spa, const char *label)
+{
+	pr19262_engine_admit_report_t admit;
+	pr19262_engine_admit_report(spa, label, &admit);
+	pr19262_engine_census_t c;
+	pr19262_census_report(spa, 1, label, &c);
+}
+
+static void
+pr19262_fence_stall_test(spa_t *spa)
+{
+	dsl_pool_t *dp = spa->spa_dsl_pool;
+	char name[] = PR19262_STALL_DS;
+	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+	    ZIO_COMPRESS_OFF, B_FALSE));
+	objset_t *os;
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE, FTAG,
+	    &os));
+	uint64_t blocks = pr19262_env_u64("PR19262_ENGINE_FENCE_STALL_BLOCKS",
+	    64);
+	uint64_t limit = pr19262_env_u64("PR19262_ENGINE_FENCE_STALL_LIMIT_KIB",
+	    4096) << 10;
+	uint_t probes = pr19262_env_u64("PR19262_ENGINE_FENCE_STALL_PROBES",
+	    64);
+	uint64_t a[PR19262_STALL_TRIES];
+	for (uint_t i = 0; i < PR19262_STALL_TRIES; i++)
+		a[i] = pr19262_stall_object(os, blocks, 0x11 + i);
+	uint64_t b = pr19262_stall_object(os, blocks, 0x41);
+	uint64_t k = pr19262_stall_object(os, 1, 0x61);
+	txg_wait_synced(dp, 0);
+	txg_wait_synced(dp, 0);
+	(void) pr19262_stall_drain(spa, "setup");
+	pr19262_engine_retired_limit(spa, limit);
+	pr19262_export_fence_test_t test = { 0 };
+	mutex_init(&test.lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&test.changed, NULL, CV_DEFAULT, NULL);
+	/* Growth fences stay off while the test owns fence scheduling. */
+	pr19262_engine_export_fence_arm(spa, &test);
+	uint_t tries = 0;
+	boolean_t empty = B_FALSE;
+	for (; tries < PR19262_STALL_TRIES && !empty; tries++) {
+		/* A past the limit: a client schedules F1 (held at start). */
+		pr19262_stall_free(spa, os, a[tries]);
+		mutex_enter(&test.lock);
+		test.paused = test.task_done = test.paused_end = B_FALSE;
+		test.release = B_FALSE;
+		mutex_exit(&test.lock);
+		VERIFY3S(pr19262_engine_admit(spa, PR19262_ADMIT_CLIENT, 0, 0,
+		    0, 0), ==, ERESTART);
+		VERIFY(pr19262_export_fence_wait(&test, &test.paused,
+		    "f1-paused"));
+		/* Direct fences take what is listed (A, and metadata). */
+		(void) pr19262_stall_drain(spa, "before-f1");
+		/* F1 takes its catalog now and holds before its verdict. */
+		mutex_enter(&test.lock);
+		test.hold_end = B_TRUE;
+		test.release = B_TRUE;
+		cv_broadcast(&test.changed);
+		mutex_exit(&test.lock);
+		VERIFY(pr19262_export_fence_wait(&test, &test.paused_end,
+		    "f1-held"));
+		empty = test.reclaimed == 0 && test.released == 0;
+		(void) printf("PR19262_FENCE_STALL_F1 try=%u reclaimed=%llu "
+		    "released=%llu empty=%u\n", tries,
+		    (u_longlong_t)test.reclaimed,
+		    (u_longlong_t)test.released, empty);
+		if (empty)
+			break;
+		/* F1 returned something: no stall either way; again. */
+		mutex_enter(&test.lock);
+		test.release_end = B_TRUE;
+		cv_broadcast(&test.changed);
+		mutex_exit(&test.lock);
+		VERIFY(pr19262_export_fence_wait(&test, &test.task_done,
+		    "f1-done-retry"));
+		pr19262_engine_fence_idle(spa);
+		(void) pr19262_stall_drain(spa, "retry");
+	}
+	VERIFY(empty);
+	/* B retires after F1's catalog: listed only by a later root. */
+	pr19262_stall_free(spa, os, b);
+	txg_wait_synced(dp, 0);
+	pr19262_stall_report(spa, "stall-before-verdict");
+	mutex_enter(&test.lock);
+	/* F2 holds at its start. */
+	test.paused = test.task_done = B_FALSE;
+	test.release = B_FALSE;
+	test.release_end = B_TRUE;
+	cv_broadcast(&test.changed);
+	mutex_exit(&test.lock);
+	VERIFY(pr19262_export_fence_wait(&test, &test.task_done, "f1-done"));
+	pr19262_engine_fence_idle(spa);
+	/* The burst: clients past the limit while F2 is pending. */
+	uint_t enospc = 0, restart = 0, other = 0;
+	pr19262_stall_probe(spa, 1, &enospc, &restart, &other);
+	uint_t first = enospc ? ENOSPC : restart ? ERESTART : 0;
+	VERIFY(pr19262_export_fence_wait(&test, &test.paused, "f2-paused"));
+	pr19262_stall_probe(spa, probes - 1, &enospc, &restart, &other);
+	/* A DMU writer (DMU_TX_WAIT) while F2 is pending. */
+	pr19262_stall_writer_t w = { .os = os, .object = k };
+	mutex_init(&w.lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&w.cv, NULL, CV_DEFAULT, NULL);
+	kthread_t *writer = _thread_create(NULL, 0,
+	    pr19262_stall_writer_thread, &w, 0, NULL, TS_RUN | TS_JOINABLE,
+	    defclsyspri);
+	hrtime_t deadline = gethrtime() + SEC2NSEC(1);
+	mutex_enter(&w.lock);
+	while (!w.done && gethrtime() < deadline)
+		(void) cv_timedwait_hires(&w.cv, &w.lock, deadline,
+		    USEC2NSEC(1), CALLOUT_FLAG_ABSOLUTE);
+	boolean_t answered = w.done;
+	int early = w.error;
+	mutex_exit(&w.lock);
+	pr19262_stall_report(spa, "stall-burst");
+	/* F2 runs: its catalog lists B. */
+	mutex_enter(&test.lock);
+	test.release = B_TRUE;
+	cv_broadcast(&test.changed);
+	mutex_exit(&test.lock);
+	VERIFY0(thread_join(writer));
+	VERIFY(pr19262_export_fence_wait(&test, &test.task_done, "f2-done"));
+	pr19262_engine_fence_idle(spa);
+	uint_t after_enospc = 0, after_restart = 0, after_other = 0;
+	pr19262_stall_probe(spa, 1, &after_enospc, &after_restart,
+	    &after_other);
+	pr19262_stall_report(spa, "stall-after");
+	(void) printf("PR19262_FENCE_STALL_REPRO tries=%u f1_empty=%u "
+	    "limit=%llu object_bytes=%llu probes=%u first=%u enospc=%u "
+	    "erestart=%u other=%u writer_answered_while_pending=%u "
+	    "writer_early_error=%d writer_error=%d writer_ms=%llu "
+	    "after_admit=%s\n", tries, empty, (u_longlong_t)limit,
+	    (u_longlong_t)(blocks * PR19262_STALL_BLOCK), probes, first,
+	    enospc, restart, other, answered, answered ? early : -1, w.error,
+	    (u_longlong_t)NSEC2MSEC(w.ns), after_enospc ? "ENOSPC" :
+	    after_restart ? "ERESTART" : after_other ? "0" : "?");
+	pr19262_engine_export_fence_arm(spa, NULL);
+	pr19262_engine_retired_limit(spa, 64ULL << 20);
+	cv_destroy(&w.cv);
+	mutex_destroy(&w.lock);
+	cv_destroy(&test.changed);
+	mutex_destroy(&test.lock);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	pr19262_engine_check(spa, "fence-stall");
+}
+
+/*
+ * L21 witness (flips the L15 control): retired backing a pool checkpoint
+ * pins (listed, never returned while C exists) past the limit does not
+ * refuse clients and schedules no fence; client writes succeed while free
+ * space remains, and fences run only for bytes they can return.  With
+ * PR19262_ENGINE_CKGUEST_FILL the writes go on until the pool is full under
+ * C: ENOSPC then, from space, as native.  Growth fences stay on (not armed).
+ */
+#define	PR19262_CKGUEST_DS	"pr19262_tx/ckguest"
+#define	PR19262_CKGUEST_TX	(1ULL << 20)
+
+static int
+pr19262_ckguest_write(objset_t *os, uint64_t object, uint64_t off,
+    void *data, uint64_t *restarts)
+{
+	for (;;) {
+		dmu_tx_t *tx = dmu_tx_create(os);
+		dmu_tx_hold_write(tx, object, off, PR19262_CKGUEST_TX);
+		int error = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (error != 0) {
+			dmu_tx_abort(tx);
+			if (error == ERESTART) {
+				(*restarts)++;
+				continue;
+			}
+			return (error);
+		}
+		for (uint64_t o = 0; o < PR19262_CKGUEST_TX;
+		    o += PR19262_STALL_BLOCK) {
+			memset(data, (int)((off + o) >> 17), PR19262_STALL_BLOCK);
+			dmu_write(os, object, off + o, PR19262_STALL_BLOCK,
+			    data, tx, 0);
+		}
+		dmu_tx_commit(tx);
+		return (0);
+	}
+}
+
+static void
+pr19262_ckguest_pinned(spa_t *spa, const char *label)
+{
+	uint64_t retired, pinned, pinned_v, counts, passes;
+	pr19262_engine_retired_pinned_report(spa, &retired, &pinned,
+	    &pinned_v, &counts, &passes);
+	(void) printf("PR19262_CKGUEST_PINNED label=%s retired=%llu "
+	    "pinned=%llu pinned_v=%llu counts=%llu passes=%llu "
+	    "dspace=%llu ckpt_space=%llu\n", label, (u_longlong_t)retired,
+	    (u_longlong_t)pinned, (u_longlong_t)pinned_v,
+	    (u_longlong_t)counts, (u_longlong_t)passes,
+	    (u_longlong_t)spa_get_dspace(spa),
+	    (u_longlong_t)spa_get_checkpoint_space(spa));
+}
+
+static void
+pr19262_fence_stall_control(spa_t *spa, const pr19262_engine_census_t *c)
+{
+	boolean_t fill = getenv("PR19262_ENGINE_CKGUEST_FILL") != NULL;
+	uint64_t limit = MAX(c->retired_bytes / 2, 1);
+	uint64_t mib = pr19262_env_u64("PR19262_ENGINE_CKGUEST_MIB", 64);
+	pr19262_engine_retired_limit(spa, limit);
+	char name[] = PR19262_CKGUEST_DS;
+	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+	    ZIO_COMPRESS_OFF, B_FALSE));
+	objset_t *os;
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE, FTAG,
+	    &os));
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER,
+	    PR19262_STALL_BLOCK, DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	pr19262_engine_admit_report_t r0, r1, r2;
+	pr19262_engine_admit_report(spa, "ckguest-before", &r0);
+	pr19262_ckguest_pinned(spa, "ckguest-before");
+	hrtime_t t0 = gethrtime();
+	/* The L15 control's probes: client admissions past the limit. */
+	uint_t enospc = 0, restart = 0, other = 0, admitted = 0;
+	int first = pr19262_engine_admit(spa, PR19262_ADMIT_CLIENT, 0, 0, 0,
+	    0);
+	admitted += first == 0;
+	enospc += first == ENOSPC;
+	restart += first == ERESTART;
+	for (uint_t i = 0; i < 8; i++) {
+		int e = pr19262_engine_admit(spa, PR19262_ADMIT_CLIENT, 0, 0,
+		    0, 0);
+		admitted += e == 0;
+		enospc += e == ENOSPC;
+		restart += e == ERESTART;
+		other += e != 0 && e != ENOSPC && e != ERESTART;
+	}
+	/* Client writes under C: new data, then an overwrite of half. */
+	void *data = kmem_alloc(PR19262_STALL_BLOCK, KM_SLEEP);
+	uint64_t written = 0, restarts = 0, rewritten = 0;
+	int werr = 0;
+	uint64_t cap = fill ? (16ULL << 30) : mib << 20;
+	hrtime_t deadline = gethrtime() + SEC2NSEC(600);
+	while (written < cap && gethrtime() < deadline) {
+		werr = pr19262_ckguest_write(os, object, written, data,
+		    &restarts);
+		if (werr != 0)
+			break;
+		written += PR19262_CKGUEST_TX;
+	}
+	pr19262_engine_admit_report(spa, "ckguest-written", &r1);
+	pr19262_ckguest_pinned(spa, "ckguest-written");
+	uint64_t jbytes = 0, dspace_j0 = 0, dspace_j1 = 0;
+	if (!fill) {
+		VERIFY0(werr);
+		/* Overwrite half: retired bytes a fence can return. */
+		for (uint64_t off = 0; off < written / 2;
+		    off += PR19262_CKGUEST_TX) {
+			VERIFY0(pr19262_ckguest_write(os, object, off, data,
+			    &restarts));
+			rewritten += PR19262_CKGUEST_TX;
+		}
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		pr19262_ckguest_pinned(spa, "ckguest-rewritten");
+		/*
+		 * The guest's fsync pattern: synchronous writes bind journal
+		 * records, then an overwrite retires those owners, which C's
+		 * chain may replay: pinned until the discard.
+		 */
+		uint64_t jblocks = pr19262_env_u64(
+		    "PR19262_ENGINE_CKGUEST_JBLOCKS", 256);
+		jblocks = P2ROUNDUP(jblocks, PR19262_CKGUEST_TX /
+		    PR19262_STALL_BLOCK);
+		zilog_t *zilog = zil_open(os, pr19262_journal_get_data, NULL);
+		for (uint64_t i = 0; i < jblocks; i++)
+			pr19262_journal_write(os, zilog, object,
+			    written + i * PR19262_STALL_BLOCK, 0x33, B_TRUE);
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		dspace_j0 = spa_get_dspace(spa);
+		pr19262_ckguest_pinned(spa, "ckguest-journaled");
+		jbytes = jblocks * PR19262_STALL_BLOCK;
+		for (uint64_t off = written; off < written + jbytes;
+		    off += PR19262_CKGUEST_TX)
+			VERIFY0(pr19262_ckguest_write(os, object, off, data,
+			    &restarts));
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		/*
+		 * One client past the limit counts the pinned bytes again,
+		 * or restarts behind a pending fence that counts at its end
+		 * (as DMU_TX_WAIT would).
+		 */
+		int e;
+		for (uint_t i = 0; ; i++) {
+			e = pr19262_engine_admit(spa, PR19262_ADMIT_CLIENT, 0,
+			    0, 0, 0);
+			if (e != ERESTART || i >= 8)
+				break;
+			restart++;
+			pr19262_engine_fence_idle(spa);
+		}
+		admitted += e == 0;
+		enospc += e == ENOSPC;
+		other += e != 0 && e != ENOSPC && e != ERESTART;
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		dspace_j1 = spa_get_dspace(spa);
+		pr19262_ckguest_pinned(spa, "ckguest-journal-retired");
+		zil_close(zilog);
+	}
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	hrtime_t t1 = gethrtime();
+	pr19262_engine_fence_idle(spa);
+	pr19262_engine_admit_report(spa, "ckguest-after", &r2);
+	pr19262_ckguest_pinned(spa, "ckguest-after");
+	uint64_t ms = NSEC2MSEC(t1 - t0);
+	uint64_t fences = r2.fence_auto - r0.fence_auto;
+	(void) printf("PR19262_CKGUEST mode=%s retired_bytes=%llu limit=%llu "
+	    "first=%d admitted=%u enospc=%u erestart=%u other=%u "
+	    "written=%llu rewritten=%llu write_error=%d tx_restarts=%llu "
+	    "ms=%llu fence_requests=%llu fence_auto=%llu "
+	    "fence_waits=%llu fences_per_s_x1000=%llu "
+	    "space_rejections=%llu client_rejected=%llu "
+	    "free_before=%llu free_written=%llu protected_written=%llu "
+	    "journal_bytes=%llu dspace_journaled=%llu "
+	    "dspace_journal_retired=%llu\n",
+	    fill ? "fill" : "ample", (u_longlong_t)c->retired_bytes,
+	    (u_longlong_t)limit, first, admitted, enospc, restart, other,
+	    (u_longlong_t)written, (u_longlong_t)rewritten, werr,
+	    (u_longlong_t)restarts, (u_longlong_t)ms,
+	    (u_longlong_t)(r2.fence_requests - r0.fence_requests),
+	    (u_longlong_t)fences,
+	    (u_longlong_t)(r2.fence_waits - r0.fence_waits),
+	    (u_longlong_t)(ms == 0 ? 0 : fences * 1000000 / ms),
+	    (u_longlong_t)(r1.space_rejections - r0.space_rejections),
+	    (u_longlong_t)(r1.classes[PR19262_ADMIT_CLIENT].rejected -
+	    r0.classes[PR19262_ADMIT_CLIENT].rejected),
+	    (u_longlong_t)r0.free, (u_longlong_t)r1.free,
+	    (u_longlong_t)r1.protected, (u_longlong_t)jbytes,
+	    (u_longlong_t)dspace_j0, (u_longlong_t)dspace_j1);
+	if (fill) {
+		VERIFY3S(werr, ==, ENOSPC);
+	} else {
+		VERIFY3S(first, ==, 0);
+		VERIFY3U(admitted, ==, 10);
+		VERIFY0(enospc);
+		VERIFY0(other);
+		VERIFY0(werr);
+	}
+	/*
+	 * Give the space back under C: post-C owners release at fences.  A
+	 * net free, as zfs_remove marks it, so that a full pool still frees.
+	 */
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_free(tx, object, 0, DMU_OBJECT_END);
+	dmu_tx_mark_netfree(tx);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	VERIFY0(dmu_object_free(os, object, tx));
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	(void) pr19262_stall_drain(spa, "ckguest-free");
+	pr19262_engine_fence_idle(spa);
+	pr19262_engine_admit_report(spa, "ckguest-freed", &r2);
+	pr19262_ckguest_pinned(spa, "ckguest-freed");
+	kmem_free(data, PR19262_STALL_BLOCK);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	pr19262_engine_retired_limit(spa, 64ULL << 20);
+}
+
+/*
+ * L21 review M1/m3: after C1's discard no count of C1 is current; a second
+ * checkpoint C2 starts with none (a count of C1's drain must not stand for
+ * C2's), its census counts C2's own pins, and its discard leaves none.
+ */
+static void
+pr19262_ckguest_c2(spa_t *spa)
+{
+	pr19262_ckguest_pinned(spa, "ckguest-c1-drained");
+	uint64_t retired, pinned, pinned_v, counts, passes;
+	pr19262_engine_retired_pinned_report(spa, &retired, &pinned,
+	    &pinned_v, &counts, &passes);
+	VERIFY0(pinned);
+	VERIFY0(pinned_v);
+	VERIFY0(spa_checkpoint("pr19262_tx"));
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	pr19262_ckguest_pinned(spa, "ckguest-c2-taken");
+	pr19262_engine_retired_pinned_report(spa, &retired, &pinned,
+	    &pinned_v, &counts, &passes);
+	VERIFY0(pinned);
+	/* A client past a 1-byte limit counts C2's pins now. */
+	pr19262_engine_retired_limit(spa, 1);
+	int e = pr19262_engine_admit(spa, PR19262_ADMIT_CLIENT, 0, 0, 0, 0);
+	uint64_t c2_counts = counts;
+	pr19262_engine_retired_pinned_report(spa, &retired, &pinned,
+	    &pinned_v, &counts, &passes);
+	VERIFY3U(pinned, <=, retired);
+	(void) printf("PR19262_CKGUEST_C2 admit=%d retired=%llu pinned=%llu "
+	    "pinned_v=%llu counted=%llu\n", e, (u_longlong_t)retired,
+	    (u_longlong_t)pinned, (u_longlong_t)pinned_v,
+	    (u_longlong_t)(counts - c2_counts));
+	pr19262_engine_fence_idle(spa);
+	pr19262_engine_retired_limit(spa, 64ULL << 20);
+	VERIFY0(spa_checkpoint_discard("pr19262_tx"));
+	hrtime_t deadline = gethrtime() + SEC2NSEC(60);
+	while (spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT) &&
+	    gethrtime() < deadline) {
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		usleep(1000);
+	}
+	VERIFY(!spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT));
+	uint64_t floor, reclaimed, released;
+	VERIFY0(pr19262_engine_fence(spa, &floor, &reclaimed, &released,
+	    NULL));
+	txg_wait_synced(spa->spa_dsl_pool, 0);
+	pr19262_ckguest_pinned(spa, "ckguest-c2-drained");
+	pr19262_engine_retired_pinned_report(spa, &retired, &pinned,
+	    &pinned_v, &counts, &passes);
+	VERIFY0(pinned);
+	VERIFY0(pinned_v);
 }
 
 /* Two engaged engines, including export while the peer retains a worker. */
@@ -17774,6 +18579,754 @@ pr19262_tx_probe_thread(void *arg)
 	thread_exit();
 }
 
+static void
+pr19262_jroll_report(spa_t *spa, const char *label, pr19262_jroll_probe_t *r)
+{
+	VERIFY0(pr19262_engine_test_jroll_probe(spa, r));
+	(void) printf("PR19262_JROLL_PROBE label=%s seq=%llu frames=%llu "
+	    "segments=%llu rolls=%llu error=%lld retry=%llu pending=%llu "
+	    "pending_txg=%llu enospc=%llu waits=%llu recovered=%llu "
+	    "deferred=%llu standby=%llu runs=%llu free=%llu synced=%llu\n",
+	    label, (u_longlong_t)r->seq, (u_longlong_t)r->frames,
+	    (u_longlong_t)r->segments, (u_longlong_t)r->rolls,
+	    (longlong_t)r->error, (u_longlong_t)r->retry,
+	    (u_longlong_t)r->pending, (u_longlong_t)r->pending_txg,
+	    (u_longlong_t)r->enospc, (u_longlong_t)r->waits,
+	    (u_longlong_t)r->recovered, (u_longlong_t)r->deferred,
+	    (u_longlong_t)r->standby, (u_longlong_t)r->runs,
+	    (u_longlong_t)r->free_bytes, (u_longlong_t)r->synced);
+	(void) fflush(NULL);
+}
+
+/* The converter's copy entry on block 0 of the object; finished if begun. */
+static void
+pr19262_jroll_copy(spa_t *spa, objset_t *os, uint64_t object, uint64_t birth,
+    const char *when)
+{
+	dmu_buf_t *db;
+	VERIFY0(dmu_buf_hold(os, object, 0, FTAG, &db, DMU_READ_NO_PREFETCH));
+	blkptr_t bp = *dmu_buf_get_blkptr(db);
+	dmu_buf_rele(db, FTAG);
+	void *copy = NULL;
+	int begin = pr19262_engine_copy_begin(spa, &bp, 0, birth, &copy);
+	int run = begin == 0 ? pr19262_engine_copy_run(copy, B_FALSE) : -1;
+	(void) printf("PR19262_JROLL_COPY when=%s begin=%d run=%d\n", when,
+	    begin, run);
+	(void) fflush(NULL);
+}
+
+typedef struct pr19262_jroll_conv {
+	spa_t *spa;
+	uint64_t max_passes;
+	kmutex_t lock;
+	boolean_t done;
+	int error;
+	pr19262_engine_convert_stats_t st;
+} pr19262_jroll_conv_t;
+
+static void
+pr19262_jroll_convert_thread(void *arg)
+{
+	pr19262_jroll_conv_t *cv = arg;
+	int error = pr19262_convert_sweep(cv->spa, 2,
+	    cv->max_passes != 0 ? cv->max_passes : 12, &cv->st);
+	mutex_enter(&cv->lock);
+	cv->error = error;
+	cv->done = B_TRUE;
+	mutex_exit(&cv->lock);
+	thread_exit();
+}
+
+/*
+ * Journal roll test (L10, 2026-11-06).  ZIL records fill the journal segment
+ * until its next bind needs a roll; the squeeze then leaves a roll no run but
+ * one, and a forced roll fails with ENOSPC.  PR19262_JROLL_TEST selects:
+ *   zil      the run is in the reuse deferral.  ZIL records keep
+ *            committing: with the retry the error is not sticky, commits
+ *            fall back to txg sync while the roll is pending, and a ZIL bind
+ *            rolls once the deferred run is back; without it every later
+ *            commit falls back
+ *   convert  the run is held back (no run at all), and the converter runs:
+ *            with the retry it retries the roll each pass and its copies
+ *            wait as busy; once it failed a retry the run goes into the
+ *            deferral, and the converter rolls and copies when it returns.
+ *            Without the retry the converter stops at the sticky error
+ * L14 cells (2026-11-06, test only):
+ *   convert-full   as convert, but the test never defers the held run.
+ *                  Either a later fence returns a run (a catalog arena)
+ *                  and the converter rolls and copies, or it stops after
+ *                  8 idle sweeps: with ENOSPC and roll_needed=1 on L14,
+ *                  with EBUSY before it (L10-2).  Which one depends on the
+ *                  layout; judge stopped and recovered runs apart
+ *   convert-busy8  no squeeze, no roll: the test keeps one block's owner
+ *                  busy (a queued writer that never lands); the converter
+ *                  copies the rest in its first sweep, then stops after 8
+ *                  idle sweeps with EBUSY, the roll not needed (L10-5)
+ *   convert-bind   no forced roll: the segment is full and no roll is
+ *                  pending, so the converter's first group bind meets the
+ *                  roll first; that failure counts busy and its stages are
+ *                  retired (copy_aborts), the converter's own retry fails,
+ *                  then the run is deferred and it copies (L10-5)
+ *   zil-gate       as zil, with indirect (WR_INDIRECT) writes: the journal
+ *                  gate worker binds the written block, fails while the
+ *                  roll is pending (GATE_FAILED, commit falls back to a txg
+ *                  sync), and binds again once the roll recovered (L10-5)
+ *   rebind-tail    a second ZIL chain whose unwritten tail was allocated
+ *                  before the stronger epoch; with the segment full and no
+ *                  run, the converter walk's rebind of that tail
+ *                  (pr19262_engine_rebind_unwritten, called directly) gets
+ *                  ENOSPC with the roll pending and the error not sticky,
+ *                  which the walk counts busy; once the run is back the
+ *                  same rebind succeeds (L10-5, unit level)
+ * Needs PR19262_ENGINE_DURABLE.  Exits.
+ */
+static void
+pr19262_jroll_tail(zilog_t *zilog, blkptr_t *bp)
+{
+	mutex_enter(&zilog->zl_lock);
+	lwb_t *lwb = list_tail(&zilog->zl_lwb_list);
+	VERIFY3P(lwb, !=, NULL);
+	*bp = lwb->lwb_blk;
+	mutex_exit(&zilog->zl_lock);
+	VERIFY(!BP_IS_HOLE(bp));
+}
+
+static void
+pr19262_jroll_test(spa_t *spa)
+{
+	const char *mode = getenv("PR19262_JROLL_TEST");
+	boolean_t full = strcmp(mode, "convert-full") == 0;
+	boolean_t busy8 = strcmp(mode, "convert-busy8") == 0;
+	boolean_t bind = strcmp(mode, "convert-bind") == 0;
+	boolean_t gate = strcmp(mode, "zil-gate") == 0;
+	boolean_t tail = strcmp(mode, "rebind-tail") == 0;
+	VERIFY(strcmp(mode, "zil") == 0 || strcmp(mode, "convert") == 0 ||
+	    full || busy8 || bind || gate || tail);
+	boolean_t convert = strncmp(mode, "convert", 7) == 0;
+	zfs_txg_timeout = 100000;
+	dsl_pool_t *dp = spa_get_dsl(spa);
+	char name[] = "pr19262_tx/jroll";
+	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+	    ZIO_COMPRESS_OFF, B_FALSE));
+	objset_t *os;
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE, FTAG,
+	    &os));
+	uint64_t block = 131072, blocks = 32;
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER, block,
+	    DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	/* Weak (single parity) payload for the converter. */
+	void *data = kmem_alloc(block, KM_SLEEP);
+	for (uint64_t i = 0; i < blocks; i++) {
+		memset(data, 0x31 + i % 64, block);
+		tx = dmu_tx_create(os);
+		dmu_tx_hold_write(tx, object, i * block, block);
+		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+		dmu_write(os, object, i * block, block, data, tx, 0);
+		dmu_tx_commit(tx);
+	}
+	kmem_free(data, block);
+	txg_wait_synced(dp, 0);
+	/* rebind-tail: a chain whose unwritten tail is in the weak layout. */
+	char name2[] = "pr19262_tx/jroll2";
+	objset_t *os2 = NULL;
+	zilog_t *zilog2 = NULL;
+	uint64_t object2 = 0;
+	if (tail) {
+		VERIFY0(dmu_objset_create(name2, DMU_OST_OTHER, 0, NULL, NULL,
+		    NULL));
+		VERIFY0(ztest_dsl_prop_set_uint64(name2, ZFS_PROP_COMPRESSION,
+		    ZIO_COMPRESS_OFF, B_FALSE));
+		VERIFY0(dmu_objset_own(name2, DMU_OST_OTHER, B_FALSE, B_TRUE,
+		    FTAG, &os2));
+		tx = dmu_tx_create(os2);
+		dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+		object2 = dmu_object_alloc(os2, DMU_OT_UINT64_OTHER, block,
+		    DMU_OT_NONE, 0, tx);
+		dmu_tx_commit(tx);
+		zilog2 = zil_open(os2, pr19262_journal_get_data, NULL);
+		pr19262_journal_write(os2, zilog2, object2, 0, 0x21, B_FALSE);
+		txg_wait_synced(dp, 0);
+	}
+	/* The stronger epoch first: appending it syncs txgs. */
+	uint64_t birth = pr19262_epoch_birth(spa, 2);
+	zilog_t *zilog = zil_open(os, pr19262_journal_get_data, NULL);
+	pr19262_jroll_probe_t r, before;
+	pr19262_jroll_report(spa, "start", &r);
+	/* Fill: one ZIL block bind per commit, until the next bind rolls. */
+	uint64_t offset = blocks * block, commits = 0;
+	while (r.seq + 3 < r.frames && commits < 1024) {
+		pr19262_journal_write(os, zilog, object, offset, 0x5a, B_FALSE);
+		offset += 8192;
+		commits++;
+		VERIFY0(pr19262_engine_test_jroll_probe(spa, &r));
+	}
+	txg_wait_synced(dp, 0);
+	pr19262_jroll_report(spa, "filled", &r);
+	(void) printf("PR19262_JROLL_FILLED commits=%llu\n",
+	    (u_longlong_t)commits);
+	uint64_t run;
+	if (!busy8) {
+		VERIFY0(pr19262_engine_test_jroll_squeeze(spa,
+		    convert || tail ? 2 : 1, &run));
+		pr19262_jroll_report(spa, "squeezed", &r);
+		VERIFY0(r.runs);
+		VERIFY0(r.standby);
+	}
+	/* convert-bind and rebind-tail meet the roll first themselves. */
+	if (busy8) {
+		VERIFY0(r.pending);
+	} else if (!bind && !tail) {
+		int roll = pr19262_engine_journal_roll(spa);
+		pr19262_jroll_report(spa, "forced", &r);
+		(void) printf("PR19262_JROLL_FORCED error=%d sticky=%lld "
+		    "pending=%llu run=%llu\n", roll, (longlong_t)r.error,
+		    (u_longlong_t)r.pending, (u_longlong_t)run);
+		(void) fflush(NULL);
+		VERIFY3S(roll, ==, ENOSPC);
+		pr19262_jroll_copy(spa, os, object, birth, "pending");
+	} else {
+		VERIFY0(r.pending);
+	}
+	if (tail) {
+		blkptr_t tbp;
+		pr19262_jroll_tail(zilog2, &tbp);
+		pr19262_engine_info_t before, after;
+		pr19262_engine_inspect(spa, &tbp, 0, &before);
+		int rb = pr19262_engine_rebind_unwritten(spa, &tbp, 0, birth);
+		pr19262_engine_inspect(spa, &tbp, 0, &after);
+		pr19262_jroll_report(spa, "rebind", &r);
+		(void) printf("PR19262_JROLL_REBIND when=pending error=%d "
+		    "sticky=%lld pending=%llu ready=%u leases=%llu "
+		    "copying=%u p_before=%llu p_after=%llu tail_birth=%llu "
+		    "busy=%u\n", rb, (longlong_t)r.error,
+		    (u_longlong_t)r.pending, before.ready,
+		    (u_longlong_t)before.leases, before.copying,
+		    (u_longlong_t)before.p, (u_longlong_t)after.p,
+		    (u_longlong_t)BP_GET_BIRTH(&tbp),
+		    (rb == EBUSY || rb == ENOSPC) && r.pending != 0 &&
+		    r.error == 0);
+		(void) fflush(NULL);
+		VERIFY0(pr19262_engine_test_jroll_squeeze(spa, 3, &run));
+		pr19262_jroll_report(spa, "deferred", &r);
+		for (int i = 0; i < 40 && rb != 0; i++) {
+			txg_wait_synced(dp, 0);
+			pr19262_jroll_tail(zilog2, &tbp);
+			rb = pr19262_engine_rebind_unwritten(spa, &tbp, 0,
+			    birth);
+		}
+		pr19262_engine_inspect(spa, &tbp, 0, &after);
+		pr19262_jroll_report(spa, "rebound", &r);
+		(void) printf("PR19262_JROLL_REBIND when=after error=%d "
+		    "sticky=%lld pending=%llu recovered=%llu p_before=%llu "
+		    "p_after=%llu\n", rb, (longlong_t)r.error,
+		    (u_longlong_t)r.pending, (u_longlong_t)r.recovered,
+		    (u_longlong_t)before.p, (u_longlong_t)after.p);
+		(void) fflush(NULL);
+		/* The chain writes its tail where the rebind put it. */
+		pr19262_journal_write(os2, zilog2, object2, 8192, 0x22,
+		    B_FALSE);
+		zil_close(zilog2);
+		dmu_objset_disown(os2, B_TRUE, FTAG);
+		pr19262_jroll_copy(spa, os, object, birth, "after");
+	} else if (convert) {
+		pr19262_jroll_conv_t cv = { .spa = spa,
+		    .max_passes = busy8 ? 64 : 0 };
+		dmu_buf_t *bdb = NULL;
+		blkptr_t bbp;
+		if (busy8) {
+			VERIFY0(dmu_buf_hold(os, object, 0, FTAG, &bdb,
+			    DMU_READ_NO_PREFETCH));
+			bbp = *dmu_buf_get_blkptr(bdb);
+			dmu_buf_rele(bdb, FTAG);
+			VERIFY0(pr19262_engine_test_jroll_busy(spa, &bbp, 1));
+		}
+		mutex_init(&cv.lock, NULL, MUTEX_DEFAULT, NULL);
+		kthread_t *thread = _thread_create(NULL, 0,
+		    pr19262_jroll_convert_thread, &cv, 0, NULL,
+		    TS_RUN | TS_JOINABLE, defclsyspri);
+		/*
+		 * Until the converter failed a retry of its own (or ended).
+		 * convert-full and convert-busy8: until it ended.
+		 */
+		hrtime_t deadline = gethrtime() + SEC2NSEC(full || busy8 ?
+		    300 : 120);
+		boolean_t done = B_FALSE;
+		while (!done && gethrtime() < deadline) {
+			VERIFY0(pr19262_engine_test_jroll_probe(spa, &r));
+			mutex_enter(&cv.lock);
+			done = cv.done || (!full && !busy8 && r.enospc >= 2);
+			mutex_exit(&cv.lock);
+			if (!done)
+				(void) poll(NULL, 0, 10);
+		}
+		pr19262_jroll_report(spa, "waiting", &r);
+		if (!full && !busy8) {
+			VERIFY0(pr19262_engine_test_jroll_squeeze(spa, 3,
+			    &run));
+			pr19262_jroll_report(spa, "deferred", &r);
+		}
+		VERIFY0(thread_join(thread));
+		mutex_destroy(&cv.lock);
+		if (busy8)
+			VERIFY0(pr19262_engine_test_jroll_busy(spa, &bbp, 0));
+		pr19262_jroll_report(spa, "converted", &r);
+		(void) printf("PR19262_JROLL_CONVERT error=%d copied=%llu "
+		    "busy=%llu passes=%llu\n", cv.error,
+		    (u_longlong_t)cv.st.copied, (u_longlong_t)cv.st.busy,
+		    (u_longlong_t)cv.st.passes);
+		pr19262_jroll_copy(spa, os, object, birth, "after");
+	} else {
+		/* Commit until a ZIL bind rolled and two more bound. */
+		uint_t bound_after = 0;
+		/* zil-gate: whole blocks, so dmu_sync writes them. */
+		if (gate)
+			offset = P2ROUNDUP(offset, block);
+		for (uint_t i = 0; i < 16 && bound_after < 3; i++) {
+			VERIFY0(pr19262_engine_test_jroll_probe(spa, &before));
+			pr19262_journal_write(os, zilog, object, offset, 0x6b,
+			    gate);
+			offset += gate ? 131072 : 8192;
+			pr19262_jroll_report(spa, "zil", &r);
+			boolean_t bound = r.seq != before.seq ||
+			    r.segments != before.segments;
+			(void) printf("PR19262_JROLL_ZIL i=%u bound=%u "
+			    "fallback=%u seq=%llu,%llu segments=%llu,%llu "
+			    "synced=%llu,%llu error=%lld pending=%llu "
+			    "deferred=%llu runs=%llu\n", i, bound,
+			    r.synced != before.synced, (u_longlong_t)before.seq,
+			    (u_longlong_t)r.seq, (u_longlong_t)before.segments,
+			    (u_longlong_t)r.segments,
+			    (u_longlong_t)before.synced, (u_longlong_t)r.synced,
+			    (longlong_t)r.error, (u_longlong_t)r.pending,
+			    (u_longlong_t)r.deferred, (u_longlong_t)r.runs);
+			(void) fflush(NULL);
+			if (r.recovered > 0 && bound)
+				bound_after++;
+		}
+		/* The deferred run is back: a copy binds now. */
+		pr19262_jroll_report(spa, "after", &r);
+		pr19262_jroll_copy(spa, os, object, birth, "after");
+	}
+	if (!busy8)
+		VERIFY0(pr19262_engine_test_jroll_squeeze(spa, 0, &run));
+	zil_close(zilog);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	txg_wait_synced(dp, 0);
+	pr19262_engine_check(spa, "jroll");
+	pr19262_jroll_report(spa, "end", &r);
+	(void) printf("PR19262_JROLL_DONE mode=%s\n", mode);
+	(void) fflush(NULL);
+	_exit(0);
+}
+
+static void
+pr19262_reuse_report(spa_t *spa, const char *label, pr19262_reuse_probe_t *r)
+{
+	VERIFY0(pr19262_engine_test_reuse_probe(spa, r));
+	(void) printf("PR19262_GROWTH_DEFER_PROBE label=%s p=%lld bytes=%llu "
+	    "left=%llu in_free=%llu any_free=%llu in_legacy=%llu "
+	    "in_store=%llu in_journal=%llu owned=%llu elsewhere=%llu "
+	    "durable_ub=%llu durable_catalog=%llu stored_catalog=%llu "
+	    "synced=%llu free=%llu capacity=%llu\n", label,
+	    (longlong_t)r->p, (u_longlong_t)r->bytes, (u_longlong_t)r->left,
+	    (u_longlong_t)r->in_free, (u_longlong_t)r->any_free,
+	    (u_longlong_t)r->in_legacy, (u_longlong_t)r->in_store,
+	    (u_longlong_t)r->in_journal, (u_longlong_t)r->owned,
+	    (u_longlong_t)r->elsewhere, (u_longlong_t)r->durable_ub,
+	    (u_longlong_t)r->durable_catalog, (u_longlong_t)r->stored_catalog,
+	    (u_longlong_t)spa_last_synced_txg(spa),
+	    (u_longlong_t)r->free_bytes, (u_longlong_t)r->capacity);
+	(void) fflush(NULL);
+}
+
+static int
+pr19262_reuse_grow(spa_t *spa, const char *label)
+{
+	pr19262_mgrowth_probe_t g;
+	int error = pr19262_engine_mgrowth_probe(spa, B_TRUE, &g);
+	(void) printf("PR19262_GROWTH_DEFER_GROW label=%s error=%d p=%llu "
+	    "capacity=%llu arenas=%llu\n", label, error, (u_longlong_t)g.p,
+	    (u_longlong_t)g.capacity, (u_longlong_t)g.arenas);
+	(void) fflush(NULL);
+	return (error);
+}
+
+/*
+ * One txg in which the catalog changes: rewrite a small object, so the
+ * engine records a new owner and the store is dirty.  Waits for that txg.
+ */
+static void
+pr19262_defer_step(spa_t *spa, objset_t *os, uint64_t touch, uint64_t *seq,
+    const char *label, pr19262_reuse_probe_t *r)
+{
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_write(tx, touch, 0, sizeof (*seq));
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t txg = dmu_tx_get_txg(tx);
+	(*seq)++;
+	dmu_write(os, touch, 0, sizeof (*seq), seq, tx, 0);
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa_get_dsl(spa), txg);
+	pr19262_reuse_report(spa, label, r);
+}
+
+typedef struct pr19262_defer_state {
+	objset_t *os;
+	uint64_t object;
+	uint64_t free_txg;
+	const char *mode;
+	const char *fault;
+	boolean_t force;
+	boolean_t fired;
+	uint64_t steer;
+	uint64_t left_synced;
+	pr19262_reuse_probe_t left;
+} pr19262_defer_state_t;
+
+static pr19262_defer_state_t pr19262_defer;
+
+/*
+ * Runs inside the engine start, after its deferral turnover and before its
+ * scan: the object's blocks are freed natively and that txg synced, so the
+ * frees are in ms_defer when the scan runs.
+ */
+static void
+pr19262_defer_free_cb(spa_t *spa, void *arg)
+{
+	pr19262_defer_state_t *d = arg;
+	dmu_tx_t *tx = dmu_tx_create(d->os);
+	dmu_tx_hold_free(tx, d->object, 0, DMU_OBJECT_END);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	d->free_txg = dmu_tx_get_txg(tx);
+	VERIFY0(dmu_object_free(d->os, d->object, tx));
+	dmu_tx_commit(tx);
+	txg_wait_synced(spa_get_dsl(spa), d->free_txg);
+}
+
+/*
+ * Store hook, syncing context, at the start of a store sync: the first one
+ * after the marked space is back in the free tree.  The durable catalog is
+ * the one stored before it, which lists the space as legacy; this store's
+ * uberblock is not written yet.  The next catalog growth is steered onto the
+ * space here: the same moment as a growth the store itself would start.
+ */
+static void
+pr19262_defer_store_hook(spa_t *spa, int phase)
+{
+	pr19262_defer_state_t *d = &pr19262_defer;
+	pr19262_reuse_probe_t r;
+	if (phase != 2 || d->fired ||
+	    pr19262_engine_test_reuse_probe(spa, &r) != 0 ||
+	    r.p == UINT64_MAX || r.durable_catalog == 0)
+		return;
+	d->fired = B_TRUE;
+	pr19262_reuse_report(spa, "left-legacy", &r);
+	d->left = r;
+	d->left_synced = spa_last_synced_txg(spa);
+	/*
+	 * Admission with the run not in free yet (a tree with the deferral):
+	 * a request that fits once the deferred space returns restarts
+	 * (ERESTART); one that cannot fit at all stays ENOSPC.
+	 */
+	pr19262_engine_admit_report_t ar;
+	pr19262_engine_admit_report(spa, "left-legacy", &ar);
+	int later = pr19262_engine_admit(spa, PR19262_ADMIT_NETFREE, 0,
+	    ar.free + (16ULL << 20), 0, 0);
+	int never = pr19262_engine_admit(spa, PR19262_ADMIT_NETFREE, 0,
+	    ar.free + (1ULL << 40), 0, 0);
+	(void) printf("PR19262_GROWTH_DEFER_ADMIT later=%d never=%d "
+	    "free=%llu\n", later, never, (u_longlong_t)ar.free);
+	(void) fflush(NULL);
+	VERIFY(later != 0 && never != 0);
+	uint64_t deferred;
+	if (pr19262_engine_test_defer_free(spa, 0, &deferred) == 0) {
+		/*
+		 * The arena-run branch: with every 8 MiB of free holed there
+		 * is no arena run, but plenty of free space, and the deferred
+		 * run holds some; a client needing one new arena restarts.
+		 */
+		pr19262_engine_admit_report(spa, "arena-pre", &ar);
+		VERIFY0(pr19262_engine_test_free_holes(spa, B_TRUE));
+		uint64_t pages = ar.pages_free + 1;
+		int arena = pr19262_engine_admit(spa, PR19262_ADMIT_CLIENT, 0,
+		    0, pages, 0);
+		if (arena == 0)
+			pr19262_engine_admit_release(spa, PR19262_ADMIT_CLIENT,
+			    0, pages, 0);
+		pr19262_engine_admit_report_t after;
+		pr19262_engine_admit_report(spa, "arena-probe", &after);
+		VERIFY0(pr19262_engine_test_free_holes(spa, B_FALSE));
+		(void) printf("PR19262_GROWTH_DEFER_ARENA_ADMIT err=%d "
+		    "pages=%llu restarts=%llu fence_requests=%llu "
+		    "fence_waits=%llu\n", arena, (u_longlong_t)pages,
+		    (u_longlong_t)(after.restarts - ar.restarts),
+		    (u_longlong_t)(after.fence_requests - ar.fence_requests),
+		    (u_longlong_t)(after.fence_waits - ar.fence_waits));
+		(void) fflush(NULL);
+	}
+	boolean_t reopen = strcmp(d->mode, "reopen") == 0;
+	VERIFY0(pr19262_engine_test_prefer_arena(spa, r.p,
+	    reopen && d->force));
+	if (reopen && d->fault != NULL)
+		VERIFY0(setenv("PR19262_M_PAGE_FAULT", d->fault, 1));
+	int error = pr19262_reuse_grow(spa,
+	    reopen ? "reopen" : "before-durable");
+	if (reopen) {
+		(void) printf("PR19262_GROWTH_DEFER_NO_CUT error=%d\n", error);
+		(void) fflush(NULL);
+		_exit(3);
+	}
+	VERIFY0(error);
+	pr19262_reuse_report(spa, "before-durable", &r);
+	d->steer = r.steer;
+	(void) printf("PR19262_GROWTH_DEFER_PICK when=before-durable "
+	    "steer=%llu durable_catalog=%llu was=%llu\n",
+	    (u_longlong_t)r.steer, (u_longlong_t)r.durable_catalog,
+	    (u_longlong_t)d->left.durable_catalog);
+	(void) fflush(NULL);
+}
+
+/*
+ * Growth-defer test (2026-11-05).  Native data is marked and freed while the
+ * durable engine starts, so its frees sit in ms_defer at the scan: legacy
+ * in the first catalog.  A later metaslab_sync_done brings them back into the
+ * free tree, after the store of that txg, so the durable catalog lists them
+ * as legacy until the store of the following txg is durable.  Every waited
+ * txg dirties the catalog (a small DMU rewrite the engine records as an
+ * owner), so each one is stored.
+ * PR19262_GROWTH_DEFER selects the cell:
+ *   invariant  the run that left legacy is not pickable until the
+ *              uberblock TXG_DEFER_SIZE txgs after the catalog that
+ *              records the free is durable, then it is (fixed tree); a
+ *              tree without the deferral picks it at once
+ *   idle       as invariant, but no write dirties the catalog while the
+ *              run is deferred: empty txgs must still bring the uberblocks
+ *   rewind     as invariant, then one more store after the growth; prints
+ *              the newest uberblock and the oldest TXG_DEFER_SIZE rewind
+ *              for the runner's read-only rewound import
+ *   reopen     steer the next growth onto that run and set
+ *              PR19262_M_PAGE_FAULT=PR19262_GROWTH_DEFER_FAULT for it;
+ *              PR19262_GROWTH_DEFER_FORCE=1 steers past the free tree;
+ *              the runner then reopens the image writable
+ * No txg syncs unless this test waits for one.  Exits; the runner reopens
+ * the image with the cold importer.
+ */
+static void
+pr19262_growth_defer_test(spa_t *spa)
+{
+	const char *mode = getenv("PR19262_GROWTH_DEFER");
+	VERIFY(strcmp(mode, "invariant") == 0 || strcmp(mode, "rewind") == 0 ||
+	    strcmp(mode, "idle") == 0 || strcmp(mode, "reopen") == 0);
+	uint64_t mib = pr19262_env_u64("PR19262_GROWTH_DEFER_MIB", 96);
+	pr19262_defer_state_t *d = &pr19262_defer;
+	d->mode = mode;
+	d->fault = getenv("PR19262_GROWTH_DEFER_FAULT");
+	d->force = getenv("PR19262_GROWTH_DEFER_FORCE") != NULL;
+	zfs_txg_timeout = 100000;
+	dsl_pool_t *dp = spa_get_dsl(spa);
+	char name[] = "pr19262_tx/defer";
+	VERIFY0(dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	VERIFY0(ztest_dsl_prop_set_uint64(name, ZFS_PROP_COMPRESSION,
+	    ZIO_COMPRESS_OFF, B_FALSE));
+	objset_t *os;
+	VERIFY0(dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE, FTAG,
+	    &os));
+	uint64_t block = 128ULL << 10, chunk = 8ULL << 20;
+	dmu_tx_t *tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t object = dmu_object_alloc(os, DMU_OT_UINT64_OTHER, block,
+	    DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	/* The small object that dirties the catalog in each waited txg. */
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_bonus(tx, DMU_NEW_OBJECT);
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	uint64_t touch = dmu_object_alloc(os, DMU_OT_UINT64_OTHER, 512,
+	    DMU_OT_NONE, 0, tx);
+	dmu_tx_commit(tx);
+	uint64_t seq = 0;
+	void *data = kmem_alloc(chunk, KM_SLEEP);
+	memset(data, 0x5d, chunk);
+	for (uint64_t off = 0; off < (mib << 20); off += chunk) {
+		tx = dmu_tx_create(os);
+		dmu_tx_hold_write(tx, object, off, chunk);
+		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+		dmu_write(os, object, off, chunk, data, tx, 0);
+		dmu_tx_commit(tx);
+	}
+	kmem_free(data, chunk);
+	txg_wait_synced(dp, 0);
+	/* Mark its extents on the target vdev: legacy at activation. */
+	uint64_t marked = 0;
+	for (uint64_t off = 0; off < (mib << 20); off += block) {
+		dmu_buf_t *db;
+		VERIFY0(dmu_buf_hold(os, object, off, FTAG, &db,
+		    DMU_READ_NO_PREFETCH));
+		const blkptr_t *bp = dmu_buf_get_blkptr(db);
+		VERIFY(bp != NULL && !BP_IS_HOLE(bp));
+		for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
+			const dva_t *dva = &bp->blk_dva[d];
+			if (DVA_GET_VDEV(dva) != 0)
+				continue;
+			VERIFY0(pr19262_engine_test_mark(spa,
+			    DVA_GET_OFFSET(dva), DVA_GET_ASIZE(dva)));
+			marked += DVA_GET_ASIZE(dva);
+		}
+		dmu_buf_rele(db, FTAG);
+	}
+	(void) printf("PR19262_GROWTH_DEFER_NATIVE mode=%s mib=%llu "
+	    "marked=%llu synced=%llu\n", mode, (u_longlong_t)mib,
+	    (u_longlong_t)marked, (u_longlong_t)spa_last_synced_txg(spa));
+	/* Engage; all its blocks are freed in one txg (dnode_sync_free). */
+	d->os = os;
+	d->object = object;
+	pr19262_engine_store_test_hook(spa, pr19262_defer_store_hook);
+	pr19262_engine_test_start_hook(spa, pr19262_defer_free_cb, d);
+	VERIFY0(pr19262_engine_start_persistent(spa));
+	VERIFY3U(d->free_txg, !=, 0);
+	pr19262_reuse_probe_t r;
+	pr19262_reuse_report(spa, "engaged", &r);
+	(void) printf("PR19262_GROWTH_DEFER_FREED free_txg=%llu synced=%llu\n",
+	    (u_longlong_t)d->free_txg, (u_longlong_t)spa_last_synced_txg(spa));
+	/*
+	 * The deferred frees return a few txgs after the free; the store
+	 * after that runs the hook.  Dirty the catalog until it has.
+	 */
+	for (uint_t i = 0; i < 16 && !d->fired; i++)
+		pr19262_defer_step(spa, os, touch, &seq, "wait", &r);
+	VERIFY(d->fired);
+	VERIFY3U(d->left.durable_catalog, >, 0);
+	pr19262_engine_store_test_hook(spa, NULL);
+	/* A catalog stored after the return is durable once its txg synced. */
+	pr19262_reuse_report(spa, "after-sync", &r);
+	for (uint_t i = 0; i < 8 &&
+	    r.durable_catalog <= d->left.durable_catalog; i++)
+		pr19262_defer_step(spa, os, touch, &seq, "after-sync", &r);
+	VERIFY3U(r.durable_catalog, >, d->left.durable_catalog);
+	if (d->steer != 1) {
+		/*
+		 * This catalog records the free.  The run joins free once the
+		 * uberblock TXG_DEFER_SIZE txgs later is durable; each waited
+		 * txg dirties the catalog, so an uberblock comes with it.
+		 */
+		(void) printf("PR19262_GROWTH_DEFER_RECORDED catalog=%llu "
+		    "ub=%llu in_free=%llu\n", (u_longlong_t)r.durable_catalog,
+		    (u_longlong_t)r.durable_ub, (u_longlong_t)r.in_free);
+		for (uint_t i = 0; i < 8 && !r.in_free; i++) {
+			if (strcmp(mode, "idle") != 0) {
+				pr19262_defer_step(spa, os, touch, &seq,
+				    "after-sync", &r);
+				continue;
+			}
+			txg_wait_synced(dp, spa_last_synced_txg(spa) + 1);
+			pr19262_reuse_report(spa, "after-sync", &r);
+		}
+		VERIFY(r.in_free);
+		VERIFY0(pr19262_engine_test_prefer_arena(spa, d->left.p,
+		    B_FALSE));
+		VERIFY0(pr19262_reuse_grow(spa, "after-durable"));
+		pr19262_reuse_report(spa, "after-durable", &r);
+		(void) printf("PR19262_GROWTH_DEFER_PICK when=after-durable "
+		    "steer=%llu durable_catalog=%llu was=%llu\n",
+		    (u_longlong_t)r.steer, (u_longlong_t)r.durable_catalog,
+		    (u_longlong_t)d->left.durable_catalog);
+	}
+	uint64_t deferred;
+	if (strcmp(mode, "invariant") == 0 && d->steer != 1 &&
+	    pr19262_engine_test_defer_free(spa, 0, &deferred) == 0) {
+		/*
+		 * The restarts behind the deferral end.  Once nothing is
+		 * deferred, an admission clears the mark.  Refill the
+		 * deferral: a request that fits only counting it restarts and
+		 * marks the synced txg.  Keep refilling for TXG_DEFER_SIZE + 1
+		 * txgs: the same request is then ENOSPC.  Let the deferral
+		 * drain again: the mark is cleared and it restarts anew.
+		 */
+		pr19262_engine_admit_report_t ar;
+		uint64_t mark, free_bytes;
+		for (uint_t i = 0; i < 8 && deferred != 0; i++) {
+			pr19262_defer_step(spa, os, touch, &seq, "drain", &r);
+			VERIFY0(pr19262_engine_test_defer_free(spa, 0,
+			    &deferred));
+		}
+		VERIFY0(deferred);
+		VERIFY0(pr19262_engine_admit(spa, PR19262_ADMIT_NETFREE, 0,
+		    4096, 0, 0));
+		pr19262_engine_admit_release(spa, PR19262_ADMIT_NETFREE, 0, 0,
+		    0);
+		VERIFY0(pr19262_engine_test_defer_free(spa, 64ULL << 20,
+		    &deferred));
+		pr19262_engine_admit_report(spa, "expiry", &ar);
+		free_bytes = ar.free;
+		mark = spa_last_synced_txg(spa);
+		int first = pr19262_engine_admit(spa, PR19262_ADMIT_NETFREE, 0,
+		    free_bytes + (8ULL << 20), 0, 0);
+		for (uint_t i = 0; i < TXG_DEFER_SIZE + 1; i++) {
+			VERIFY0(pr19262_engine_test_defer_free(spa, 16ULL << 20,
+			    &deferred));
+			pr19262_defer_step(spa, os, touch, &seq, "refill", &r);
+		}
+		pr19262_engine_admit_report(spa, "expired", &ar);
+		uint64_t synced = spa_last_synced_txg(spa);
+		int expired = pr19262_engine_admit(spa, PR19262_ADMIT_NETFREE,
+		    0, ar.free + (8ULL << 20), 0, 0);
+		for (uint_t i = 0; i < 8; i++) {
+			VERIFY0(pr19262_engine_test_defer_free(spa, 0,
+			    &deferred));
+			if (deferred == 0)
+				break;
+			pr19262_defer_step(spa, os, touch, &seq, "drain", &r);
+		}
+		VERIFY0(deferred);
+		VERIFY0(pr19262_engine_admit(spa, PR19262_ADMIT_NETFREE, 0,
+		    4096, 0, 0));
+		pr19262_engine_admit_release(spa, PR19262_ADMIT_NETFREE, 0, 0,
+		    0);
+		VERIFY0(pr19262_engine_test_defer_free(spa, 64ULL << 20,
+		    &deferred));
+		pr19262_engine_admit_report(spa, "reset", &ar);
+		int reset = pr19262_engine_admit(spa, PR19262_ADMIT_NETFREE, 0,
+		    ar.free + (8ULL << 20), 0, 0);
+		(void) printf("PR19262_GROWTH_DEFER_ADMIT_EXPIRY marked=%llu "
+		    "synced=%llu first=%d expired=%d reset=%d\n",
+		    (u_longlong_t)mark, (u_longlong_t)synced, first, expired,
+		    reset);
+		(void) fflush(NULL);
+	}
+	/* rewind: a store after the growth. */
+	VERIFY0(pr19262_engine_test_reuse_probe(spa, &r));
+	/* The newest uberblock when the growth took the run. */
+	uint64_t grown_ub = d->steer == 1 ? d->left.durable_ub : r.durable_ub;
+	if (strcmp(mode, "rewind") == 0)
+		pr19262_defer_step(spa, os, touch, &seq, "rewind", &r);
+	dmu_objset_disown(os, B_TRUE, FTAG);
+	txg_wait_synced(dp, 0);
+	pr19262_engine_check(spa, "growth-defer-invariant");
+	if (strcmp(mode, "rewind") == 0) {
+		/*
+		 * The oldest rewind inside the native defer window at the
+		 * time the growth took the run.
+		 */
+		pr19262_reuse_report(spa, "rewind", &r);
+		(void) printf("PR19262_GROWTH_DEFER_REWIND newest=%llu "
+		    "grown=%llu target=%llu catalog=%llu\n",
+		    (u_longlong_t)r.durable_ub, (u_longlong_t)grown_ub,
+		    (u_longlong_t)(grown_ub - TXG_DEFER_SIZE),
+		    (u_longlong_t)r.durable_catalog);
+	}
+	(void) printf("PR19262_GROWTH_DEFER_INVARIANT_DONE\n");
+	(void) fflush(NULL);
+	/* Persistent images need the private importer. */
+	_exit(0);
+}
+
 static int
 pr19262_tx_driver(const char *directory)
 {
@@ -17809,9 +19362,13 @@ pr19262_tx_driver(const char *directory)
 	spa_t *spa;
 	VERIFY0(spa_open("pr19262_tx", &spa, FTAG));
 	if (getenv("PR19262_RUNTIME_ENGINE") != NULL) {
+		if (getenv("PR19262_GROWTH_DEFER") != NULL)
+			pr19262_growth_defer_test(spa);
 		pr19262_engine_start(spa);
 		if (getenv("PR19262_ENGINE_DURABLE") != NULL)
 			VERIFY0(pr19262_engine_store_enable(spa));
+		if (getenv("PR19262_JROLL_TEST") != NULL)
+			pr19262_jroll_test(spa);
 		if (getenv("PR19262_ENGINE_DMU_STALE") != NULL) {
 			pr19262_dmu_stale_test(spa);
 			spa_close(spa, FTAG);
@@ -17831,6 +19388,11 @@ pr19262_tx_driver(const char *directory)
 			pr19262_convert_prepare(spa);
 		if (getenv("PR19262_ENGINE_FULL") != NULL) {
 			pr19262_full_test(spa);
+			(void) fflush(NULL);
+			_exit(0);
+		}
+		if (getenv("PR19262_ENGINE_FENCE_STALL") != NULL) {
+			pr19262_fence_stall_test(spa);
 			(void) fflush(NULL);
 			_exit(0);
 		}

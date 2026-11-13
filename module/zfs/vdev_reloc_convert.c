@@ -24,6 +24,11 @@
 #include <sys/zil.h>
 #include <sys/zil_impl.h>
 
+#ifndef _KERNEL
+/* Test only (L13 witness driver): hold every owner release while set. */
+volatile int pr19262_l13_hold_release;
+#endif
+
 static void
 engine_version_unlink(engine_t *engine, engine_owner_t *e, engine_version_t *b)
 {
@@ -128,6 +133,11 @@ static boolean_t
 engine_owner_releasable(engine_t *engine, engine_owner_t *e, uint64_t catalog)
 {
 	ASSERT(MUTEX_HELD(&engine->lock));
+#ifndef _KERNEL
+	/* L13 witness: no owner is releasable while the driver holds them. */
+	if (pr19262_l13_hold_release)
+		return (B_FALSE);
+#endif
 	if (!e->retired || e->aborted || e->checkpoint_only || e->copying ||
 	    e->releasing || e->pending != NULL || e->holds != 0 ||
 	    e->queued_writers != 0 || e->journal_pending ||
@@ -1064,6 +1074,23 @@ engine_fence_task(void *arg)
 	int error = engine_fence_impl(spa, &floor, &reclaimed, &released,
 	    NULL, B_TRUE, &catalog);
 	boolean_t suspended = error == ESHUTDOWN;
+#ifndef _KERNEL
+	/* L15 test: what the fence returned; hold it before its verdict. */
+	if (test != NULL) {
+		mutex_enter(&test->lock);
+		test->reclaimed = reclaimed;
+		test->released = released;
+		if (test->hold_end) {
+			test->hold_end = B_FALSE;
+			test->paused_end = B_TRUE;
+			cv_broadcast(&test->changed);
+			while (!test->release_end)
+				cv_wait(&test->changed, &test->lock);
+			test->release_end = B_FALSE;
+		}
+		mutex_exit(&test->lock);
+	}
+#endif
 	mutex_enter(&engine->lock);
 #ifndef _KERNEL
 	engine->fence_task_thread = NULL;
@@ -1581,6 +1608,11 @@ pr19262_engine_checkpoint_discard_wait(spa_t *spa, zthr_t *zthr)
 {
 	engine_t *engine = spa->spa_reloc;
 	boolean_t asked = B_FALSE;
+#ifndef _KERNEL
+	/* L11 witness: a full catalog no fence can relieve. */
+	if (pr19262_env("PR19262_L11_NO_DISCARD_FENCE") != NULL)
+		asked = B_TRUE;
+#endif
 	mutex_enter(&engine->lock);
 	engine->ckpt_discard_waits++;
 	mutex_exit(&engine->lock);
@@ -2372,6 +2404,15 @@ engine_fence_growth_check(spa_t *spa)
 		mutex_exit(&engine->lock);
 		return;
 	}
+	/*
+	 * L11 witness: no growth fence while a checkpoint discard is pending,
+	 * as on a kernel import whose discard runs before load completes.
+	 */
+	if (pr19262_env("PR19262_L11_HOLD_GROWTH_FENCE") != NULL &&
+	    spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT)) {
+		mutex_exit(&engine->lock);
+		return;
+	}
 #endif
 	/* The first store after load or reset only seeds the marks. */
 	if (!engine->fence_growth_seeded) {
@@ -2456,6 +2497,32 @@ pr19262_engine_export_fence_arm(spa_t *spa,
 	VERIFY3P(engine->spa, ==, spa);
 	VERIFY(!engine->fence_pending);
 	engine->export_fence_test = test;
+	mutex_exit(&engine->lock);
+}
+
+/* L21 test: retired, pinned, pinned V, counts and passes. */
+void
+pr19262_engine_retired_pinned_report(spa_t *spa, uint64_t *retired,
+    uint64_t *pinned, uint64_t *pinned_v, uint64_t *counts, uint64_t *passes)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	VERIFY3P(engine->spa, ==, spa);
+	*retired = engine->retired;
+	engine_retired_pinned_now_locked(engine, pinned, pinned_v);
+	*counts = engine->retired_pinned_counts;
+	*passes = engine->retired_pinned_passes;
+	mutex_exit(&engine->lock);
+}
+
+/* L15 test: until no scheduled fence is pending. */
+void
+pr19262_engine_fence_idle(spa_t *spa)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	while (engine->fence_pending)
+		cv_wait(&engine->fence_cv, &engine->lock);
 	mutex_exit(&engine->lock);
 }
 #endif
@@ -3909,5 +3976,69 @@ pr19262_engine_epoch(spa_t *spa, uint64_t parity, uint64_t *birth)
 	kmem_free(t, sizeof (*t));
 	return (error);
 }
+
+#ifndef _KERNEL
+/*
+ * Test only (L13 witness driver): one line of catalog headroom and
+ * retirement state, and a fence dispatched like the admission's.
+ */
+void
+pr19262_engine_l13_status(spa_t *spa, char *buf, size_t len)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || !engine->persistent) {
+		mutex_exit(&engine->lock);
+		(void) snprintf(buf, len, "engine=0");
+		return;
+	}
+	uint64_t dirty = 0, retired_owners = 0, owners = 0;
+	for (engine_owner_t *e = list_head(&engine->dirty); e != NULL;
+	    e = list_next(&engine->dirty, e))
+		dirty++;
+	for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+	    e = AVL_NEXT(&engine->owners, e)) {
+		owners++;
+		retired_owners += e->retired;
+	}
+	(void) snprintf(buf, len, "pages_available=%llu pages_capacity=%llu "
+	    "runs=%llu runs_known=%d standby=%d headroom_low=%d owners=%llu "
+	    "retired_owners=%llu retired=%llu dirty_rows=%llu gone_rows=%u "
+	    "tombstones=%llu grow_enospc=%llu fence_requests=%llu "
+	    "fence_completions=%llu fence_pending=%d floor=%llu "
+	    "durable_catalog=%llu free_deferrals=%llu",
+	    (u_longlong_t)engine->pages->available,
+	    (u_longlong_t)engine->pages->capacity,
+	    (u_longlong_t)engine->free_runs_cached,
+	    engine->free_runs_known, engine->store_standby_valid,
+	    engine->store_headroom_low, (u_longlong_t)owners,
+	    (u_longlong_t)retired_owners, (u_longlong_t)engine->retired,
+	    (u_longlong_t)dirty, engine->gone_count,
+	    (u_longlong_t)avl_numnodes(&engine->tombstones),
+	    (u_longlong_t)engine->store_grow_enospc,
+	    (u_longlong_t)engine->fence_requests,
+	    (u_longlong_t)engine->fence_completions,
+	    engine->fence_pending, (u_longlong_t)engine->pages->floor,
+	    (u_longlong_t)engine->durable_catalog_txg,
+	    (u_longlong_t)engine->free_deferrals);
+	mutex_exit(&engine->lock);
+}
+
+void
+pr19262_engine_l13_fence_dispatch(spa_t *spa)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	boolean_t go = engine->spa == spa && engine->persistent &&
+	    !engine->fence_pending && !engine->fence_quiesced;
+	if (go) {
+		engine->fence_pending = B_TRUE;
+		engine->fence_requests++;
+	}
+	mutex_exit(&engine->lock);
+	if (go)
+		pr19262_engine_fence_schedule(spa);
+}
+#endif
 
 #include "vdev_reloc_kernel.c"

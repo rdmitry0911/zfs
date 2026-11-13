@@ -824,6 +824,18 @@ struct pr19262_engine {
 	uint64_t test_prefer_p;
 	uint64_t test_prefer_end;
 	boolean_t test_prefer_active;
+	/* Growth-defer test: a legacy mark and one steered arena pick. */
+	zfs_range_tree_t *test_legacy_mark;
+	uint64_t test_arena_p;
+	boolean_t test_arena_active;
+	boolean_t test_arena_force;
+	uint64_t test_arena_result;
+	void (*test_start_fn)(spa_t *, void *);
+	void *test_start_arg;
+	zfs_range_tree_t *test_holes;
+	/* Journal roll test: holes carved out of free, a held run + 1. */
+	zfs_range_tree_t *test_jholes;
+	uint64_t test_jheld;
 #endif
 	/* The last scheduled fence reclaimed and released nothing. */
 	boolean_t fence_stalled;
@@ -3569,6 +3581,14 @@ engine_start(spa_t *spa, boolean_t persistent)
 	/* Serialize topology changes through preparation and publication. */
 	mutex_enter(&spa->spa_vdev_top_lock);
 	txg_wait_synced(spa->spa_dsl_pool, 0);
+#ifndef _KERNEL
+	/* Growth-defer test: frees that sync after the turnover. */
+	if (engine->test_start_fn != NULL) {
+		void (*fn)(spa_t *, void *) = engine->test_start_fn;
+		engine->test_start_fn = NULL;
+		fn(spa, engine->test_start_arg);
+	}
+#endif
 
 	/* DMU space-map reads must precede every config writer lock. */
 	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
@@ -5173,6 +5193,23 @@ pr19262_engine_dispatch(zio_t *zio)
 	if (r01_bound)
 		engine_r01_selected_locked(engine, zio, e, b, v);
 #endif
+#ifndef _KERNEL
+	/*
+	 * Test-only, not part of the release tree:
+	 * ztest's pr19262_engine_park_next() parks the next ordinary read
+	 * here, after its translation took a lease on the version it reads,
+	 * until pr19262_engine_unpark() resumes it at this stage.  This is
+	 * the ordinary-read park the R-01 b198 prebind step removed; the
+	 * kernel consumes park_next only on its R-01 scan paths.
+	 */
+	if (selected && engine->park_next &&
+	    zio->io_type == ZIO_TYPE_READ && !zio->io_pr19262_owner_copy) {
+		engine->park_next = B_FALSE;
+		engine_defer(zio, &engine->parked);
+		mutex_exit(&engine->lock);
+		return (EINPROGRESS);
+	}
+#endif
 	mutex_exit(&engine->lock);
 	return (0);
 }
@@ -5355,6 +5392,51 @@ pr19262_engine_test_prefer_p(spa_t *spa, uint64_t p, uint64_t size)
 	}
 	mutex_exit(&engine->lock);
 	return (error);
+}
+
+/*
+ * ztest only, floor-flake negative control.  [v, v + size) is a range a
+ * remaining checkpoint space map entry names.  Give its first
+ * checkpoint-only owner the state a discard step gives the owners of its
+ * processed prefix (retired, drain_releasable) without taking the range
+ * out of the map: a wrong drain_releasable flag.  Syncing context, like a
+ * discard step.  Returns the owner's V size (its V in *out), or 0.
+ */
+uint64_t
+pr19262_engine_test_flag_covered(spa_t *spa, uint64_t v, uint64_t size,
+    uint64_t *out)
+{
+	engine_t *engine = spa->spa_reloc;
+	uint64_t flagged = 0;
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || engine->vd == NULL) {
+		mutex_exit(&engine->lock);
+		return (0);
+	}
+	uint64_t align = 1ULL << engine->vd->vdev_ashift;
+	for (uint64_t c = v; c < v + size; ) {
+		engine_owner_t *e = engine_checkpoint_owner(engine, c);
+		if (e == NULL) {
+			c += align;
+			continue;
+		}
+		if (e->checkpoint_only && !e->retired && e->v >= v &&
+		    e->v + e->size <= v + size) {
+			e->checkpoint_only = B_FALSE;
+			e->retired = B_TRUE;
+			e->retired_at = ++engine->sequence;
+			engine->retired += e->cur->size;
+			engine->revision++;
+			engine_owner_dirty(engine, e);
+			e->drain_releasable = B_TRUE;
+			flagged = e->size;
+			*out = e->v;
+			break;
+		}
+		c = e->v + e->size;
+	}
+	mutex_exit(&engine->lock);
+	return (flagged);
 }
 #endif
 
@@ -5975,7 +6057,229 @@ pr19262_engine_spa_fini(spa_t *spa)
 	rw_exit(&engine->r02_topology_lock);
 	rw_destroy(&engine->r02_topology_lock);
 	mutex_destroy(&engine->lock);
+#ifndef _KERNEL
+	if (engine->test_legacy_mark != NULL) {
+		zfs_range_tree_vacate(engine->test_legacy_mark, NULL, NULL);
+		zfs_range_tree_destroy(engine->test_legacy_mark);
+	}
+	if (engine->test_holes != NULL) {
+		zfs_range_tree_vacate(engine->test_holes, NULL, NULL);
+		zfs_range_tree_destroy(engine->test_holes);
+	}
+#endif
 	kmem_free(engine->pages, sizeof (*engine->pages));
 	kmem_free(engine, sizeof (*engine));
 	spa->spa_reloc = NULL;
 }
+
+#ifndef _KERNEL
+/* Growth-defer test: mark a native extent, also before activation. */
+int
+pr19262_engine_test_mark(spa_t *spa, uint64_t start, uint64_t size)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->test_legacy_mark == NULL)
+		engine->test_legacy_mark = zfs_range_tree_create(NULL,
+		    ZFS_RANGE_SEG64, NULL, 0, 0);
+	zfs_range_tree_clear(engine->test_legacy_mark, start, size);
+	zfs_range_tree_add(engine->test_legacy_mark, start, size);
+	mutex_exit(&engine->lock);
+	return (0);
+}
+
+static void
+engine_test_clear(void *arg, uint64_t start, uint64_t size)
+{
+	zfs_range_tree_clear(arg, start, size);
+}
+
+static boolean_t
+engine_test_overlaps(zfs_range_tree_t *rt, uint64_t p, uint64_t size)
+{
+	uint64_t found, length;
+	return (rt != NULL && zfs_range_tree_find_in(rt, p, size, &found,
+	    &length));
+}
+
+/*
+ * The highest arena-sized, stripe-aligned run of marked space that is not
+ * legacy now, and every structure it overlaps.  elsewhere: in none of
+ * them (with the reuse deferral: deferred space).
+ */
+int
+pr19262_engine_test_reuse_probe(spa_t *spa, pr19262_reuse_probe_t *out)
+{
+	engine_t *engine = spa->spa_reloc;
+	memset(out, 0, sizeof (*out));
+	out->p = UINT64_MAX;
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || engine->test_legacy_mark == NULL ||
+	    engine->legacy == NULL) {
+		mutex_exit(&engine->lock);
+		return (EINVAL);
+	}
+	uint64_t bytes = ENGINE_STORE_BYTES * engine->vd->vdev_children;
+	zfs_range_tree_t *left = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	    NULL, 0, 0);
+	zfs_range_tree_walk(engine->test_legacy_mark, zfs_range_tree_add,
+	    left);
+	zfs_range_tree_walk(engine->legacy, engine_test_clear, left);
+	out->left = zfs_range_tree_space(left);
+	uint64_t range[2] = { UINT64_MAX, bytes };
+	engine_walk_arg_t walk = { engine, range };
+	zfs_range_tree_walk(left, engine_pages_pick, &walk);
+	zfs_range_tree_vacate(left, NULL, NULL);
+	zfs_range_tree_destroy(left);
+	out->bytes = bytes;
+	uint64_t p = range[0];
+	if (p != UINT64_MAX) {
+		out->p = p;
+		out->in_free = zfs_range_tree_contains(engine->free, p, bytes);
+		out->any_free = engine_test_overlaps(engine->free, p, bytes);
+		out->in_legacy = engine_test_overlaps(engine->legacy, p, bytes);
+		out->in_store = engine_test_overlaps(engine->store_extents, p,
+		    bytes);
+		out->in_journal = engine_test_overlaps(engine->journal_extents,
+		    p, bytes);
+		for (engine_owner_t *e = avl_first(&engine->owners);
+		    e != NULL && !out->owned; e = AVL_NEXT(&engine->owners, e))
+			for (engine_version_t *b = e->versions; b != NULL;
+			    b = b->next)
+				if (b->p < p + bytes && p < b->p + b->size)
+					out->owned = 1;
+		out->elsewhere = !out->any_free && !out->in_legacy &&
+		    !out->in_store && !out->in_journal && !out->owned;
+	}
+	out->durable_ub = engine->durable_ub_txg;
+	out->durable_catalog = engine->durable_catalog_txg;
+	out->stored_catalog = engine->stored_desc[6];
+	out->free_bytes = zfs_range_tree_space(engine->free);
+	out->capacity = engine->pages->capacity;
+	out->steer = engine->test_arena_result;
+	mutex_exit(&engine->lock);
+	return (0);
+}
+
+/* The next engine_pages_grow takes p if it is free (or, forced, anyway). */
+int
+pr19262_engine_test_prefer_arena(spa_t *spa, uint64_t p, boolean_t force)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || engine->vd == NULL ||
+	    p % (ENGINE_STORE_PAGE * engine->vd->vdev_children) != 0) {
+		mutex_exit(&engine->lock);
+		return (EINVAL);
+	}
+	engine->test_arena_p = p;
+	engine->test_arena_force = force;
+	engine->test_arena_active = B_TRUE;
+	mutex_exit(&engine->lock);
+	return (0);
+}
+
+/*
+ * Growth-defer test: native frees that straddle activation.  A free synced
+ * after engine_start's own deferral turnover and before its scan is still in
+ * ms_defer when the scan runs: legacy in the first catalog, and returned by
+ * metaslab_sync_done (engine_native_free) after a store lists it.
+ */
+void
+pr19262_engine_test_start_hook(spa_t *spa, void (*fn)(spa_t *, void *),
+    void *arg)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	engine->test_start_fn = fn;
+	engine->test_start_arg = arg;
+	mutex_exit(&engine->lock);
+}
+
+#ifdef ENGINE_REUSE_BATCHES
+typedef struct engine_test_take {
+	uint64_t bytes;
+	uint64_t start;
+} engine_test_take_t;
+
+static void
+engine_test_take_cb(void *arg, uint64_t start, uint64_t size)
+{
+	engine_test_take_t *t = arg;
+	if (size >= t->bytes)
+		t->start = start;
+}
+
+int
+pr19262_engine_test_defer_free(spa_t *spa, uint64_t bytes, uint64_t *deferred)
+{
+	engine_t *engine = spa->spa_reloc;
+	engine_test_take_t t = { bytes, UINT64_MAX };
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || !engine->persistent) {
+		mutex_exit(&engine->lock);
+		return (EINVAL);
+	}
+	if (bytes != 0) {
+		/* The highest free segment that holds them. */
+		zfs_range_tree_walk(engine->free, engine_test_take_cb, &t);
+		if (t.start == UINT64_MAX) {
+			mutex_exit(&engine->lock);
+			return (ENOSPC);
+		}
+		zfs_range_tree_remove(engine->free, t.start, bytes);
+		engine_reuse_add(engine, t.start, bytes);
+	}
+	*deferred = engine_reuse_bytes(engine);
+	mutex_exit(&engine->lock);
+	return (0);
+}
+#else
+int
+pr19262_engine_test_defer_free(spa_t *spa, uint64_t bytes, uint64_t *deferred)
+{
+	(void) spa, (void) bytes;
+	*deferred = 0;
+	return (ENOTSUP);
+}
+#endif
+
+static void
+engine_test_holes_cb(void *arg, uint64_t start, uint64_t size)
+{
+	zfs_range_tree_t *holes = arg;
+	uint64_t at = P2ROUNDUP(start, 8ULL << 20);
+	if (at == start)
+		at += 8ULL << 20;
+	for (; at < start + size; at += 8ULL << 20)
+		zfs_range_tree_add(holes, at - 4096, 4096);
+}
+
+int
+pr19262_engine_test_free_holes(spa_t *spa, boolean_t carve)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || !engine->persistent ||
+	    (carve && engine->test_holes != NULL) ||
+	    (!carve && engine->test_holes == NULL)) {
+		mutex_exit(&engine->lock);
+		return (EINVAL);
+	}
+	if (carve) {
+		engine->test_holes = zfs_range_tree_create(NULL,
+		    ZFS_RANGE_SEG64, NULL, 0, 0);
+		zfs_range_tree_walk(engine->free, engine_test_holes_cb,
+		    engine->test_holes);
+		zfs_range_tree_walk(engine->test_holes, engine_test_clear,
+		    engine->free);
+	} else {
+		zfs_range_tree_vacate(engine->test_holes, zfs_range_tree_add,
+		    engine->free);
+		zfs_range_tree_destroy(engine->test_holes);
+		engine->test_holes = NULL;
+	}
+	mutex_exit(&engine->lock);
+	return (0);
+}
+#endif

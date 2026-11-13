@@ -1429,3 +1429,183 @@ pr19262_engine_convert_room(spa_t *spa, uint64_t parity, uint64_t batch,
 	}
 	out->room = out->avail - out->delta;
 }
+
+#ifndef _KERNEL
+/* Journal roll test (L10): see vdev_reloc_engine.h. */
+int
+pr19262_engine_test_jroll_probe(spa_t *spa, pr19262_jroll_probe_t *out)
+{
+	engine_t *engine = spa->spa_reloc;
+	memset(out, 0, sizeof (*out));
+	mutex_enter(&engine->journal_lock);
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || !engine->persistent) {
+		mutex_exit(&engine->lock);
+		mutex_exit(&engine->journal_lock);
+		return (EINVAL);
+	}
+	uint64_t children = engine->vd->vdev_children;
+	out->seq = engine->journal_seq;
+	out->frames = engine->journal_bytes / ENGINE_STORE_PAGE;
+	out->segments = engine->journal_segment_count;
+	out->rolls = atomic_load_64(&engine->journal_cost.rolls);
+	out->error = engine->journal_error;
+#ifdef ENGINE_JOURNAL_ROLL_RETRY
+	out->retry = 1;
+	out->pending = engine->journal_roll_pending;
+	out->pending_txg = engine->journal_roll_txg;
+	out->enospc = engine->journal_roll_enospc;
+	out->waits = engine->journal_roll_waits;
+	out->recovered = engine->journal_roll_recovered;
+#endif
+	out->deferred = engine_reuse_bytes(engine);
+	out->standby = engine->store_standby_valid;
+	engine_admit_slots_t s = { .stripe = ENGINE_STORE_PAGE * children,
+	    .bytes = engine->journal_bytes * children };
+	zfs_range_tree_walk(engine->free, engine_admit_slots_count, &s);
+	out->runs = s.slots;
+	out->free_bytes = zfs_range_tree_space(engine->free);
+	mutex_exit(&engine->lock);
+	mutex_exit(&engine->journal_lock);
+	out->synced = spa_last_synced_txg(spa);
+	return (0);
+}
+
+/* L14 convert-busy8 cell: see vdev_reloc_engine.h. */
+int
+pr19262_engine_test_jroll_busy(spa_t *spa, const blkptr_t *bp, int on)
+{
+	engine_t *engine = spa->spa_reloc;
+	mutex_enter(&engine->lock);
+	engine_owner_t *e = engine->spa == spa ?
+	    engine_find(engine, DVA_GET_OFFSET(&bp->blk_dva[0])) : NULL;
+	if (e == NULL || (!on && e->queued_writers == 0)) {
+		mutex_exit(&engine->lock);
+		return (ENOENT);
+	}
+	if (on)
+		e->queued_writers++;
+	else
+		e->queued_writers--;
+	mutex_exit(&engine->lock);
+	return (0);
+}
+
+/* L14 r2(a) cell: see vdev_reloc_engine.h. */
+int
+pr19262_engine_test_retired_probe(spa_t *spa, pr19262_retired_probe_t *out)
+{
+	engine_t *engine = spa->spa_reloc;
+	memset(out, 0, sizeof (*out));
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa) {
+		mutex_exit(&engine->lock);
+		return (EINVAL);
+	}
+	out->retired = engine->retired;
+	out->limit = engine->retired_limit;
+	out->draining = engine->checkpoint.ub_txg == 0 &&
+	    spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT);
+	out->stalled = engine->fence_stalled;
+	out->fence_error = engine->fence_error;
+	out->client_rejected = engine->admit[PR19262_ADMIT_CLIENT].rejected;
+	out->arena_rejections = engine->admit_arena_rejections;
+	out->headroom_rejections = engine->admit_headroom_rejections;
+	out->fence_waits = engine->admit_fence_waits;
+	out->fence_requests = engine->fence_requests;
+	/* Retired owners a draining fence skips (convert.c release sync). */
+	for (engine_owner_t *e = avl_first(&engine->owners); e != NULL;
+	    e = AVL_NEXT(&engine->owners, e)) {
+		if (e->retired && !e->drain_releasable) {
+			out->unflagged += e->cur->size;
+			out->unflagged_owners++;
+		}
+	}
+	mutex_exit(&engine->lock);
+	return (0);
+}
+
+static void
+engine_test_jroll_holes(void *arg, uint64_t start, uint64_t size)
+{
+	zfs_range_tree_t *holes = arg;
+	uint64_t step = 2ULL << 20;
+	uint64_t at = P2ROUNDUP(start, step);
+	if (at == start)
+		at += step;
+	for (; at < start + size; at += step) {
+		uint64_t first = MAX(start, at - 4096);
+		zfs_range_tree_add(holes, first, at - first);
+	}
+}
+
+static void
+engine_test_jroll_clear(void *arg, uint64_t start, uint64_t size)
+{
+	zfs_range_tree_clear(arg, start, size);
+}
+
+/*
+ * op 1: carve, the run deferred; 2: carve, the run held back (no run at
+ * all); 3: the held run into the deferral; 0: the holes back.
+ */
+int
+pr19262_engine_test_jroll_squeeze(spa_t *spa, int op, uint64_t *run)
+{
+	engine_t *engine = spa->spa_reloc;
+	uint64_t children = engine->vd->vdev_children;
+	uint64_t bytes = engine->journal_bytes * children;
+	*run = UINT64_MAX;
+	mutex_enter(&engine->lock);
+	if (engine->spa != spa || !engine->persistent ||
+	    ((op == 1 || op == 2) && engine->test_jholes != NULL) ||
+	    ((op == 0 || op == 3) && engine->test_jholes == NULL) ||
+	    (op == 3 && engine->test_jheld == 0)) {
+		mutex_exit(&engine->lock);
+		return (EINVAL);
+	}
+	if (op == 0 || op == 3) {
+		if (op == 3) {
+			/* Freed after the durable catalog: deferred. */
+			*run = engine->test_jheld - 1;
+			engine_reuse_add(engine, *run, bytes);
+			engine->test_jheld = 0;
+		} else {
+			if (engine->test_jheld != 0)
+				zfs_range_tree_add(engine->free,
+				    engine->test_jheld - 1, bytes);
+			engine->test_jheld = 0;
+			zfs_range_tree_vacate(engine->test_jholes,
+			    zfs_range_tree_add, engine->free);
+			zfs_range_tree_destroy(engine->test_jholes);
+			engine->test_jholes = NULL;
+		}
+		mutex_exit(&engine->lock);
+		return (0);
+	}
+	(void) engine_pages_standby_release_locked(engine);
+	engine_store_pick_arg_t pick = { children * ENGINE_STORE_PAGE,
+	    bytes, UINT64_MAX };
+	zfs_range_tree_walk(engine->free, engine_store_pick, &pick);
+	if (pick.found == UINT64_MAX) {
+		mutex_exit(&engine->lock);
+		return (ENOSPC);
+	}
+	zfs_range_tree_remove(engine->free, pick.found, bytes);
+	engine->test_jholes = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
+	    NULL, 0, 0);
+	zfs_range_tree_walk(engine->free, engine_test_jroll_holes,
+	    engine->test_jholes);
+	zfs_range_tree_walk(engine->test_jholes, engine_test_jroll_clear,
+	    engine->free);
+	if (op == 1) {
+		/* Freed after the durable catalog: deferred, as a cut is. */
+		engine_reuse_add(engine, pick.found, bytes);
+	} else {
+		engine->test_jheld = pick.found + 1;
+	}
+	*run = pick.found;
+	mutex_exit(&engine->lock);
+	return (0);
+}
+#endif

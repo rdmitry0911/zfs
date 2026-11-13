@@ -2756,6 +2756,34 @@ engine_pages_grow(engine_mbatch_t *b)
 	} else {
 		zfs_range_tree_walk(engine->free, engine_pages_pick, &walk);
 	}
+#ifndef _KERNEL
+	if (engine->test_arena_active) {
+		/* Growth-defer test: steer this pick (force: past free). */
+		engine->test_arena_active = B_FALSE;
+		uint64_t p = engine->test_arena_p;
+		boolean_t honoured = zfs_range_tree_contains(engine->free, p,
+		    bytes);
+		boolean_t forced = !honoured && engine->test_arena_force;
+		if (forced) {
+			zfs_range_tree_clear(engine->free, p, bytes);
+			zfs_range_tree_add(engine->free, p, bytes);
+		}
+		pr19262_printf("PR19262_TEST_ARENA_STEER p=%llu natural=%lld "
+		    "honoured=%u forced=%u\n", (u_longlong_t)p,
+		    (longlong_t)range[0], honoured, forced);
+		pr19262_flush();
+		engine->test_arena_result = honoured ? 1 : forced ? 2 : 3;
+		if ((honoured || forced) && reserved) {
+			/* The steer wins: the taken run stays reserved. */
+			zfs_range_tree_add(engine->store_reserved, range[0],
+			    bytes);
+			engine->store_reserve_uses--;
+			reserved = B_FALSE;
+		}
+		if (honoured || forced)
+			range[0] = p;
+	}
+#endif
 	if (range[0] == UINT64_MAX && engine->store_standby_valid) {
 		/* Already in store_extents: the standby run is the arena. */
 		range[0] = engine->store_standby;
@@ -2771,6 +2799,13 @@ engine_pages_grow(engine_mbatch_t *b)
 		    (u_longlong_t)engine->pages->capacity,
 		    (u_longlong_t)engine->pages->available,
 		    (u_longlong_t)engine->store_standby_uses);
+#ifndef _KERNEL
+		/* L13 witness: what the failing batch had placed so far. */
+		pr19262_printf("PR19262_L13DRV_GROW_ENOSPC txg=%llu "
+		    "batch_pages=%u changes=%u deletes=%u tombstones=%u\n",
+		    (u_longlong_t)spa_syncing_txg(b->spa), b->pages,
+		    b->changes, b->deletes, b->tombstones);
+#endif
 		return (ENOSPC);
 	}
 	if (!standby && !reserved) {
